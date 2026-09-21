@@ -33,7 +33,7 @@ $ sudo smart-caddy add panel.example.com 54321
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<you>/smart-caddy/main/smart_caddy.sh -o smart_caddy.sh
+curl -fsSL https://githubusercontent.com/Plus98ir/Smart-Caddy/main/smart_caddy.sh -o smart_caddy.sh
 sudo bash smart_caddy.sh
 ```
 
