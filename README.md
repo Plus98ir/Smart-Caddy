@@ -33,9 +33,10 @@ $ sudo smart-caddy add panel.example.com 54321
 ## Install
 
 ```bash
-curl -fsSL https://githubusercontent.com/Plus98ir/Smart-Caddy/main/smart_caddy.sh -o smart_caddy.sh
-sudo bash smart_caddy.sh
+sudo bash <(curl -fsSL https://github.com/Plus98ir/Smart-Caddy/releases/latest/download/smart_caddy.sh)
 ```
+
+That URL always resolves to the newest release — no version number to update.
 
 One file, one command. It installs Caddy itself if missing (apt, dnf, yum, pacman,
 apk), inspects the machine, and asks only about what it cannot work out alone:
@@ -63,10 +64,16 @@ apk), inspects the machine, and asks only about what it cannot work out alone:
 On a single-address host it never asks about addresses at all. The web panel's
 source is embedded in the script, so there is nothing else to download.
 
-> **`curl ... | bash` will not work.** Piping leaves no terminal to ask questions
-> on, so every prompt would silently take its default. The script detects this and
-> refuses rather than guessing. Use the two-step form above, or
-> `sudo bash <(curl -fsSL <url>) setup`.
+> **Use `bash <(...)`, not `curl ... | bash`.** Piping leaves no terminal to ask
+> questions on, so every prompt would silently take its default; the script detects
+> that and refuses rather than guessing. Process substitution keeps your terminal
+> attached, so the wizard works.
+
+Already installed? Update in place:
+
+```bash
+sudo smart-caddy update
+```
 
 ## Features
 

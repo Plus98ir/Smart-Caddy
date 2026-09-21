@@ -1,6 +1,6 @@
 <div align="center">
 
-# Smart-Caddy
+# smart-caddy
 
 [English](README.md) · **فارسی**
 
@@ -41,11 +41,12 @@ $ sudo smart-caddy add panel.example.com 54321
 </div>
 
 ```bash
-curl -fsSL https://githubusercontent.com/Plus98ir/Smart-Caddy/main/smart_caddy.sh -o smart_caddy.sh
-sudo bash smart_caddy.sh
+sudo bash <(curl -fsSL https://github.com/Plus98ir/Smart-Caddy/releases/latest/download/smart_caddy.sh)
 ```
 
 <div dir="rtl" align="right">
+
+این آدرس همیشه به آخرین نسخه می‌رسد — شماره‌ای نیست که لازم باشد عوضش کنی.
 
 یک فایل، یک دستور. اگر Caddy نصب نباشد خودش نصبش می‌کند (apt، dnf، yum، pacman، apk)،
 بعد به ماشین نگاه می‌کند و فقط چیزی را می‌پرسد که خودش نمی‌تواند بفهمد:
@@ -77,10 +78,16 @@ sudo bash smart_caddy.sh
 روی سرور تک‌IP اصلاً سؤال آدرس نمی‌پرسد. سورس پنل وب داخل خود اسکریپت جاسازی شده،
 پس چیز دیگری برای دانلود نیست.
 
-> **`curl ... | bash` کار نمی‌کند.** وقتی ورودی یک لوله باشد، ترمینالی برای سؤال
-> پرسیدن نمی‌ماند و هر prompt بی‌صدا مقدار پیش‌فرض را برمی‌دارد. اسکریپت این را
-> تشخیص می‌دهد و به‌جای حدس زدن امتناع می‌کند. همان شکل دو مرحله‌ای بالا را استفاده
-> کن، یا `sudo bash <(curl -fsSL <url>) setup`.
+> **از `bash <(...)` استفاده کن، نه `curl ... | bash`.** وقتی ورودی یک لوله باشد،
+> ترمینالی برای سؤال پرسیدن نمی‌ماند و هر prompt بی‌صدا مقدار پیش‌فرض را برمی‌دارد؛
+> اسکریپت این را تشخیص می‌دهد و به‌جای حدس زدن امتناع می‌کند. process substitution
+> ترمینال تو را وصل نگه می‌دارد، پس ویزارد درست کار می‌کند.
+
+از قبل نصب است؟ در جا آپدیت کن:
+
+```bash
+sudo smart-caddy update
+```
 
 ## چه کارهایی می‌کند
 

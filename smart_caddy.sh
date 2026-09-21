@@ -36,6 +36,9 @@ FRONT_IP=""          # empty = do not emit bind (single-IP server)
 ACME_EMAIL=""
 SRC_DIR=""           # where install was run from, so 'panel' can find ui.py later
 
+# Where to fetch a fresh copy of this script. Override with SMART_CADDY_URL.
+SELF_URL="${SMART_CADDY_URL:-https://github.com/Plus98ir/Smart-Caddy/releases/latest/download/smart_caddy.sh}"
+
 [[ -r "$CONF_FILE" ]] && . "$CONF_FILE"
 
 # --- output ------------------------------------------------------------------
@@ -66,6 +69,26 @@ ask() {   # ask "question" [y|n] -> 0=yes 1=no
 }
 
 need_root() { [[ $EUID -eq 0 ]] || die "must run as root: sudo $0 $*"; }
+
+# A readable copy of this script on disk, for installing it to /usr/local/bin.
+#
+# With `bash <(curl ...)` $0 is a pipe, not a file: it is already consumed, it
+# cannot be rewound, and reading it again steals the text bash has not executed
+# yet - which kills the running script mid-way. So in that case, fetch a fresh
+# copy over the network instead of touching $0 at all.
+self_source() {
+	local f; f="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+	if [[ -f "$f" && -r "$f" && -s "$f" ]]; then
+		printf '%s\n' "$f"; return 0
+	fi
+	have curl || return 1
+	local tmp; tmp="$(mktemp /tmp/smart-caddy.XXXXXX.sh)"
+	if curl -fsSL "$SELF_URL" -o "$tmp" 2>/dev/null && [[ -s "$tmp" ]] \
+	   && bash -n "$tmp" 2>/dev/null && grep -q 'smart-caddy' "$tmp"; then
+		printf '%s\n' "$tmp"; return 0
+	fi
+	rm -f "$tmp"; return 1
+}
 have()      { command -v "$1" >/dev/null 2>&1; }
 
 # prompt VARNAME "question" ["default"] - reads into VARNAME
@@ -539,6 +562,11 @@ cmd_install() {
 			ip="$existing"; info "taken from existing 'bind' in Caddyfile: $ip"
 		elif [[ ${#ips[@]} -eq 1 ]]; then
 			ip=""; info "single-IP host (${ips[0]}) - no bind needed"
+		elif [[ ${#ips[@]} -eq 0 ]]; then
+			# No global IPv4: a v6-only box, or 'ip' is missing. Leaving bind
+			# unset is the safe default - Caddy listens on everything.
+			ip=""; warn "no global IPv4 address found - continuing without 'bind'"
+			dim "pass --ip <address> if Caddy should listen on one address only"
 		else
 			warn "this host has several IPs: ${ips[*]}"
 			warn "with more than one service on :80/:443, 'bind' is mandatory"
@@ -619,14 +647,20 @@ cmd_install() {
 		LE_LIVE="${LE_LIVE}"
 		FRONT_IP="${FRONT_IP}"
 		ACME_EMAIL="${ACME_EMAIL}"
-		SRC_DIR="$(dirname "$(readlink -f "$0")")"
+		SRC_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo .)")" 2>/dev/null && pwd || echo "")"
 	EOF
 	chmod 0644 "$CONF_FILE"; ok "$CONF_FILE"
 
-	local src; src="$(readlink -f "$0")"
-	if [[ "$src" != "/usr/local/bin/$SELF_NAME" ]]; then
-		install -m 0755 "$src" "/usr/local/bin/$SELF_NAME"
-		ok "command installed -> /usr/local/bin/$SELF_NAME"
+	local src=""
+	if src="$(self_source)"; then
+		if [[ "$(readlink -f "$src")" != "/usr/local/bin/$SELF_NAME" ]]; then
+			install -m 0755 "$src" "/usr/local/bin/$SELF_NAME"
+			ok "command installed -> /usr/local/bin/$SELF_NAME"
+		fi
+		case "$src" in /tmp/smart-caddy.*.sh) rm -f "$src" ;; esac
+	else
+		warn "could not get a copy of this script to install"
+		dim "download it to a file and run 'install' again, or set SMART_CADDY_URL"
 	fi
 
 	# Stash the web UI now, while we still know where the download landed.
@@ -2540,6 +2574,40 @@ find_ui_source() {
 	return 1
 }
 
+cmd_update() {
+	need_root update
+	have curl || die "curl is required to update"
+
+	hdr "Updating from the latest release"
+	dim "$SELF_URL"
+	local tmp; tmp="$(mktemp /tmp/smart-caddy.XXXXXX.sh)"
+	curl -fsSL "$SELF_URL" -o "$tmp" \
+		|| { rm -f "$tmp"; die "download failed"; }
+	# Never install something we have not sanity-checked: a captive portal or
+	# a 404 page would otherwise replace a working install with HTML.
+	[[ -s "$tmp" ]] && bash -n "$tmp" 2>/dev/null && grep -q 'smart-caddy' "$tmp" \
+		|| { rm -f "$tmp"; die "what came back is not a valid smart-caddy script"; }
+
+	local newv; newv="$(grep -m1 '^VERSION=' "$tmp" | cut -d'"' -f2)"
+	if [[ "$newv" == "$VERSION" ]]; then
+		ok "already on v$VERSION - nothing to do"
+		rm -f "$tmp"; return 0
+	fi
+	ok "v$VERSION -> v${newv:-?}"
+
+	install -m 0755 "$tmp" "/usr/local/bin/$SELF_NAME"
+	rm -f "$tmp"
+	ok "command replaced"
+
+	# The panel source lives inside the script, so it has to be refreshed too.
+	"/usr/local/bin/$SELF_NAME" install --yes >/dev/null 2>&1 \
+		&& ok "panel source and system wiring refreshed" \
+		|| warn "run '$SELF_NAME install' by hand to finish the update"
+
+	hdr "Done"
+	dim "$SELF_NAME doctor   check everything still looks right"
+}
+
 cmd_passwd() {
 	need_root passwd
 	local user="" pass="" show=0
@@ -2856,6 +2924,7 @@ ${C_B}COMMANDS${C_OFF}
   panel <domain> [--user u] [--port n]     install the web UI at that domain
   panel status | panel remove [<domain>]   check or remove the web UI
   passwd [user] [--password <p>]           change the panel password
+  update                                   fetch and install the latest release
   doctor                                   full diagnostic
   fixbind                                  add 'bind' to blocks missing it
   repair                                   fix file permissions and reload
@@ -2923,6 +2992,7 @@ main() {
 		doctor|check)      cmd_doctor ;;
 		panel)             cmd_panel "$@" ;;
 		passwd|password)   cmd_passwd "$@" ;;
+		update|upgrade)    cmd_update "$@" ;;
 		fixbind)           cmd_fixbind ;;
 		repair)            cmd_repair ;;
 		uninstall)         cmd_uninstall ;;
