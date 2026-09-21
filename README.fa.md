@@ -41,7 +41,7 @@ $ sudo smart-caddy add panel.example.com 54321
 </div>
 
 ```bash
-sudo bash <(curl -fsSL https://github.com/Plus98ir/Smart-Caddy/releases/latest/download/smart_caddy.sh)
+sudo bash -c "$(curl -fsSL https://github.com/Plus98ir/Smart-Caddy/releases/latest/download/smart_caddy.sh)"
 ```
 
 <div dir="rtl" align="right">
@@ -78,10 +78,28 @@ sudo bash <(curl -fsSL https://github.com/Plus98ir/Smart-Caddy/releases/latest/d
 روی سرور تک‌IP اصلاً سؤال آدرس نمی‌پرسد. سورس پنل وب داخل خود اسکریپت جاسازی شده،
 پس چیز دیگری برای دانلود نیست.
 
-> **از `bash <(...)` استفاده کن، نه `curl ... | bash`.** وقتی ورودی یک لوله باشد،
-> ترمینالی برای سؤال پرسیدن نمی‌ماند و هر prompt بی‌صدا مقدار پیش‌فرض را برمی‌دارد؛
-> اسکریپت این را تشخیص می‌دهد و به‌جای حدس زدن امتناع می‌کند. process substitution
-> ترمینال تو را وصل نگه می‌دارد، پس ویزارد درست کار می‌کند.
+> **چرا `bash -c "$(...)"` و نه چیزی کوتاه‌تر؟**
+>
+> `curl ... | bash` ترمینالی برای سؤال پرسیدن باقی نمی‌گذارد و هر prompt بی‌صدا
+> مقدار پیش‌فرض را برمی‌دارد. اسکریپت این را تشخیص می‌دهد و به‌جای حدس زدن امتناع
+> می‌کند.
+>
+> `sudo bash <(curl ...)` تمیزتر به‌نظر می‌رسد ولی **کار نمی‌کند**: process
+> substitution فایل `/dev/fd/63` را در شل فعلی می‌سازد، و sudo فایل‌دیسکریپتورهای
+> ارث‌رسیده را می‌بندد، پس bashای که اجرا می‌شود نمی‌تواند بازش کند و خطای
+> `/dev/fd/63: No such file or directory` می‌گیری. (بدون `sudo` و وقتی root هستی،
+> همان شکل درست کار می‌کند.)
+>
+> `bash -c "$(...)"` متن اسکریپت را به‌عنوان آرگومان می‌دهد، نه فایل‌دیسکریپتور، پس
+> چیزی نیست که بسته شود، و ترمینال تو هم وصل می‌ماند.
+>
+> اگر اصلاً دوست نداری اسکریپتی را مستقیم به شل بدهی:
+>
+> ```bash
+> curl -fsSL https://github.com/Plus98ir/Smart-Caddy/releases/latest/download/smart_caddy.sh -o smart_caddy.sh
+> less smart_caddy.sh      # اول بخوانش
+> sudo bash smart_caddy.sh
+> ```
 
 از قبل نصب است؟ در جا آپدیت کن:
 
