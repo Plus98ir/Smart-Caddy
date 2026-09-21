@@ -1,6 +1,6 @@
 <div align="center">
 
-# smart-caddy
+# Smart-Caddy
 
 **English** · [فارسی](README.fa.md)
 
