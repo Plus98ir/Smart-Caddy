@@ -33,7 +33,7 @@ $ sudo smart-caddy add panel.example.com 54321
 ## Install
 
 ```bash
-sudo bash -c "$(curl -fsSL https://github.com/Plus98ir/Smart-Caddy/releases/latest/download/smart_caddy.sh)"
+curl -fsSL https://github.com/Plus98ir/Smart-Caddy/releases/latest/download/smart_caddy.sh -o smart_caddy.sh && sudo bash smart_caddy.sh
 ```
 
 That URL always resolves to the newest release — no version number to update.
@@ -64,20 +64,20 @@ apk), inspects the machine, and asks only about what it cannot work out alone:
 On a single-address host it never asks about addresses at all. The web panel's
 source is embedded in the script, so there is nothing else to download.
 
-> **Why `bash -c "$(...)"` and not something shorter?**
+> **Why download first instead of piping into bash?**
 >
 > `curl ... | bash` leaves no terminal to ask questions on, so every prompt would
 > silently take its default. The script detects that and refuses rather than guess.
 >
-> `sudo bash <(curl ...)` looks tidier but **fails**: process substitution creates
-> `/dev/fd/63` in your current shell, and sudo closes inherited file descriptors, so
-> the `bash` it starts cannot open it — you get `/dev/fd/63: No such file or
-> directory`. (Without `sudo`, as root, that form is fine.)
+> `sudo bash -c "$(curl ...)"` passes the whole script as one command-line argument,
+> and Linux caps a single argument at 128 KB. The script is bigger than that, so you
+> get `Argument list too long`.
 >
-> `bash -c "$(...)"` passes the script as an argument instead of a file descriptor,
-> so nothing can be closed out from under it, and your terminal stays attached.
+> `sudo bash <(curl ...)` fails too: sudo closes the `/dev/fd/63` that process
+> substitution creates, so you get `/dev/fd/63: No such file or directory`.
 >
-> If you would rather not pipe a script into a shell at all:
+> Saving the file and running it has none of these problems, keeps your terminal
+> attached for the questions, and lets you read the script first if you like:
 >
 > ```bash
 > curl -fsSL https://github.com/Plus98ir/Smart-Caddy/releases/latest/download/smart_caddy.sh -o smart_caddy.sh
@@ -104,6 +104,7 @@ sudo smart-caddy update
 | **Activity log** | every change, from the panel or the terminal: who, when, the output, and a diff of exactly which config lines changed |
 | **Many backend types** | a local port, a TLS backend, a directory of files, another site, or a redirect |
 | **Path-aware, not path-fragile** | records an app's base path without 404-ing the rest, so panel WebSockets keep working |
+| **Behind another front proxy** | when an SNI proxy such as DNSGuard owns `:80`/`:443` and hands names to Caddy on loopback, sites are created behind it and the domain is registered with it for you |
 | **Coexists with Xray** | `--behind-xray` sets up the loopback + PROXY protocol + h2c listener and verifies the fallback exists |
 | **Web panel** | Persian / English, real login page, PBKDF2 passwords, signed sessions, add / edit / remove sites, raw config editor |
 | **Safe removal** | on delete, asks whether to keep the certificate (default: keep) |
@@ -399,6 +400,19 @@ handshake, so this listener never sees one.
 [warn] api.example.com: no Xray fallback points at :8083
        the domain will look dead until you add that row in x-ui
 ```
+
+## Behind an SNI proxy (DNSGuard and similar)
+
+Some servers run an SNI proxy on `:80`/`:443` that serves its own clients and hands
+the names it does not handle to Caddy on a loopback port, with a PROXY protocol
+header. Caddy's global options then contain `https_port <n>` with `n` other than 443.
+
+Smart Caddy detects that and stops suggesting `--behind-xray`. Every site it creates
+there is an ordinary HTTPS site bound to `127.0.0.1`, with an explicit http → https
+redirect when the front proxy has turned Caddy's own redirect off. For **DNSGuard** it
+also adds the domain to `SNI_LOCAL_NAMES` in `/opt/dnsguard/.env` and restarts it (DNS
+pauses for a few seconds); for anything else it tells you which name to forward.
+`doctor` lists any site the front proxy does not hand over yet.
 
 ### What does not work
 

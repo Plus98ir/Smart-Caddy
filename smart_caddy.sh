@@ -77,7 +77,7 @@ need_root() { [[ $EUID -eq 0 ]] || die "must run as root: sudo $0 $*"; }
 # yet - which kills the running script mid-way. So in that case, fetch a fresh
 # copy over the network instead of touching $0 at all.
 # A runnable way to refer to this script, for messages. Under
-# `bash -c "$(curl ...)"` $0 is literally "bash"; telling someone to run
+# `bash -c "$(curl ...)"` (too long to work anyway past 128 KB) $0 is literally "bash"; telling someone to run
 # `bash bash setup` helps nobody.
 self_invocation() {
 	if [[ -x "/usr/local/bin/$SELF_NAME" ]]; then
@@ -85,7 +85,7 @@ self_invocation() {
 	elif [[ -f "$0" && -r "$0" ]]; then
 		printf 'bash %s' "$0"
 	else
-		printf 'bash -c "$(curl -fsSL %s)" %s' "$SELF_URL" "$SELF_NAME"
+		printf 'bash smart_caddy.sh'   # after: curl -fsSL "$SELF_URL" -o smart_caddy.sh
 	fi
 }
 
@@ -180,8 +180,107 @@ fix_perms() {
 bind_line() {
 	# Must return 0 even with no FRONT_IP: it runs inside `{ ... } > file`
 	# groups, where a non-zero status would abort the write under set -e.
+	# Behind a front proxy only that proxy may reach Caddy, so loopback.
+	if [[ -n "$(caddy_front_port)" ]]; then printf '\tbind 127.0.0.1\n'; return 0; fi
 	[[ -n "$FRONT_IP" ]] || return 0
 	printf '\tbind %s\n' "$FRONT_IP"
+}
+
+# =============================================================================
+#  Front proxy
+#
+#  Some servers put another program on :80/:443 - an SNI proxy such as
+#  DNSGuard - that hands the names it does not serve itself to Caddy on a
+#  loopback port, with a PROXY protocol header. Caddy's global options then
+#  carry 'https_port <n>' with n != 443. Sites on such a box are ordinary
+#  HTTPS sites bound to 127.0.0.1, NOT Xray fallbacks.
+# =============================================================================
+
+# Caddy's https_port when it is not 443, i.e. something in front hands
+# traffic over. Empty (and status 0) on a normal box.
+caddy_front_port() {
+	[[ -r "$CADDYFILE" ]] || return 0
+	awk '
+		NR == 1 && $0 !~ /^[ \t]*\{[ \t]*$/ { exit }
+		/^\}/ { exit }
+		{ if (match($0, /^[ \t]*https_port[ \t]+[0-9]+/)) {
+			n = $0; gsub(/[^0-9]/, "", n); if (n != "443") print n; exit } }
+	' "$CADDYFILE" 2>/dev/null || true
+}
+
+# Caddy's own http->https redirect is off (front proxies often do that), so
+# every HTTPS site needs an explicit one.
+caddy_redirects_off() {
+	grep -qE '^\s*auto_https\s+(disable_redirects|off)' "$CADDYFILE" 2>/dev/null
+}
+
+# A plain redirect block for the http:// side of a site behind a front proxy.
+redirect_block() {
+	printf '\n# http -> https (Caddy'"'"'s automatic redirect is off on this server)\n'
+	printf 'http://%s {\n\tbind 127.0.0.1\n\tredir https://{host}{uri} permanent\n}\n' "$1"
+}
+
+# DNSGuard keeps its list of names to hand over in its .env
+DNSGUARD_ENV="/opt/dnsguard/.env"
+dnsguard_present() {
+	[[ -r "$DNSGUARD_ENV" ]] && grep -qE '^SNI_LOCAL=.+' "$DNSGUARD_ENV"
+}
+
+# Does DNSGuard already hand <domain> to Caddy? (PUBLIC_DOMAIN and its
+# subdomains, plus SNI_LOCAL_NAMES)
+dnsguard_covers() {
+	local d="${1,,}" n names
+	names="$(grep -oP '^PUBLIC_DOMAIN=\K.*' "$DNSGUARD_ENV" | head -1 || true),$(grep -oP '^SNI_LOCAL_NAMES=\K.*' "$DNSGUARD_ENV" | head -1 || true)"
+	IFS=',' read -ra names <<<"${names// /}"
+	for n in "${names[@]}"; do
+		n="${n,,}"; n="${n%.}"
+		[[ -z "$n" ]] && continue
+		[[ "$d" == "$n" || "$d" == *".$n" ]] && return 0
+	done
+	return 1
+}
+
+# Add <domain> to DNSGuard's SNI_LOCAL_NAMES and restart it (a few seconds,
+# DNS included) so it starts handing that name to Caddy.
+dnsguard_add_name() {
+	local d="$1" cur bak
+	dnsguard_covers "$d" && { ok "DNSGuard already hands $d to Caddy"; return 0; }
+	bak="$(mktemp)"; cp -p "$DNSGUARD_ENV" "$bak"
+	cur="$(grep -oP '^SNI_LOCAL_NAMES=\K.*' "$DNSGUARD_ENV" | head -1 || true)"
+	if grep -q '^SNI_LOCAL_NAMES=' "$DNSGUARD_ENV"; then
+		sed -i "s|^SNI_LOCAL_NAMES=.*|SNI_LOCAL_NAMES=${cur:+$cur,}$d|" "$DNSGUARD_ENV"
+	else
+		printf 'SNI_LOCAL_NAMES=%s\n' "$d" >> "$DNSGUARD_ENV"
+	fi
+	[[ -n "$ACTIVITY_DIFF" ]] && diff -u --label "a$DNSGUARD_ENV" --label "b$DNSGUARD_ENV" \
+		"$bak" "$DNSGUARD_ENV" | grep -vE '^[-+ ](ADMIN_KEY|TOKEN|BOT_TOKEN|NODE_KEY|SNI_PASS)=' \
+		>> "$ACTIVITY_DIFF" 2>/dev/null || true
+	rm -f "$bak"
+	if systemctl restart dnsguard 2>/dev/null; then
+		ok "DNSGuard now hands $d to Caddy (restarted it - DNS paused for a few seconds)"
+	else
+		warn "added $d to SNI_LOCAL_NAMES but could not restart dnsguard - restart it by hand"
+	fi
+}
+
+# After writing a site behind a front proxy: make sure the front proxy will
+# actually send this name to Caddy, or say what is missing.
+front_register() {
+	local d="$1" fp; fp="$(caddy_front_port)"
+	[[ -n "$fp" ]] || return 0
+	if dnsguard_present; then
+		dnsguard_covers "$d" && { ok "DNSGuard already hands $d to Caddy"; return 0; }
+		info "DNSGuard owns :80/:443 and only hands over the names it knows"
+		if ask "Add $d to DNSGuard's SNI_LOCAL_NAMES now? (restarts DNSGuard for a few seconds)" y; then
+			dnsguard_add_name "$d"
+		else
+			warn "$d will not be reachable until DNSGuard hands it over"
+			dim "add it to SNI_LOCAL_NAMES in $DNSGUARD_ENV and restart dnsguard"
+		fi
+	else
+		info "the program on :443 ($(port_owner 443)) must hand $d to Caddy on 127.0.0.1:$fp"
+		dim "with a PROXY protocol header - otherwise the site stays unreachable"
+	fi
 }
 
 certbot_cert()   { printf '%s/%s/fullchain.pem' "$LE_LIVE" "$1"; }
@@ -450,8 +549,7 @@ cmd_setup() {
 	if [[ ! -t 0 ]]; then
 		warn "stdin is not a terminal, so setup cannot ask you anything"
 		dim "it would silently accept every default. Run it one of these ways:"
-		dim "    curl -fsSL <url> -o smart_caddy.sh && sudo bash smart_caddy.sh setup"
-		dim "    sudo bash <(curl -fsSL <url>) setup"
+		dim "    curl -fsSL $SELF_URL -o smart_caddy.sh && sudo bash smart_caddy.sh setup"
 		die "refusing to guess"
 	fi
 
@@ -499,6 +597,11 @@ cmd_setup() {
 	[[ -n "$o443" ]] && { warn ":443 is held by '$o443'"; blocked=1; }
 	[[ $blocked -eq 0 ]] && ok ":80 and :443 are free"
 
+	if [[ $blocked -eq 1 && -n "$(caddy_front_port)" ]]; then
+		ok "that program hands traffic to Caddy on 127.0.0.1:$(caddy_front_port) - sites will sit behind it"
+		dnsguard_present && dim "it is DNSGuard: new domains are added to its SNI_LOCAL_NAMES for you"
+		blocked=0
+	fi
 	if [[ $blocked -eq 1 ]]; then
 		echo
 		dim "Caddy cannot share a port with another process. Your options:"
@@ -1147,6 +1250,11 @@ cmd_add() {
 		fi
 	fi
 
+	local front_port; front_port="$(caddy_front_port)"
+	if [[ -n "$front_port" && $behind_xray -eq 0 ]]; then
+		ok "Caddy sits behind a front proxy on :443 - this site is served on 127.0.0.1:${front_port}"
+	fi
+
 	if [[ $behind_xray -eq 1 ]]; then
 		cert_mode="none"          # Xray holds the certificate, not us
 		dns_check=0               # nothing of ours is reachable from outside
@@ -1329,6 +1437,9 @@ cmd_add() {
 			render_main
 		fi
 		echo "}"
+		if [[ -n "$front_port" && $behind_xray -eq 0 && "$cert_mode" != none ]] && caddy_redirects_off; then
+			redirect_block "$domain"
+		fi
 	} > "$f"
 	unset -f render_proxy render_body render_main
 	chown "root:$(caddy_group)" "$f" 2>/dev/null || true
@@ -1343,6 +1454,9 @@ cmd_add() {
 
 	hdr "Applying"
 	apply
+	# before waiting for a certificate: Let's Encrypt can only reach this
+	# name once the front proxy hands it to Caddy
+	[[ $behind_xray -eq 0 ]] && front_register "$domain"
 
 	if { [[ "$cert_mode" == "auto" && "$kind" == "none" ]]; } \
 	   || { [[ "$cert_mode" == "acme" ]] && ! caddy_has_cert "$domain"; }; then
@@ -1854,6 +1968,26 @@ cmd_doctor() {
 		dim "certbot not present on this host"
 	fi
 
+	local dfp; dfp="$(caddy_front_port)"
+	if [[ -n "$dfp" ]]; then
+		hdr "6a Front proxy"
+		ok "Caddy sits behind a front proxy - it hands traffic to 127.0.0.1:$dfp"
+		local ff fd
+		shopt -s nullglob
+		for ff in "$SITES_DIR"/*.caddy; do
+			fd=$(basename "$ff" .caddy)
+			grep -q 'behind an Xray fallback' "$ff" && continue
+			if grep -qE '^\s*bind\s+' "$ff" && ! grep -qE '^\s*bind\s+127\.0\.0\.1' "$ff"; then
+				warn "$fd: bound to a public address - behind a front proxy it must be 127.0.0.1"
+			fi
+			if dnsguard_present; then
+				if dnsguard_covers "$fd"; then ok "$fd: DNSGuard hands it to Caddy"
+				else warn "$fd: DNSGuard does not hand it over - add it to SNI_LOCAL_NAMES in $DNSGUARD_ENV"; fi
+			fi
+		done
+		shopt -u nullglob
+	fi
+
 	hdr "6b Certificate renewal"
 	local cf cd cany=0
 	shopt -s nullglob
@@ -2136,7 +2270,7 @@ cmd_import() {
 		fi
 		pick+=("$s|$e|$dom|$header")
 	done
-	for d in "${want[@]}"; do
+	for d in ${want[@]+"${want[@]}"}; do
 		printf '%s\n' "${pick[@]}" | grep -q "|$d|" \
 			|| die "$d is not an importable block in $CADDYFILE  (see: $SELF_NAME import --list)"
 	done
@@ -2161,10 +2295,19 @@ cmd_import() {
 	local bak="${CADDYFILE}.bak.$(date +%Y%m%d-%H%M%S)"
 	cp -p "$CADDYFILE" "$bak"
 
-	local f ranges=""
+	local f ranges="" written=" "
 	for p in "${pick[@]}"; do
 		IFS='|' read -r s e dom header <<<"$p"
 		f="$(site_file "$dom")"
+		# A domain often has more than one block - "x.com {" plus an
+		# "http://x.com {" redirect. They all belong in the same file, so
+		# every block after the first is appended, never written over it.
+		if [[ "$written" == *" $dom "* ]]; then
+			{ echo; sed -n "${s},${e}p" "$CADDYFILE"; } >> "$f"
+			ranges+="$s-$e "
+			continue
+		fi
+		written+="$dom "
 		if [[ -f "$f" ]]; then
 			warn "replacing the managed copy of $dom with the Caddyfile block"
 			stage_edit "$f"
@@ -2190,8 +2333,7 @@ cmd_import() {
 
 	hdr "Applying"
 	apply
-	for p in "${pick[@]}"; do
-		IFS='|' read -r s e dom header <<<"$p"
+	for dom in $written; do
 		ok "$dom -> $(site_file "$dom")"
 	done
 	dim "backup of the old Caddyfile: $bak"
@@ -2406,8 +2548,13 @@ def parse_site(text):
                 info["paths"].append(tok)
     info["strict_path"] = "@app path" in text
 
+    # the plain "http://name { bind ...; redir https://{host}{uri} }" block
+    # written next to a site behind a front proxy belongs to that site
+    text = re.sub(r"\n?(#[^\n]*\n)?http://\S+\s*\{\s*(bind\s+\S+\s*)?"
+                  r"redir\s+https://\{host\}\{uri\}(\s+permanent)?\s*\}\s*", "\n", text)
     stack = []          # open blocks, as (directive, argument)
     handle = None       # path of the handle block we are in ("" = catch-all)
+    blocks = http_blocks = 0
 
     def body_target(words):
         d = words[0]
@@ -2434,8 +2581,9 @@ def parse_site(text):
         depth = len(stack)
         if depth == 0:
             addr = words[0]
+            blocks += 1
             if addr.startswith("http://"):
-                info["no_tls"] = not info["behind_xray"]
+                http_blocks += 1
                 mp = re.match(r"http://[^:/]+:(\d+)", addr)
                 if mp:
                     info["listen_port"] = mp.group(1)
@@ -2478,6 +2626,12 @@ def parse_site(text):
                 info["unknown"].append(d)
         if opens:
             stack.append((d, words[1] if len(words) > 2 else ""))
+    # plain HTTP only when every block is http:// (an "https + http redirect"
+    # pair is an HTTPS site); and the form writes one block, so a file with
+    # several would lose the others if saved from it
+    info["no_tls"] = blocks > 0 and http_blocks == blocks and not info["behind_xray"]
+    if blocks > 1:
+        info["unknown"].append("several site blocks")
     # A remote site gets its own name as Host automatically, so that one is
     # implied by the target rather than chosen; only a forced value is shown.
     th = re.sub(r"^[a-z]+://", "", info["target"]).split("/")[0].rsplit(":", 1)[0]
@@ -2590,6 +2744,26 @@ def site_config(domain):
             return fh.read()
     except OSError:
         return None
+
+
+def front_proxy():
+    """Caddy's https_port when something else owns :443 and hands traffic
+    over (an SNI proxy such as DNSGuard). Mirrors caddy_front_port()."""
+    try:
+        with open("/etc/caddy/Caddyfile") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return None
+    if not lines or lines[0].strip() != "{":
+        return None
+    for line in lines[1:]:
+        if line.startswith("}"):
+            break
+        m = re.match(r"\s*https_port\s+(\d+)", line)
+        if m and m.group(1) != "443":
+            name = "DNSGuard" if os.path.exists("/opt/dnsguard/.env") else port_owner(443)
+            return {"port": m.group(1), "name": name or "?"}
+    return None
 
 
 def caddy_running():
@@ -2801,6 +2975,7 @@ class Handler(BaseHTTPRequestHandler):
                 "front_ip": front_ip(),
                 "caddy_running": caddy_running(),
                 "ports": {"80": port_owner(80), "443": port_owner(443)},
+                "front": front_proxy(),
                 "sites": read_sites(),
                 "caddyfile": caddyfile_blocks(),
             })
@@ -3001,7 +3176,7 @@ LOGIN_PAGE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>smart-caddy</title>
+<title>Smart Caddy</title>
 <style>
 :root{
   --bg:#f6f7f9; --card:#fff; --ink:#16181d; --mut:#6b7280; --line:#e4e6eb;
@@ -3053,7 +3228,7 @@ button:disabled{opacity:.55;cursor:default}
       <circle cx="6.5" cy="17" r="1.1" fill="var(--acc)"/>
     </svg>
     <div class="grow">
-      <h1>smart-caddy</h1>
+      <h1>Smart Caddy</h1>
       <div class="host" id="host"></div>
     </div>
     <div class="lang"><button type="button" data-lang="fa">فا</button><button type="button" data-lang="en">EN</button></div>
@@ -3127,7 +3302,7 @@ PAGE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>smart-caddy</title>
+<title>Smart Caddy</title>
 <style>
 :root{
   --bg:#f6f7f9; --card:#fff; --ink:#16181d; --mut:#6b7280; --line:#e4e6eb;
@@ -3276,7 +3451,7 @@ textarea:focus{outline:2px solid color-mix(in srgb,var(--acc) 45%,transparent);b
 <div class="wrap">
 
 <header>
-  <h1>smart-caddy</h1>
+  <h1>Smart Caddy</h1>
   <span class="pill"><span class="dot" id="dot"></span><span id="status" data-t="checking">checking</span></span>
   <span class="sub ltr" id="meta"></span>
   <span class="grow"></span>
@@ -3411,6 +3586,7 @@ en: {
   loading:'Loading…', close:'Close', cancel:'Cancel', refresh:'Refresh', optional:'(optional)',
   tile_sites:'Sites', tile_certs:'Certificates', tile_exp:'Expiring < 21 days', tile_cf:'Unmanaged in Caddyfile',
   heads_up:'Heads up',
+  front_text:'{0} owns ports 80 and 443 on this server and hands the domains it knows to Caddy on {1}. Add sites normally, without Behind Xray: they are served on loopback, and each new domain is added to the list of {0} for you (it restarts for a few seconds).',
   ports_text:'This machine already has {0} on the address Caddy uses. Caddy cannot share a port, so an ordinary site will fail with <code>address already in use</code>. Add sites with <b>Behind Xray</b> ticked: Caddy listens on a loopback port and you add one fallback row in x-ui.',
   sites:'Sites', th_domain:'Domain', th_backend:'Backend', th_notes:'Notes',
   no_sites:'No sites yet. Add one with the form.', no_sites_cf:'No sites yet. Add one with the form, or import the ones found in the Caddyfile.',
@@ -3465,7 +3641,7 @@ en: {
   diag:'Diagnostics', running:'Running…', no_output:'(no output)',
   diag_title:'Diagnostics & output', diag_idle:'Run diagnostics to check the whole setup: ports, permissions, certificates, DNS and Xray fallbacks. The output of every action you take also shows up here.',
   dup_tag:'defined twice', dup_keep:'Keep this one',
-  confirm_dup:'{0} is defined both here in the Caddyfile and in smart-caddy.\n\nKeep the Caddyfile block: it replaces the managed copy and leaves the Caddyfile. The replaced copy stays in the activity log, and nothing changes if Caddy rejects it.',
+  confirm_dup:'{0} is defined both here in the Caddyfile and in Smart Caddy.\n\nKeep the Caddyfile block: it replaces the managed copy and leaves the Caddyfile. The replaced copy stays in the activity log, and nothing changes if Caddy rejects it.',
   act_add:'Added', act_add_r:'Edited', act_del:'Removed', act_import:'Imported', act_put:'Config saved',
   act_fixbind:'Fixed bind', act_repair:'Repaired', act_uninstall:'Uninstalled', act_del_cert:'Certificate deleted',
   act_renew:'Certificate renewed', act_cert:'SSL handed to Caddy'
@@ -3475,6 +3651,7 @@ fa: {
   loading:'در حال بارگذاری…', close:'بستن', cancel:'انصراف', refresh:'به‌روزرسانی', optional:'(اختیاری)',
   tile_sites:'سایت‌ها', tile_certs:'گواهی‌ها', tile_exp:'انقضا کمتر از ۲۱ روز', tile_cf:'مدیریت‌نشده در Caddyfile',
   heads_up:'توجه',
+  front_text:'روی این سرور {0} پورت‌های 80 و 443 را دارد و دامنه‌هایی را که می‌شناسد روی {1} به Caddy تحویل می‌دهد. سایت‌ها را معمولی و بدون تیک «پشت Xray» اضافه کنید: روی loopback سرو می‌شوند و هر دامنهٔ جدید خودکار به فهرست {0} اضافه می‌شود ({0} چند ثانیه ری‌استارت می‌شود).',
   ports_text:'روی آدرسی که Caddy استفاده می‌کند، {0} از قبل پورت را گرفته است. Caddy نمی‌تواند پورت را با برنامهٔ دیگری شریک شود، پس سایت معمولی با خطای <code>address already in use</code> بالا نمی‌آید. سایت‌ها را با تیک <b>پشت Xray</b> اضافه کنید: Caddy روی یک پورت داخلی گوش می‌دهد و شما یک ردیف fallback در x-ui اضافه می‌کنید.',
   sites:'سایت‌ها', th_domain:'دامنه', th_backend:'مقصد', th_notes:'توضیحات',
   no_sites:'هنوز سایتی نیست. از فرم یکی اضافه کنید.', no_sites_cf:'هنوز سایتی نیست. از فرم یکی اضافه کنید یا سایت‌های پیداشده در Caddyfile را وارد کنید.',
@@ -3529,7 +3706,7 @@ fa: {
   diag:'عیب‌یابی', running:'در حال اجرا…', no_output:'(بدون خروجی)',
   diag_title:'عیب‌یابی و خروجی', diag_idle:'با اجرای عیب‌یابی کل تنظیمات بررسی می‌شود: پورت‌ها، دسترسی فایل‌ها، گواهی‌ها، DNS و fallbackهای Xray. خروجی هر کاری که انجام می‌دهید هم اینجا نمایش داده می‌شود.',
   dup_tag:'دو بار تعریف شده', dup_keep:'همین را نگه دار',
-  confirm_dup:'{0} هم اینجا در Caddyfile و هم در smart-caddy تعریف شده است.\n\nبلاک Caddyfile نگه داشته شود: جای نسخهٔ مدیریت‌شده را می‌گیرد و از Caddyfile خارج می‌شود. نسخهٔ جایگزین‌شده در گزارش تغییرات می‌ماند و اگر Caddy قبول نکند هیچ چیز تغییر نمی‌کند.',
+  confirm_dup:'{0} هم اینجا در Caddyfile و هم در Smart Caddy تعریف شده است.\n\nبلاک Caddyfile نگه داشته شود: جای نسخهٔ مدیریت‌شده را می‌گیرد و از Caddyfile خارج می‌شود. نسخهٔ جایگزین‌شده در گزارش تغییرات می‌ماند و اگر Caddy قبول نکند هیچ چیز تغییر نمی‌کند.',
   act_add:'افزوده شد', act_add_r:'ویرایش شد', act_del:'حذف شد', act_import:'وارد شد', act_put:'کانفیگ ذخیره شد',
   act_fixbind:'اصلاح bind', act_repair:'تعمیر', act_uninstall:'حذف نصب', act_del_cert:'گواهی حذف شد',
   act_renew:'گواهی تمدید شد', act_cert:'SSL به Caddy سپرده شد'
@@ -3662,7 +3839,12 @@ function render(d){
   const p = d.ports || {};
   const busy443 = p['443'] && p['443'] !== 'caddy';
   const busy80  = p['80']  && p['80']  !== 'caddy';
-  if (busy443 || busy80){
+  if (d.front){
+    // another program owns :80/:443 and hands our names to Caddy - normal
+    // HTTPS sites work here, so no Xray hint and nothing pre-ticked
+    $('#ports-text').innerHTML = t('front_text', '<b>' + esc(d.front.name) + '</b>', '<code>127.0.0.1:' + esc(d.front.port) + '</code>');
+    $('#ports-note').hidden = false;
+  } else if (busy443 || busy80){
     const who = [busy80 ? ':80 (' + esc(p['80']) + ')' : '',
                  busy443 ? ':443 (' + esc(p['443']) + ')' : ''].filter(Boolean).join(' + ');
     $('#ports-text').innerHTML = t('ports_text', '<code>' + who + '</code>');
@@ -4281,7 +4463,9 @@ cmd_panel() {
 
 	# If something else owns both web ports on every interface, a normal :443
 	# site can never bind. Offer the only arrangement that can work here.
-	if [[ $behind_xray -eq 0 ]]; then
+	if [[ $behind_xray -eq 0 && -n "$(caddy_front_port)" ]]; then
+		ok "a front proxy owns :443 and hands traffic to Caddy - the panel goes behind it"
+	elif [[ $behind_xray -eq 0 ]]; then
 		local _o443; _o443="$(port_owner 443)"
 		if [[ -n "$_o443" && "$_o443" != caddy ]]; then
 			warn ":443 is held by '$_o443', so Caddy cannot serve the panel there"
@@ -4411,11 +4595,11 @@ cmd_panel() {
 
 	hdr "4/6  Certificate"
 	local tls_block=""
-	if [[ -f "$(certbot_cert "$domain")" ]]; then
+	if [[ -f "$(certbot_cert "$domain")" ]] && certbot_renew_ok "$domain"; then
 		tls_block=$'\ttls '"$(certbot_cert "$domain") $(certbot_key "$domain")"
 		ok "reusing the existing certbot certificate"
 	else
-		info "Caddy will obtain a certificate after reload"
+		info "Caddy will obtain the certificate and renew it by itself"
 	fi
 
 	hdr "5/6  Caddy site"
@@ -4476,10 +4660,14 @@ cmd_panel() {
 		echo -e "\t\theader_up X-Forwarded-Proto {scheme}"
 		echo -e "\t}"
 		echo "}"
+		if [[ -n "$(caddy_front_port)" ]] && caddy_redirects_off; then
+			redirect_block "$domain"
+		fi
 	} > "$f"
 	chown "root:$(caddy_group)" "$f" 2>/dev/null || true
 	chmod 0644 "$f"
 	apply
+	front_register "$domain"
 
 	hdr "6/6  Done"
 	ok "https://${domain}"
