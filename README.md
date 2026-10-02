@@ -98,13 +98,16 @@ sudo smart-caddy update
 | **Never breaks your server** | `caddy validate` before every reload; any failure rolls back |
 | **Automatic `bind`** | always emitted on multi-IP hosts, so no port collisions |
 | **Permission-safe writes** | edits the Caddyfile in place, never clobbering mode or ownership |
-| **Smart certificates** | reuses an existing certbot or Caddy cert; only requests a new one when there is none |
+| **Certificates on autopilot** | Caddy issues and renews every certificate itself; the panel shows days left and has a one-click **Renew** that puts the old cert back if anything fails |
+| **Adopts your existing Caddy** | finds sites you wrote straight into the Caddyfile and imports them unchanged, so they show up in the panel |
+| **Path routes** | send `/dns-query/*` or `/api/*` to a different backend than the rest of the site |
+| **Activity log** | every change, from the panel or the terminal: who, when, the output, and a diff of exactly which config lines changed |
 | **Many backend types** | a local port, a TLS backend, a directory of files, another site, or a redirect |
 | **Path-aware, not path-fragile** | records an app's base path without 404-ing the rest, so panel WebSockets keep working |
 | **Coexists with Xray** | `--behind-xray` sets up the loopback + PROXY protocol + h2c listener and verifies the fallback exists |
-| **Web panel** | real login page, PBKDF2 passwords, signed sessions, add / edit / remove sites |
+| **Web panel** | Persian / English, real login page, PBKDF2 passwords, signed sessions, add / edit / remove sites, raw config editor |
 | **Safe removal** | on delete, asks whether to keep the certificate (default: keep) |
-| **`doctor`** | listeners, bind, DNS, permissions, WebSocket pitfalls, Xray fallbacks, recent errors |
+| **`doctor`** | listeners, bind, DNS, permissions, certificates that cannot renew, WebSocket pitfalls, Xray fallbacks, recent errors |
 | **`repair`** | fixes file permissions, stale auth blocks and missing HTTP version pins |
 
 ## Web panel
@@ -117,6 +120,23 @@ sudo smart-caddy panel caddy.example.com  # or name it up front
 A localhost-only service behind Caddy with TLS. List your sites, add them, **edit**
 them, remove them, and run the diagnostics — all by calling the same CLI
 underneath, so there is exactly one code path that writes config.
+
+What it shows and does:
+
+- **Persian and English**, with a language switch (right-to-left in Persian).
+- Every site with its backend, routes, and **how many days of SSL are left**,
+  coloured as expiry gets close, with a **Renew** button.
+- One form to add or edit a site, with an explanation under every field:
+  main backend, **path routes**, path prefix, Host header, **SSL certificate**
+  (Caddy, existing certbot, or self-signed), admin-panel preset, plain HTTP,
+  behind Xray.
+- **Config**: edit any site's raw Caddyfile text. It is validated first and rolled
+  back if Caddy rejects it, so a typo cannot take the server down.
+- **Found in Caddyfile**: sites written by hand into the Caddyfile, with one-click
+  import. A domain defined twice gets a "keep this one" button.
+- **Diagnostics & output** and the **Activity log** at the bottom of the page.
+  Each log entry expands to the command's output and a coloured diff of the
+  config files it changed.
 
 It has a real sign-in page, not the browser's native credential box: passwords are
 PBKDF2-HMAC-SHA256 (240k rounds) in `/etc/smart-caddy-panel.json` (mode 0600),
@@ -151,6 +171,11 @@ add <domain> <backend> [opts]            add a site
 del <domain> [--keep-cert|--purge-cert]  remove a site
 del-cert <domain>                        remove only the certificate
 list                                     list sites and certificates
+import [domain...] [--all|--list]        adopt sites already in the Caddyfile
+import <domain> --replace                ... over a managed copy of the same domain
+put <domain> <file>                      replace a site's config with your own text
+cert <domain> caddy                      let Caddy issue and renew the certificate
+renew <domain>                           get a fresh certificate now (rolls back on failure)
 panel <domain> [--user u] [--port n]     install the web panel
 panel status | panel remove [<domain>]   check or remove the web panel
 passwd [user] [--password <p>]           change the panel password
@@ -182,6 +207,8 @@ detects it and offers to switch — that mismatch is the most common cause of a 
 
 | Option | Effect |
 |---|---|
+| `--route <path>=<backend>` | send one path to another backend, e.g. `--route '/dns-query/*=8000'`. Repeatable. |
+| `--replace` | overwrite an existing site in place (keeps its certificate and its Xray loopback port) |
 | `--path <prefix>` | record the app's base path, shown in `list`. Repeatable. |
 | `--strict-path` | additionally refuse everything outside those prefixes |
 | `--behind-xray` | Xray owns `:443` and falls back to us |
@@ -190,7 +217,8 @@ detects it and offers to switch — that mismatch is the most common cause of a 
 | `--insecure` | don't verify the backend's TLS certificate |
 | `--no-buffer` | stream responses through — live stats, SSE, log tails |
 | `--host-header <v>` | force the `Host` header sent upstream (routers want `127.0.0.1`) |
-| `--auto-cert` | request a new cert even if certbot already has one |
+| `--auto-cert` | Caddy issues and renews the certificate itself (recommended) |
+| `--certbot` | use the existing certbot certificate |
 | `--self-signed` | `tls internal` — Caddy's internal CA, for testing |
 | `--no-tls` | plain HTTP |
 | `--no-dns-check` | skip the A-record check |
@@ -214,7 +242,6 @@ which generates:
 panel.example.com {
 	bind 203.0.113.10
 	encode zstd gzip
-	tls /etc/letsencrypt/live/panel.example.com/fullchain.pem /etc/letsencrypt/live/panel.example.com/privkey.pem
 
 	# app base path: /5wSobQvUFuNy4zBUcc
 	reverse_proxy https://127.0.0.1:27389 {
@@ -255,6 +282,75 @@ works.
 
 The app already 404s its own root, so the extra restriction usually buys nothing.
 `--strict-path` restores the strict matcher if you really want it, with a warning.
+
+## Already running Caddy?
+
+Sites you wrote by hand live in the Caddyfile itself, where nothing can see them.
+`setup` and `install` notice them and offer to import; you can also do it any time:
+
+```bash
+sudo smart-caddy import --list     # what is there
+sudo smart-caddy import            # move them into sites.d
+```
+
+Each block moves **byte for byte** into `/etc/caddy/sites.d/<domain>.caddy`, so Caddy
+serves exactly what it served before. The Caddyfile is backed up first, and the move is
+validated and rolled back like any other change. Blocks with no domain name (`:80`, an
+IP, `localhost`) and snippets stay where they are.
+
+Imported sites are read back into the panel's form when they use directives it
+understands — reverse proxies, path routes, files, redirects. Anything more exotic is
+edited as raw text with **Config**.
+
+## Path routes
+
+One domain, several backends. A DNS-over-HTTPS server with its own admin page and a
+public landing page, for example:
+
+```bash
+sudo smart-caddy add dns.example.com 8088 \
+    --route '/dns-query/*=8000' --route '/panel*=8000'
+```
+
+Each route becomes a `handle` block, and the main backend takes everything else:
+
+```caddyfile
+	handle /dns-query/* {
+		reverse_proxy 127.0.0.1:8000 { ... }
+	}
+	handle /panel* {
+		reverse_proxy 127.0.0.1:8000 { ... }
+	}
+	handle {
+		reverse_proxy 127.0.0.1:8088 { ... }
+	}
+```
+
+## Certificates
+
+By default Caddy gets every certificate from Let's Encrypt and renews it about 30
+days before expiry, with nothing else to run. `list` and the panel show what each
+site actually uses and how long it has left.
+
+A certbot certificate from before Caddy can quietly stop renewing: its `standalone`
+mode needs port 80, which Caddy now holds, and its `nginx` mode needs nginx. `doctor`
+flags that case, and one command hands the certificate to Caddy without downtime:
+
+```bash
+sudo smart-caddy cert panel.example.com caddy
+```
+
+`renew` fetches a fresh certificate on demand. Caddy keeps certificates in memory, so
+it restarts Caddy for about a second; the current certificate is set aside first and
+put back if no new one arrives. Let's Encrypt allows five renewals of the same name
+per week.
+
+## Activity log
+
+Every command that changes something — from the panel or the terminal — appends one
+entry to `/var/log/smart-caddy/activity.jsonl` (the last 500 are kept): when, who
+(`user@ip` from the panel), the command, its output, and a unified diff of every file
+it touched. The panel shows it at the bottom of the page.
 
 ## Sharing port 443 with Xray
 
@@ -332,6 +428,7 @@ sudo smart-caddy doctor
 | `permission denied` on the Caddyfile | mode/ownership clobbered → `smart-caddy repair` |
 | Browser shows a native login popup | an old `basic_auth` block → `smart-caddy repair` |
 | Certificate never issued | A record points elsewhere, CDN proxy on, or port 80 closed |
+| certbot certificate about to expire | certbot cannot renew while Caddy holds :80 → `smart-caddy cert <domain> caddy` |
 | `502 Bad Gateway` | backend down, or it speaks HTTPS and you gave a plain `host:port` |
 | Panel loads but **live stats stay empty** | a forced `Host` header, a `--strict-path` restriction, buffering, or a missing `versions 1.1` |
 | `address already in use` | another service holds that IP:port — `ss -tnlp \| grep ':443'` |

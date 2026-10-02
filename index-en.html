@@ -285,7 +285,10 @@ var ICON = {
   panel:'<rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M3 9h18M8 9v11"/>',
   split:'<path d="M4 6h5l5 6 5-6"/><path d="M4 18h5l5-6"/><circle cx="20" cy="6" r="1.6"/><circle cx="20" cy="18" r="1.6"/>',
   stetho:'<path d="M6 3v5a4.5 4.5 0 0 0 9 0V3"/><path d="M10.5 12.5v2a5 5 0 0 0 5 5 4 4 0 0 0 4-4v-2"/><circle cx="19.5" cy="9" r="2"/>',
-  refresh:'<path d="M20 11a8 8 0 0 0-13.5-4.5L4 9"/><path d="M4 5v4h4"/><path d="M4 13a8 8 0 0 0 13.5 4.5L20 15"/><path d="M20 19v-4h-4"/>'
+  refresh:'<path d="M20 11a8 8 0 0 0-13.5-4.5L4 9"/><path d="M4 5v4h4"/><path d="M4 13a8 8 0 0 0 13.5 4.5L20 15"/><path d="M20 19v-4h-4"/>',
+  route:'<circle cx="6" cy="18" r="2"/><circle cx="18" cy="6" r="2"/><path d="M8 18h6a4 4 0 0 0 0-8h-4a4 4 0 0 1 0-8h6"/>',
+  history:'<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 2"/>',
+  inbox:'<path d="M3 13h5l1.5 3h5L16 13h5"/><path d="M5 5h14l2 8v6H3v-6l2-8z"/>'
 };
 
 var T = {
@@ -303,8 +306,8 @@ en:{
   f:[
     ["bolt","One command, one file",
      "A single self-contained script. No repo to clone, no dependencies to install, no config file to write by hand. The installer always pulls the latest release."],
-    ["lock","Certificates handled for you",
-     "New domain, new certificate, automatically. If certbot already has one for that domain, it is reused instead of requesting a duplicate. Removing a domain never silently deletes its certificate — you are asked first."],
+    ["lock","Certificates on autopilot",
+     "Caddy issues and renews every certificate by itself. The panel shows how many days each one has left and offers a one-click Renew that puts the old certificate back if anything fails. A certbot certificate that can no longer renew is flagged and handed to Caddy in one click."],
     ["shield","Validated before it is applied",
      "Every change is written, validated with caddy validate, and only then reloaded. A config that would not start is rolled back and the running server is untouched."],
     ["layers","Ports, files, sites, redirects",
@@ -316,7 +319,13 @@ en:{
     ["stetho","Diagnoses itself",
      "doctor reports what is actually listening on :80 and :443, which blocks are missing bind, whether DNS points here, and which certificates exist. repair fixes permissions and reloads."],
     ["refresh","Updates by content, not version string",
-     "update compares the installed script with the latest release byte for byte, so a re-uploaded release is still detected. Nothing changes if they are identical."]
+     "update compares the installed script with the latest release byte for byte, so a re-uploaded release is still detected. Nothing changes if they are identical."],
+    ["inbox","Adopts the Caddy you already have",
+     "Sites written by hand into the Caddyfile are found and imported unchanged, byte for byte, so Caddy keeps serving exactly the same thing — but now they show up in the panel and can be edited."],
+    ["route","Several backends on one domain",
+     "Path routes send /dns-query/* to one service and the rest of the site to another — the layout a DNS-over-HTTPS server with an admin page needs, set up from the form."],
+    ["history","An activity log with diffs",
+     "Every change from the panel or the terminal is recorded: who made it, when, what it printed, and a coloured diff of exactly which config lines changed."]
   ],
 
   tH:"A backend is not only a port",
@@ -344,9 +353,14 @@ en:{
   pH:"A web panel, if you want one",
   pS:"One command puts a real admin page on a domain of your choosing. It is a small Python service using only the standard library — no Node, no pip, nothing to keep updated.",
   p:[
+    "Persian and English, with a language switch",
     "A login page with sessions, not the browser's credential popup",
-    "Add, edit and remove domains without touching a config file",
-    "Shows each domain's backend, certificate and expiry date at a glance",
+    "Add, edit and remove domains without touching a config file — every field explained",
+    "Path routes, SSL source and the admin-panel preset right in the form",
+    "Days of SSL left for every domain, with a one-click Renew",
+    "Edit any site's raw config, validated and rolled back if rejected",
+    "Imports sites found in your Caddyfile with one click",
+    "An activity log at the bottom: every change, with its diff",
     "Shows what is really listening on :80 and :443 right now",
     "Runs diagnostics and the bind repair from the page",
     "Auto-detects when Xray holds :443 and ticks Behind Xray for you",
@@ -360,7 +374,7 @@ en:{
   s:[
     ["Rollback on failure","If the new config does not validate, or the reload fails, the file is removed and Caddy keeps running the config it already had."],
     ["Permissions preserved","Config files are edited in place instead of being replaced, so ownership and mode never change under you — a mistake that locks Caddy out of its own files."],
-    ["Certificates are never assumed","An existing certbot certificate is detected and reused. Deleting one is a separate, explicit command."],
+    ["Certificates never left to rot","Caddy renews every certificate itself; a certbot one that cannot renew here is flagged by doctor. Renew sets the current certificate aside and restores it if no new one arrives. Deleting one is a separate, explicit command."],
     ["Multi-IP aware","On a server with several addresses, every site block gets an explicit bind, so Caddy never grabs 0.0.0.0 and collides with another service."],
     ["Nothing is hardcoded","No IP, domain, port or path is baked in. The same script runs on a one-IP VPS and on a multi-IP box."],
     ["Uninstall leaves the certs","Removing the integration does not touch your certificates or Caddy itself."]
@@ -376,6 +390,10 @@ en:{
     ["del &lt;domain&gt;","Removes a domain. --keep-cert or --purge-cert decides the certificate."],
     ["del-cert &lt;domain&gt;","Removes only the certificate."],
     ["list","Lists domains, backends and certificates."],
+    ["import [domain]","Adopts sites written into the Caddyfile, unchanged. --replace keeps the Caddyfile copy of a domain defined twice."],
+    ["put &lt;domain&gt; &lt;file&gt;","Replaces a site's config with your own text — validated, rolled back if rejected."],
+    ["cert &lt;domain&gt; caddy","Hands a site's certificate to Caddy, which issues and renews it itself."],
+    ["renew &lt;domain&gt;","Gets a fresh certificate now; the old one returns if it fails."],
     ["panel &lt;domain&gt;","Installs the web panel there. --behind-xray for an Xray fallback."],
     ["panel status | remove","Checks or removes the web panel."],
     ["passwd","Changes the panel password from the terminal."],
@@ -391,7 +409,7 @@ en:{
     ["Will it break what is already running on my server?",
      "It is built not to. Every change is validated before it is applied and rolled back if it fails, so a bad config never reaches the running server. If port 443 is already taken it says so instead of failing to start, and --behind-xray is there for exactly that case."],
     ["I already have certbot certificates. Will it request new ones?",
-     "No. It looks for an existing certificate for the domain and uses it. Pass --auto-cert only if you specifically want a new one."],
+     "Not unless you want it. Caddy is the recommended choice: it issues and renews certificates itself. But once Caddy holds port 80, certbot's standalone and nginx modes cannot renew anymore — doctor warns about it, and cert <domain> caddy (or one click in the panel) hands the certificate to Caddy without downtime."],
     ["What happens to my certificates when I remove a domain?",
      "Nothing, unless you say so. del asks, and --keep-cert or --purge-cert answers in advance. del-cert exists separately for when you only want the certificate gone."],
     ["Does it work on a server with one IP address?",
@@ -401,7 +419,7 @@ en:{
     ["How do I update it?",
      "smart-caddy update. It compares the installed script against the latest release by content, so re-uploading a release is still detected as a change."],
     ["Does it touch my existing Caddyfile?",
-     "It appends an import line for its own sites directory and otherwise leaves your blocks alone. Each domain it manages lives in its own file."]
+     "It appends an import line for its own sites directory and otherwise leaves your blocks alone. Each domain it manages lives in its own file. If you want your existing sites in the panel, import moves them into that directory unchanged, after a backup."]
   ],
 
   ctaH:"One command and you're done",
@@ -423,8 +441,8 @@ fa:{
   f:[
     ["bolt","یک دستور، یک فایل",
      "یک اسکریپت کامل و خودبسنده. نه ریپویی برای clone، نه وابستگی‌ای برای نصب، نه فایل کانفیگی که دستی بنویسی. نصب‌کننده همیشه آخرین نسخه را می‌آورد."],
-    ["lock","گواهی‌ها را خودش می‌گیرد",
-     "دامنهٔ جدید، گواهی جدید، خودکار. اگر certbot از قبل برای همان دامنه گواهی داشته باشد، همان استفاده می‌شود و درخواست تکراری نمی‌رود. حذف دامنه هرگز بی‌سروصدا گواهی را پاک نمی‌کند — اول می‌پرسد."],
+    ["lock","گواهی‌ها کاملاً خودکار",
+     "Caddy همهٔ گواهی‌ها را خودش می‌گیرد و تمدید می‌کند. پنل نشان می‌دهد هر گواهی چند روز دیگر وقت دارد و دکمهٔ تمدید تک‌کلیکی دارد که اگر چیزی خراب شود گواهی قبلی را برمی‌گرداند. گواهی certbot که دیگر تمدید نمی‌شود اعلام می‌شود و با یک کلیک به Caddy سپرده می‌شود."],
     ["shield","قبل از اعمال، اعتبارسنجی",
      "هر تغییر نوشته می‌شود، با caddy validate بررسی می‌شود و تنها بعد از آن reload می‌شود. کانفیگی که بالا نمی‌آمد برگردانده می‌شود و سرویسِ در حال اجرا دست‌نخورده می‌ماند."],
     ["layers","پورت، فایل، سایت، ریدایرکت",
@@ -436,7 +454,13 @@ fa:{
     ["stetho","خودش را عیب‌یابی می‌کند",
      "دستور doctor می‌گوید واقعاً چه چیزی روی ۸۰ و ۴۴۳ گوش می‌دهد، کدام بلاک bind ندارد، آیا DNS به اینجا اشاره می‌کند و چه گواهی‌هایی موجودند. دستور repair دسترسی فایل‌ها را درست می‌کند و reload می‌زند."],
     ["refresh","آپدیت بر اساس محتوا، نه شمارهٔ نسخه",
-     "دستور update اسکریپت نصب‌شده را بایت‌به‌بایت با آخرین نسخه مقایسه می‌کند، پس ریلیزی که دوباره آپلود شده هم تشخیص داده می‌شود. اگر یکی باشند، چیزی عوض نمی‌شود."]
+     "دستور update اسکریپت نصب‌شده را بایت‌به‌بایت با آخرین نسخه مقایسه می‌کند، پس ریلیزی که دوباره آپلود شده هم تشخیص داده می‌شود. اگر یکی باشند، چیزی عوض نمی‌شود."],
+    ["inbox","Caddy فعلی‌ات را می‌پذیرد",
+     "سایت‌هایی که دستی در Caddyfile نوشته شده‌اند پیدا و بدون هیچ تغییری، بایت‌به‌بایت، وارد می‌شوند؛ Caddy دقیقاً همان را سرو می‌کند، ولی حالا در پنل دیده و ویرایش می‌شوند."],
+    ["route","چند مقصد روی یک دامنه",
+     "مسیرها /dns-query/* را به یک سرویس و بقیهٔ سایت را به سرویس دیگر می‌فرستند — همان چیدمانی که یک سرور DNS-over-HTTPS با صفحهٔ مدیریت لازم دارد، از داخل فرم."],
+    ["history","گزارش تغییرات با diff",
+     "هر تغییر از پنل یا ترمینال ثبت می‌شود: چه کسی، کی، چه خروجی‌ای داشت، و diff رنگی دقیقاً همان خطوطی از کانفیگ که عوض شد."]
   ],
 
   tH:"مقصد فقط پورت نیست",
@@ -464,9 +488,14 @@ fa:{
   pH:"پنل وب، اگر خواستی",
   pS:"یک دستور، یک صفحهٔ مدیریت واقعی روی دامنهٔ دلخواهت. یک سرویس کوچک پایتون فقط با کتابخانهٔ استاندارد — نه Node، نه pip، نه چیزی که لازم باشد آپدیت نگه داری.",
   p:[
+    "فارسی و انگلیسی، با دکمهٔ تغییر زبان",
     "صفحهٔ ورود با نشست، نه پنجرهٔ رمز مرورگر",
-    "افزودن، ویرایش و حذف دامنه بدون دست زدن به فایل کانفیگ",
-    "نمایش مقصد، گواهی و تاریخ انقضای هر دامنه در یک نگاه",
+    "افزودن، ویرایش و حذف دامنه بدون دست زدن به فایل کانفیگ — با توضیح هر فیلد",
+    "مسیرها، منبع SSL و پیش‌تنظیم پنل مدیریتی داخل همان فرم",
+    "تعداد روزهای باقی‌ماندهٔ SSL هر دامنه، با دکمهٔ تمدید",
+    "ویرایش متن خام کانفیگ هر سایت، با بررسی و برگشت در صورت خطا",
+    "وارد کردن تک‌کلیکی سایت‌های پیداشده در Caddyfile",
+    "گزارش تغییرات پایین صفحه: هر تغییر با diff آن",
     "نمایش این‌که همین حالا واقعاً چه چیزی روی ۸۰ و ۴۴۳ گوش می‌دهد",
     "اجرای عیب‌یابی و اصلاح bind از داخل صفحه",
     "تشخیص خودکار این‌که ایکس‌ری ۴۴۳ را گرفته و زدن تیک Behind Xray",
@@ -480,7 +509,7 @@ fa:{
   s:[
     ["برگشت در صورت خطا","اگر کانفیگ جدید اعتبارسنجی نشود یا reload شکست بخورد، فایل حذف می‌شود و Caddy با همان کانفیگ قبلی به کارش ادامه می‌دهد."],
     ["حفظ دسترسی فایل‌ها","فایل‌های کانفیگ در جای خودشان ویرایش می‌شوند نه جایگزین، پس مالکیت و سطح دسترسی زیر دستت عوض نمی‌شود — اشتباهی که Caddy را از فایل خودش محروم می‌کند."],
-    ["دربارهٔ گواهی فرض نمی‌گیرد","گواهی موجود certbot تشخیص داده و استفاده می‌شود. حذف گواهی یک دستور جدا و صریح است."],
+    ["گواهی‌ها رها نمی‌شوند","Caddy همهٔ گواهی‌ها را خودش تمدید می‌کند؛ گواهی certbot که اینجا تمدید نمی‌شود را doctor اعلام می‌کند. تمدید دستی گواهی فعلی را کنار می‌گذارد و اگر گواهی جدید نرسد برمی‌گرداند. حذف گواهی یک دستور جدا و صریح است."],
     ["آگاه از چند آی‌پی","روی سروری با چند آدرس، هر بلاک سایت bind صریح می‌گیرد، پس Caddy هیچ‌وقت 0.0.0.0 را نمی‌قاپد و با سرویس دیگری تصادم نمی‌کند."],
     ["هیچ چیز هاردکد نیست","هیچ آی‌پی، دامنه، پورت یا مسیری داخلش ثابت نشده. همان اسکریپت روی VPS تک‌آی‌پی و روی سرور چندآی‌پی اجرا می‌شود."],
     ["حذف نصب، گواهی‌ها را نگه می‌دارد","برداشتن یکپارچه‌سازی به گواهی‌ها و به خود Caddy دست نمی‌زند."]
@@ -496,6 +525,10 @@ fa:{
     ["del &lt;domain&gt;","حذف دامنه. سرنوشت گواهی با --keep-cert یا --purge-cert تعیین می‌شود."],
     ["del-cert &lt;domain&gt;","حذف فقط گواهی."],
     ["list","فهرست دامنه‌ها، مقصدها و گواهی‌ها."],
+    ["import [domain]","وارد کردن بدون تغییر سایت‌هایی که در Caddyfile نوشته شده‌اند. --replace نسخهٔ Caddyfile دامنهٔ دوبار تعریف‌شده را نگه می‌دارد."],
+    ["put &lt;domain&gt; &lt;file&gt;","جایگزینی کانفیگ سایت با متن خودت — با بررسی و برگشت در صورت رد شدن."],
+    ["cert &lt;domain&gt; caddy","سپردن گواهی سایت به Caddy که خودش می‌گیرد و تمدید می‌کند."],
+    ["renew &lt;domain&gt;","گرفتن گواهی تازه همین حالا؛ اگر نشد گواهی قبلی برمی‌گردد."],
     ["panel &lt;domain&gt;","نصب پنل وب روی آن دامنه. برای fallback ایکس‌ری، --behind-xray."],
     ["panel status | remove","بررسی یا حذف پنل وب."],
     ["passwd","تغییر رمز پنل از ترمینال."],
@@ -511,7 +544,7 @@ fa:{
     ["چیزی که الان روی سرورم کار می‌کند خراب می‌شود؟",
      "طوری ساخته شده که نشود. هر تغییر قبل از اعمال اعتبارسنجی می‌شود و در صورت خطا برمی‌گردد، پس کانفیگ خراب هیچ‌وقت به سرویسِ در حال اجرا نمی‌رسد. اگر پورت ۴۴۳ از قبل گرفته باشد همین را می‌گوید، جای این‌که بالا نیاید — و --behind-xray دقیقاً برای همین حالت است."],
     ["از قبل گواهی certbot دارم. گواهی جدید می‌گیرد؟",
-     "نه. اول دنبال گواهی موجود همان دامنه می‌گردد و از همان استفاده می‌کند. اگر مشخصاً گواهی جدید می‌خواهی، --auto-cert را بده."],
+     "مگر خودت بخواهی. گزینهٔ پیشنهادی Caddy است که خودش گواهی را می‌گیرد و تمدید می‌کند. ولی وقتی پورت ۸۰ دست Caddy باشد، حالت‌های standalone و nginx در certbot دیگر تمدید نمی‌کنند — doctor هشدار می‌دهد و cert <domain> caddy (یا یک کلیک در پنل) گواهی را بدون قطعی به Caddy می‌سپارد."],
     ["وقتی دامنه را حذف می‌کنم گواهی‌ام چه می‌شود؟",
      "هیچ، مگر خودت بگویی. دستور del می‌پرسد، و --keep-cert یا --purge-cert جواب را از قبل می‌دهد. دستور del-cert جدا وجود دارد، برای وقتی فقط گواهی را می‌خواهی پاک کنی."],
     ["روی سرور تک‌آی‌پی هم کار می‌کند؟",
@@ -521,7 +554,7 @@ fa:{
     ["چطور آپدیتش کنم؟",
      "با smart-caddy update. اسکریپت نصب‌شده را از نظر محتوا با آخرین نسخه مقایسه می‌کند، پس آپلود دوبارهٔ یک ریلیز هم به‌عنوان تغییر تشخیص داده می‌شود."],
     ["به Caddyfile فعلی من دست می‌زند؟",
-     "فقط یک خط import برای پوشهٔ سایت‌های خودش اضافه می‌کند و به بقیهٔ بلاک‌هایت کاری ندارد. هر دامنه‌ای که مدیریت می‌کند در فایل جدای خودش است."]
+     "فقط یک خط import برای پوشهٔ سایت‌های خودش اضافه می‌کند و به بقیهٔ بلاک‌هایت کاری ندارد. هر دامنه‌ای که مدیریت می‌کند در فایل جدای خودش است. اگر بخواهی سایت‌های فعلی‌ات در پنل باشند، import آن‌ها را بعد از گرفتن نسخهٔ پشتیبان، بدون تغییر به همان پوشه منتقل می‌کند."]
   ],
 
   ctaH:"یک دستور و تمام",
