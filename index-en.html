@@ -327,7 +327,11 @@ en:{
     ["split","Works behind DNSGuard and other SNI proxies",
      "When another program owns :80 and :443 and hands names to Caddy on loopback, sites are created behind it, bound to 127.0.0.1, and a new domain is registered with DNSGuard for you."],
     ["history","An activity log with diffs",
-     "Every change from the panel or the terminal is recorded: who made it, when, what it printed, and a coloured diff of exactly which config lines changed."]
+     "Every change from the panel or the terminal is recorded: who made it, when, what it printed, and a coloured diff of exactly which config lines changed."],
+    ["route","Xray configs behind Cloudflare",
+     "Send a secret path to an XHTTP or gRPC inbound (h2c) or to WebSocket / HTTPUpgrade, and the orange cloud hides your server's IP. The panel has a step-by-step guide for x-ui, Smart Caddy and Cloudflare."],
+    ["panel","Know which server you are on",
+     "Give every server a name, an icon - flags work - and a colour. They show in the browser tab, the favicon, the header and the sign-in page, so two panels side by side never get mixed up."]
   ],
 
   tH:"A backend is not only a port",
@@ -339,7 +343,8 @@ en:{
     ["10.0.0.5:9000","A service on another machine on your network."],
     ["/var/www/mysite","Serve files straight from a directory. No application needed."],
     ["example.com","Proxy through to somebody else's site, with the Host header set to that name."],
-    ["redirect:https://x.com","Send visitors there instead of proxying."]
+    ["redirect:https://x.com","Send visitors there instead of proxying."],
+    ["h2c://127.0.0.1:3103","An Xray XHTTP or gRPC inbound: cleartext HTTP/2, streamed without buffering - for configs behind Cloudflare."]
   ],
 
   xH:"Xray already owns :443? Fine.",
@@ -355,7 +360,10 @@ en:{
   pH:"A web panel, if you want one",
   pS:"One command puts a real admin page on a domain of your choosing. It is a small Python service using only the standard library — no Node, no pip, nothing to keep updated.",
   p:[
+    "A dark frosted-glass interface in tabs, each with a title and an explanation",
     "Persian and English, with a language switch",
+    "Server identity: a name, icon and colour per server in the tab, favicon and header",
+    "A Cloudflare CDN guide and an XHTTP / gRPC route type for configs behind the orange cloud",
     "A login page with sessions, not the browser's credential popup",
     "Add, edit and remove domains without touching a config file — every field explained",
     "Path routes, SSL source and the admin-panel preset right in the form",
@@ -464,7 +472,11 @@ fa:{
     ["split","پشت DNSGuard و SNI proxyهای دیگر",
      "وقتی برنامهٔ دیگری پورت‌های ۸۰ و ۴۴۳ را دارد و دامنه‌ها را روی loopback به Caddy می‌دهد، سایت‌ها پشت آن روی 127.0.0.1 ساخته می‌شوند و دامنهٔ جدید خودکار در DNSGuard ثبت می‌شود."],
     ["history","گزارش تغییرات با diff",
-     "هر تغییر از پنل یا ترمینال ثبت می‌شود: چه کسی، کی، چه خروجی‌ای داشت، و diff رنگی دقیقاً همان خطوطی از کانفیگ که عوض شد."]
+     "هر تغییر از پنل یا ترمینال ثبت می‌شود: چه کسی، کی، چه خروجی‌ای داشت، و diff رنگی دقیقاً همان خطوطی از کانفیگ که عوض شد."],
+    ["route","کانفیگ‌های Xray پشت Cloudflare",
+     "یک مسیر مخفی را به اینباند XHTTP یا gRPC (h2c) یا WebSocket / HTTPUpgrade بفرست تا ابر نارنجی IP سرورت را مخفی کند. پنل برای x-ui، Smart Caddy و Cloudflare راهنمای قدم‌به‌قدم دارد."],
+    ["panel","همیشه بدان روی کدام سرور هستی",
+     "برای هر سرور یک نام، یک آیکون - پرچم هم می‌شود - و یک رنگ بگذار. در تب مرورگر، favicon، بالای پنل و صفحهٔ ورود دیده می‌شوند تا دو پنل کنار هم هیچ‌وقت قاطی نشوند."]
   ],
 
   tH:"مقصد فقط پورت نیست",
@@ -476,7 +488,8 @@ fa:{
     ["10.0.0.5:9000","سرویسی روی ماشینی دیگر در شبکهٔ تو."],
     ["/var/www/mysite","سرو کردن فایل‌ها مستقیم از یک پوشه. هیچ اپلیکیشنی لازم نیست."],
     ["example.com","پروکسی کردن به سایت شخص دیگر، با هدر Host برابر همان نام."],
-    ["redirect:https://x.com","فرستادن بازدیدکننده به آن آدرس، بدون پروکسی."]
+    ["redirect:https://x.com","فرستادن بازدیدکننده به آن آدرس، بدون پروکسی."],
+    ["h2c://127.0.0.1:3103","اینباند XHTTP یا gRPC در Xray: HTTP/2 بدون رمز، استریم بدون بافر - برای کانفیگ‌های پشت Cloudflare."]
   ],
 
   xH:"ایکس‌ری پورت ۴۴۳ را گرفته؟ مشکلی نیست.",
@@ -492,7 +505,10 @@ fa:{
   pH:"پنل وب، اگر خواستی",
   pS:"یک دستور، یک صفحهٔ مدیریت واقعی روی دامنهٔ دلخواهت. یک سرویس کوچک پایتون فقط با کتابخانهٔ استاندارد — نه Node، نه pip، نه چیزی که لازم باشد آپدیت نگه داری.",
   p:[
+    "رابط تیره و شیشه‌ای در تب‌ها، هر کدام با عنوان و توضیح",
     "فارسی و انگلیسی، با دکمهٔ تغییر زبان",
+    "هویت سرور: نام، آیکون و رنگ هر سرور در تب مرورگر، favicon و بالای پنل",
+    "راهنمای CDN کلودفلر و نوع مسیر XHTTP / gRPC برای کانفیگ‌های پشت ابر نارنجی",
     "صفحهٔ ورود با نشست، نه پنجرهٔ رمز مرورگر",
     "افزودن، ویرایش و حذف دامنه بدون دست زدن به فایل کانفیگ — با توضیح هر فیلد",
     "مسیرها، منبع SSL و پیش‌تنظیم پنل مدیریتی داخل همان فرم",
