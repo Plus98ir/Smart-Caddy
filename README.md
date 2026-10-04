@@ -101,12 +101,14 @@ sudo smart-caddy update
 | **Certificates on autopilot** | Caddy issues and renews every certificate itself; the panel shows days left and has a one-click **Renew** that puts the old cert back if anything fails |
 | **Adopts your existing Caddy** | finds sites you wrote straight into the Caddyfile and imports them unchanged, so they show up in the panel |
 | **Path routes** | send `/dns-query/*` or `/api/*` to a different backend than the rest of the site |
+| **Xray configs behind Cloudflare** | route a secret path to an XHTTP / gRPC (`h2c://`) or WebSocket / HTTPUpgrade inbound, so the orange cloud hides the server's IP; the panel has a step-by-step guide |
+| **Server identity** | give each server a name, an icon (flags work) and a colour: shown in the browser tab, favicon, header and sign-in page, so several panels never get mixed up |
 | **Activity log** | every change, from the panel or the terminal: who, when, the output, and a diff of exactly which config lines changed |
 | **Many backend types** | a local port, a TLS backend, a directory of files, another site, or a redirect |
 | **Path-aware, not path-fragile** | records an app's base path without 404-ing the rest, so panel WebSockets keep working |
 | **Behind another front proxy** | when an SNI proxy such as DNSGuard owns `:80`/`:443` and hands names to Caddy on loopback, sites are created behind it and the domain is registered with it for you |
 | **Coexists with Xray** | `--behind-xray` sets up the loopback + PROXY protocol + h2c listener and verifies the fallback exists |
-| **Web panel** | Persian / English, real login page, PBKDF2 passwords, signed sessions, add / edit / remove sites, raw config editor |
+| **Web panel** | frosted-glass dark UI in tabs, Persian / English, real login page, PBKDF2 passwords, signed sessions, add / edit / remove sites, raw config editor |
 | **Safe removal** | on delete, asks whether to keep the certificate (default: keep) |
 | **`doctor`** | listeners, bind, DNS, permissions, certificates that cannot renew, WebSocket pitfalls, Xray fallbacks, recent errors |
 | **`repair`** | fixes file permissions, stale auth blocks and missing HTTP version pins |
@@ -122,22 +124,29 @@ A localhost-only service behind Caddy with TLS. List your sites, add them, **edi
 them, remove them, and run the diagnostics — all by calling the same CLI
 underneath, so there is exactly one code path that writes config.
 
-What it shows and does:
+A dark frosted-glass interface, **Persian and English** (right-to-left in Persian),
+organised in tabs, each with a title and a short explanation:
 
-- **Persian and English**, with a language switch (right-to-left in Persian).
-- Every site with its backend, routes, and **how many days of SSL are left**,
-  coloured as expiry gets close, with a **Renew** button.
-- One form to add or edit a site, with an explanation under every field:
-  main backend, **path routes**, path prefix, Host header, **SSL certificate**
-  (Caddy, existing certbot, or self-signed), admin-panel preset, plain HTTP,
-  behind Xray.
-- **Config**: edit any site's raw Caddyfile text. It is validated first and rolled
+- **Overview** — Caddy's state, certificate counts, expiring certificates, and quick
+  actions.
+- **Sites** — every site with its backend, routes, and **how many days of SSL are
+  left**, coloured as expiry gets close, with a **Renew** button.
+- **Add / Edit site** — one form in four numbered steps, with an explanation under
+  every field: main backend, **path routes** (each with a type:
+  *HTTP / WS / HTTPUpgrade* or *XHTTP / gRPC (h2c)*), SSL certificate (Caddy,
+  existing certbot, or self-signed), path prefix, Host header, admin-panel preset,
+  plain HTTP, behind Xray.
+- **Config** — edit any site's raw Caddyfile text. It is validated first and rolled
   back if Caddy rejects it, so a typo cannot take the server down.
-- **Found in Caddyfile**: sites written by hand into the Caddyfile, with one-click
-  import. A domain defined twice gets a "keep this one" button.
-- **Diagnostics & output** and the **Activity log** at the bottom of the page.
-  Each log entry expands to the command's output and a coloured diff of the
-  config files it changed.
+- **Import** — sites written by hand into the Caddyfile, with one-click import. A
+  domain defined twice gets a "keep this one" button.
+- **Cloudflare CDN** — which Xray transports work behind Cloudflare and the exact
+  steps in x-ui, here and in Cloudflare.
+- **Diagnostics** and **Activity** — the full check, the output of every action,
+  and each change with a coloured diff of the config files it touched.
+- **Settings** — the server's identity: a name, an icon and an accent colour, shown
+  in the browser tab, favicon, header and sign-in page. Stored in
+  `/etc/smart-caddy-brand.json`, untouched by updates.
 
 It has a real sign-in page, not the browser's native credential box: passwords are
 PBKDF2-HMAC-SHA256 (240k rounds) in `/etc/smart-caddy-panel.json` (mode 0600),
@@ -326,6 +335,40 @@ Each route becomes a `handle` block, and the main backend takes everything else:
 		reverse_proxy 127.0.0.1:8088 { ... }
 	}
 ```
+
+## Xray configs behind Cloudflare
+
+Put Caddy between Cloudflare and an Xray inbound: a ping of the domain returns
+Cloudflare's IP, while traffic still leaves from this server. One domain carries
+several configs, each on its own secret path.
+
+| Transport | Through Cloudflare | Route type |
+|---|---|---|
+| XHTTP | yes (`packet-up` everywhere; stream modes need gRPC on in Cloudflare) | `h2c://127.0.0.1:PORT` |
+| gRPC | yes (switch on Network → gRPC) | `h2c://127.0.0.1:PORT` |
+| WebSocket, HTTPUpgrade | yes | `127.0.0.1:PORT` |
+| Reality, TCP, Hysteria2, Shadowsocks | no — Cloudflare only carries HTTP | — |
+
+1. In x-ui, the inbound listens on `127.0.0.1`, security **none** (TLS ends at
+   Caddy — an inbound with its own TLS puts `pinnedPeerCertSha256` in the share
+   link, and behind Cloudflare that pin never matches), a long random path, and
+   your CDN domain as Host.
+2. Add the site with the cloud still grey, a cover page as the main backend, and
+   one route per config:
+
+   ```bash
+   sudo smart-caddy add cdn.example.com redirect:https://www.google.com \
+       --route '/k8Jq2xVt*=h2c://127.0.0.1:3103' --route '/ws9Lp*=3305'
+   ```
+
+3. Once the certificate is issued, turn the cloud orange; SSL/TLS **Full
+   (strict)**; keep *Always Use HTTPS* off so Caddy can renew over port 80.
+4. Client: address = the domain or a clean Cloudflare IP, port 443, TLS, SNI and
+   Host = the domain; ALPN `h2,http/1.1` for XHTTP/gRPC, `http/1.1` for
+   WebSocket/HTTPUpgrade.
+
+`h2c://` routes are streamed without buffering, and a site that has one is served
+without compression, which would otherwise hold the stream back.
 
 ## Certificates
 

@@ -20,7 +20,7 @@
 # =============================================================================
 set -euo pipefail
 
-VERSION="1.5.0"
+VERSION="1.6.0"
 SELF_NAME="smart-caddy"
 CONF_FILE="/etc/smart-caddy.conf"
 
@@ -325,7 +325,7 @@ valid_domain() { [[ "$1" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]
 normalize_target() {
 	local t="$1"
 	[[ "$t" =~ ^[0-9]+$ ]] && t="127.0.0.1:$t"
-	[[ "$t" =~ ^https?://[a-zA-Z0-9._-]+(:[0-9]+)?(/.*)?$ ]] && { echo "$t"; return; }
+	[[ "$t" =~ ^(https?|h2c)://[a-zA-Z0-9._-]+(:[0-9]+)?(/.*)?$ ]] && { echo "$t"; return; }
 	[[ "$t" =~ ^[a-zA-Z0-9._-]+:[0-9]+$ ]] || return 1
 	echo "$t"
 }
@@ -348,6 +348,8 @@ classify_target() {
 	esac
 	if [[ "$t" =~ ^[0-9]+$ ]]; then printf 'proxy 127.0.0.1:%s\n' "$t"; return 0; fi
 	if [[ "$t" =~ ^https?://[a-zA-Z0-9._-]+(:[0-9]+)?(/.*)?$ ]]; then printf 'proxy %s\n' "$t"; return 0; fi
+	# h2c://host:port - cleartext HTTP/2, what Xray XHTTP and gRPC inbounds speak
+	if [[ "$t" =~ ^h2c://[a-zA-Z0-9._-]+:[0-9]+$ ]]; then printf 'proxy %s\n' "$t"; return 0; fi
 	if [[ "$t" =~ ^[a-zA-Z0-9._-]+:[0-9]+$ ]]; then printf 'proxy %s\n' "$t"; return 0; fi
 	if valid_domain "$t"; then printf 'proxy https://%s\n' "$t"; return 0; fi
 	return 1
@@ -1238,7 +1240,7 @@ cmd_add() {
 	fi
 
 	# A backend that speaks TLS on a plain-http target is the most common 502 cause.
-	if [[ "$tkind" == proxy ]] && have curl && [[ "$target" != https://* ]] \
+	if [[ "$tkind" == proxy ]] && have curl && [[ "$target" != https://* && "$target" != h2c://* ]] \
 	   && ! target_is_remote "$target"; then
 		if curl -sk --max-time 3 "https://$hp/" -o /dev/null 2>/dev/null \
 		   && ! curl -s --max-time 3 "http://$hp/" -o /dev/null 2>/dev/null; then
@@ -1324,7 +1326,10 @@ cmd_add() {
 		printf '%s\theader_up X-Real-IP {remote_host}\n'      "$ind"
 		printf '%s\theader_up X-Forwarded-Proto {scheme}\n'   "$ind"
 		printf '%s\theader_up X-Forwarded-Port {server_port}\n' "$ind"
-		if [[ $nobuffer -eq 1 ]]; then
+		if [[ "$target" == h2c://* ]]; then
+			# Xray XHTTP/gRPC: a long-lived stream, never hold it in a buffer
+			printf '%s\tflush_interval -1\n' "$ind"
+		elif [[ $nobuffer -eq 1 ]]; then
 			printf '%s\n%s\t# stream responses straight through - needed for live\n' "" "$ind"
 			printf '%s\t# stats, SSE and log tails, which otherwise sit in a buffer\n' "$ind"
 			printf '%s\tflush_interval -1\n' "$ind"
@@ -1390,7 +1395,8 @@ cmd_add() {
 			echo "$domain {"
 			bind_line
 		fi
-		echo -e "\tencode zstd gzip"
+		# compression buffers the response, which stalls an Xray stream
+		[[ " ${route_specs[*]-} " == *" h2c://"* || "$target" == h2c://* ]] || echo -e "\tencode zstd gzip"
 		[[ -n "$tls_block" ]] && echo "$tls_block"
 
 		local rs
@@ -2482,7 +2488,7 @@ CLI = shutil.which("smart-caddy") or "/usr/local/bin/smart-caddy"
 CONF = "/etc/smart-caddy.conf"
 AUTH_FILE = os.environ.get("SMART_CADDY_PANEL_AUTH", "/etc/smart-caddy-panel.json")
 ACTIVITY_LOG = os.environ.get("SMART_CADDY_ACTIVITY", "/var/log/smart-caddy/activity.jsonl")
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 COOKIE = "sc_session"
 SESSION_HOURS = 12
@@ -2494,7 +2500,7 @@ RE_DOMAIN = re.compile(r"^(?=.{1,253}$)([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9
 # site to proxy, or a redirect. Mirrors classify_target() in the shell script.
 RE_PORT     = re.compile(r"^[0-9]{1,5}$")
 RE_HOSTPORT = re.compile(r"^[a-zA-Z0-9.\-]{1,253}:[0-9]{1,5}$")
-RE_URL      = re.compile(r"^https?://[a-zA-Z0-9.\-]{1,253}(:[0-9]{1,5})?(/[A-Za-z0-9._~\-/]*)?$")
+RE_URL      = re.compile(r"^(https?|h2c)://[a-zA-Z0-9.\-]{1,253}(:[0-9]{1,5})?(/[A-Za-z0-9._~\-/]*)?$")
 RE_DIR      = re.compile(r"^/[A-Za-z0-9._\-/]{0,255}$")
 RE_REDIR    = re.compile(r"^redirect:https?://[A-Za-z0-9.\-]{1,253}(:[0-9]{1,5})?(/[A-Za-z0-9._~\-/]*)?$")
 RE_PATH   = re.compile(r"^/[A-Za-z0-9._~\-/]{0,200}$")
@@ -2618,7 +2624,9 @@ def parse_site(text):
                 elif words[1] not in STD_HEADERS:
                     info["unknown"].append("header_up " + words[1])
             elif d == "flush_interval":
-                info["nobuffer"] = True
+                # implied by an Xray (h2c) route, not the panel option
+                if not stack[-1][1].startswith("h2c://"):
+                    info["nobuffer"] = True
         elif parent == "transport":
             if d == "tls_insecure_skip_verify":
                 info["insecure"] = True
@@ -2764,6 +2772,45 @@ def front_proxy():
             name = "DNSGuard" if os.path.exists("/opt/dnsguard/.env") else port_owner(443)
             return {"port": m.group(1), "name": name or "?"}
     return None
+
+
+# Server identity: a name, an icon and an accent colour, so two panels open
+# side by side are told apart at a glance (tab title, favicon, header, login).
+# Kept in its own file, which installs and updates never touch.
+BRAND_FILE = os.environ.get("SMART_CADDY_BRAND", "/etc/smart-caddy-brand.json")
+BRAND_COLORS = ("violet", "blue", "green", "orange", "pink", "red")
+
+
+def clean_brand(d):
+    d = d if isinstance(d, dict) else {}
+    name = re.sub(r"[\x00-\x1f\x7f<>]", "", str(d.get("name", ""))).strip()[:32]
+    icon = re.sub(r"[\x00-\x1f\x7f<>\s]", "", str(d.get("icon", "")))[:16]
+    color = str(d.get("color", ""))
+    return {"name": name, "icon": icon, "color": color if color in BRAND_COLORS else "violet"}
+
+
+def load_brand():
+    try:
+        with open(BRAND_FILE) as fh:
+            return clean_brand(json.load(fh))
+    except Exception:
+        return clean_brand({})
+
+
+def save_brand(d):
+    b = clean_brand(d)
+    tmp = BRAND_FILE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(b, fh, ensure_ascii=False)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, BRAND_FILE)
+    return b
+
+
+def branded(html):
+    """Bake the identity into the page so title and favicon are right on first paint."""
+    js = json.dumps(load_brand()).replace("</", "<\\/")
+    return html.replace("/*__BRAND__*/null", js)
 
 
 def caddy_running():
@@ -2966,7 +3013,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/":
-            return self.send_html(PAGE if self.authed() else LOGIN_PAGE)
+            return self.send_html(branded(PAGE if self.authed() else LOGIN_PAGE))
         if not self.authed():
             return self.send_json({"error": "unauthorized"}, 401)
         if path == "/api/state":
@@ -2978,6 +3025,7 @@ class Handler(BaseHTTPRequestHandler):
                 "front": front_proxy(),
                 "sites": read_sites(),
                 "caddyfile": caddyfile_blocks(),
+                "brand": load_brand(),
             })
         if path == "/api/config":
             domain = (parse_qs(urlparse(self.path).query).get("domain") or [""])[0].lower()
@@ -3163,6 +3211,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"ok": False, "out": "invalid domain"}, 400)
             return self.send_json(self.cli(["cert", domain, "caddy"]))
 
+        if path == "/api/brand":
+            try:
+                return self.send_json({"ok": True, "brand": save_brand(data)})
+            except Exception as exc:
+                return self.send_json({"ok": False, "out": f"could not save: {exc}"}, 500)
+
         if path == "/api/fixbind":
             return self.send_json(self.cli(["fixbind"]))
         if path == "/api/repair":
@@ -3177,62 +3231,78 @@ LOGIN_PAGE = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Smart Caddy</title>
+<link rel="icon" id="fav" href="data:,">
+<meta name="color-scheme" content="dark">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Vazirmatn:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
+@font-face{font-family:"Flags";font-display:swap;unicode-range:U+1F1E6-1F1FF,U+1F3F4,U+E0062-E007F;
+  src:url("https://cdn.jsdelivr.net/npm/country-flag-emoji-polyfill@0.1.8/dist/TwemojiCountryFlags.woff2") format("woff2")}
 :root{
-  --bg:#f6f7f9; --card:#fff; --ink:#16181d; --mut:#6b7280; --line:#e4e6eb;
-  --acc:#2f6f4f; --acc-ink:#fff; --bad:#b3261e;
+  --bg:#07060d; --card:rgba(255,255,255,.06); --ink:#f4f3fa; --mut:#a9a6bd; --line:rgba(255,255,255,.12);
+  --acc:#8f80ff; --acc-2:#52c3ff; --bad:#ff7d8c; color-scheme:dark;
 }
-@media (prefers-color-scheme:dark){:root:not([data-theme=light]){
-  --bg:#0f1114; --card:#171a1f; --ink:#e8eaed; --mut:#9aa0a6; --line:#2a2e35;
-  --acc:#4e9b74; --acc-ink:#07120c; --bad:#f2b8b5;
-}}
 *{box-sizing:border-box}
-:root{color-scheme:light dark}
-body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px 16px;
-  background:var(--bg);color:var(--ink);
-  font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
-html[lang=fa] body{font-family:Vazirmatn,"Segoe UI",Tahoma,sans-serif}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;
-  padding:30px 28px;width:100%;max-width:370px;
-  box-shadow:0 1px 2px rgba(0,0,0,.05),0 12px 32px rgba(0,0,0,.07)}
-.mark{display:flex;align-items:center;gap:9px;margin-bottom:22px}
-.mark svg{flex:none}
-.mark .grow{flex:1}
-h1{font-size:17px;margin:0;letter-spacing:-.01em}
-.host{font-size:12.5px;color:var(--mut);margin-top:1px;direction:ltr;text-align:start}
-label{display:block;font-size:12px;color:var(--mut);margin:0 0 5px}
-input{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:8px;
-  background:var(--bg);color:var(--ink);font:inherit;font-size:14.5px;margin-bottom:15px}
-input:focus{outline:2px solid color-mix(in srgb,var(--acc) 45%,transparent);
-  outline-offset:1px;border-color:var(--acc)}
-button{width:100%;font:inherit;font-size:14.5px;font-weight:600;padding:11px;
-  border-radius:8px;border:1px solid var(--acc);background:var(--acc);
-  color:var(--acc-ink);cursor:pointer}
-button:hover{filter:brightness(1.08)}
+html{background:var(--bg)}
+body{background:transparent}
+body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px 16px;color:var(--ink);overflow:hidden;
+  font:15px/1.6 Flags,Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+html[lang=fa] body{font-family:Flags,Vazirmatn,Inter,"Segoe UI",Tahoma,sans-serif}
+.bg{position:fixed;inset:0;z-index:-1;overflow:hidden;pointer-events:none;
+  background:radial-gradient(900px 600px at 50% -10%,#1a1440 0%,transparent 60%),var(--bg)}
+.bg i{position:absolute;border-radius:50%;filter:blur(90px);opacity:.55;mix-blend-mode:screen}
+.bg i:nth-child(1){width:42vmax;height:42vmax;left:-10vmax;top:10vh;background:var(--acc);animation:d1 24s ease-in-out infinite alternate}
+.bg i:nth-child(2){width:34vmax;height:34vmax;right:-8vmax;top:-8vh;background:#1f8bff;animation:d2 28s ease-in-out infinite alternate}
+.bg i:nth-child(3){width:26vmax;height:26vmax;left:40vw;bottom:-12vmax;background:#ff7a3d;opacity:.32;animation:d1 32s ease-in-out infinite alternate-reverse}
+@keyframes d1{to{transform:translate(16vw,10vh) scale(1.15)}}
+@keyframes d2{to{transform:translate(-12vw,18vh) scale(.9)}}
+@media (prefers-reduced-motion:reduce){.bg i{animation:none}}
+.card{background:var(--card);border:1px solid var(--line);border-radius:24px;padding:34px 30px;width:100%;max-width:400px;
+  -webkit-backdrop-filter:saturate(160%) blur(22px);backdrop-filter:saturate(160%) blur(22px);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.08),0 30px 70px -20px rgba(0,0,0,.7)}
+.mark{display:flex;align-items:center;gap:12px;margin-bottom:26px}
+.logo{width:42px;height:42px;border-radius:12px;flex:none;display:grid;place-items:center;
+  background:linear-gradient(135deg,var(--acc),var(--acc-2));box-shadow:0 8px 24px -6px color-mix(in srgb,var(--acc) 70%,transparent)}
+.mark .grow{flex:1;min-width:0}
+h1{font-size:19px;margin:0;font-weight:700;letter-spacing:-.01em}
+.host{font-size:12.5px;color:var(--mut);margin-top:1px;direction:ltr;text-align:start;overflow-wrap:anywhere}
+label{display:block;font-size:13px;font-weight:500;margin:0 0 7px}
+input{width:100%;padding:12px 14px;border:1px solid var(--line);border-radius:12px;
+  background:rgba(0,0,0,.3);color:var(--ink);font:inherit;font-size:14.5px;margin-bottom:16px}
+input:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-mix(in srgb,var(--acc) 22%,transparent)}
+button{width:100%;font:inherit;font-size:15px;font-weight:600;padding:12px;border-radius:12px;border:0;
+  background:linear-gradient(135deg,var(--acc),var(--acc-2));color:#fff;cursor:pointer;
+  box-shadow:0 12px 28px -10px color-mix(in srgb,var(--acc) 85%,transparent)}
+button:hover{filter:brightness(1.1)}
 button:disabled{opacity:.55;cursor:default}
-.lang{display:inline-flex;border:1px solid var(--line);border-radius:7px;overflow:hidden}
-.lang button{width:auto;border:0;border-radius:0;background:transparent;color:var(--mut);
-  font-size:12px;font-weight:500;padding:4px 9px}
-.lang button.on{background:var(--acc);color:var(--acc-ink)}
+.lang{display:inline-flex;padding:3px;border-radius:99px;background:rgba(255,255,255,.08);border:1px solid var(--line)}
+.lang button{width:auto;border-radius:99px;background:transparent;color:var(--mut);box-shadow:none;
+  font-size:12px;font-weight:500;padding:4px 10px}
+.lang button.on{background:var(--ink);color:#0b0a14;font-weight:600}
+.srv{display:flex;align-items:center;justify-content:center;gap:9px;padding:10px 14px;margin:-8px 0 22px;border-radius:14px;
+  font-weight:600;font-size:15px;background:color-mix(in srgb,var(--acc) 18%,transparent);
+  border:1px solid color-mix(in srgb,var(--acc) 50%,transparent);overflow-wrap:anywhere}
+.srv .ic{font-size:19px;line-height:1}
 .err{font-size:13px;color:var(--bad);margin:0 0 14px;min-height:1.2em}
-.foot{font-size:11.5px;color:var(--mut);margin:18px 0 0;text-align:center}
+.foot{font-size:12px;color:var(--mut);margin:20px 0 0;text-align:center}
 </style>
 </head>
 <body>
+<div class="bg"><i></i><i></i><i></i></div>
 <form class="card" id="f" autocomplete="on">
   <div class="mark">
-    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <rect x="2.5" y="4" width="19" height="6" rx="2" stroke="var(--acc)" stroke-width="1.6"/>
-      <rect x="2.5" y="14" width="19" height="6" rx="2" stroke="var(--acc)" stroke-width="1.6"/>
-      <circle cx="6.5" cy="7" r="1.1" fill="var(--acc)"/>
-      <circle cx="6.5" cy="17" r="1.1" fill="var(--acc)"/>
-    </svg>
+    <div class="logo" aria-hidden="true"><svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+      <rect x="3" y="4" width="18" height="6" rx="2" stroke="#fff" stroke-width="1.8"/>
+      <rect x="3" y="14" width="18" height="6" rx="2" stroke="#fff" stroke-width="1.8"/>
+      <circle cx="7" cy="7" r="1.2" fill="#fff"/><circle cx="7" cy="17" r="1.2" fill="#fff"/>
+    </svg></div>
     <div class="grow">
       <h1>Smart Caddy</h1>
       <div class="host" id="host"></div>
     </div>
     <div class="lang"><button type="button" data-lang="fa">فا</button><button type="button" data-lang="en">EN</button></div>
   </div>
+
+  <div class="srv" id="srv" hidden><span class="ic" id="srv-icon"></span><span id="srv-name"></span></div>
 
   <label for="u" data-t="user">Username</label>
   <input id="u" name="username" autocomplete="username" dir="ltr" autofocus required>
@@ -3246,6 +3316,47 @@ button:disabled{opacity:.55;cursor:default}
 </form>
 
 <script>
+const $ = s => document.querySelector(s);
+
+// ---------------------------------------------------------------- identity
+const BRAND_COLORS = {violet:['#8f80ff','#52c3ff'], blue:['#4f8bff','#3ee0ff'], green:['#2fd68f','#3ec9ff'],
+                      orange:['#ff8a3d','#ffc94d'], pink:['#ff5fa2','#a77bff'], red:['#ff5468','#ff9d5c']};
+let BRAND = Object.assign({name:'', icon:'', color:'violet'}, /*__BRAND__*/null || {});
+
+function escXml(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+// Favicon text: a flag becomes its two letters (Windows has no flag emoji),
+// any other icon is used as is, else the name's initials, else "SM".
+function favText(b){
+  const cps = [...(b.icon || '')];
+  if (cps.length === 2 && cps.every(c => { const n = c.codePointAt(0); return n >= 0x1F1E6 && n <= 0x1F1FF; }))
+    return cps.map(c => String.fromCharCode(c.codePointAt(0) - 0x1F1E6 + 65)).join('');
+  if (cps.length) return b.icon;
+  const w = (b.name || '').trim().split(/\s+/).filter(Boolean);
+  if (w.length) return (w.length > 1 ? [...w[0]][0] + [...w[1]][0] : [...w[0]].slice(0, 2).join('')).toUpperCase();
+  return 'SM';
+}
+function favUrl(b){
+  const c = BRAND_COLORS[b.color] || BRAND_COLORS.violet, txt = favText(b);
+  const fs = /^[A-Z0-9]{1,2}$/.test(txt) ? 28 : ([...txt].length > 2 ? 22 : 36);
+  const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">'
+    + '<stop offset="0" stop-color="' + c[0] + '"/><stop offset="1" stop-color="' + c[1] + '"/></linearGradient></defs>'
+    + '<rect width="64" height="64" rx="16" fill="url(#g)"/><text x="32" y="34" text-anchor="middle" dominant-baseline="middle" '
+    + 'font-family="Segoe UI,Arial,sans-serif" font-weight="700" font-size="' + fs + '" fill="#fff">' + escXml(txt) + '</text></svg>';
+  return 'data:image/svg+xml,' + encodeURIComponent(svg);
+}
+function brandTitle(b){ return (b.name ? (b.icon ? b.icon + ' ' : '') + b.name + ' · ' : '') + 'Smart Caddy'; }
+function applyBrand(b){
+  const c = BRAND_COLORS[b.color] || BRAND_COLORS.violet;
+  document.documentElement.style.setProperty('--acc', c[0]);
+  document.documentElement.style.setProperty('--acc-2', c[1]);
+  $('#fav').href = favUrl(b);
+  document.title = brandTitle(b);
+  $('#srv').hidden = !(b.name || b.icon);
+  $('#srv-icon').textContent = b.icon || '';
+  $('#srv-icon').hidden = !b.icon;
+  $('#srv-name').textContent = b.name || '';
+}
+applyBrand(BRAND);
 const I18N = {
   en: {user:'Username', pass:'Password', signin:'Sign in', signing:'Signing in…',
        foot:'Reverse proxy management', wrong:'Wrong username or password',
@@ -3302,274 +3413,555 @@ PAGE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
 <title>Smart Caddy</title>
+<link rel="icon" id="fav" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Vazirmatn:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
+@font-face{font-family:"Flags";font-display:swap;unicode-range:U+1F1E6-1F1FF,U+1F3F4,U+E0062-E007F;
+  src:url("https://cdn.jsdelivr.net/npm/country-flag-emoji-polyfill@0.1.8/dist/TwemojiCountryFlags.woff2") format("woff2")}
 :root{
-  --bg:#f6f7f9; --card:#fff; --ink:#16181d; --mut:#6b7280; --line:#e4e6eb;
-  --acc:#2f6f4f; --acc-ink:#fff; --bad:#b3261e; --warn:#8a5a00; --ok:#1f7a4d;
-  --add:#1f7a4d; --del:#b3261e; --radius:10px;
+  --bg:#07060d; --glass:rgba(255,255,255,.055); --glass-2:rgba(255,255,255,.09);
+  --glass-3:rgba(255,255,255,.14); --stroke:rgba(255,255,255,.11); --stroke-2:rgba(255,255,255,.2);
+  --ink:#f4f3fa; --mut:#a9a6bd; --dim:#7d7a92;
+  --acc:#8f80ff; --acc-2:#52c3ff; --acc-ink:#0b0920; --warm:#ff9d5c;
+  --ok:#5fe3a1; --warn:#ffc24d; --bad:#ff7d8c; --add:#5fe3a1; --del:#ff9aa5;
+  --r:20px; --r-sm:12px;
+  --blur:saturate(160%) blur(22px);
+  --font:Flags,Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  color-scheme:dark;
 }
-@media (prefers-color-scheme:dark){:root:not([data-theme=light]){
-  --bg:#0f1114; --card:#171a1f; --ink:#e8eaed; --mut:#9aa0a6; --line:#2a2e35;
-  --acc:#4e9b74; --acc-ink:#07120c; --bad:#f2b8b5; --warn:#e3b341; --ok:#6cc48f;
-  --add:#6cc48f; --del:#f2a19c;
-}}
 *{box-sizing:border-box}
-:root{color-scheme:light dark}
-@media (prefers-color-scheme:light){:root{color-scheme:light}}
-body{margin:0;background:var(--bg);color:var(--ink);
-  font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
-html[lang=fa] body{font-family:Vazirmatn,"Segoe UI",Tahoma,sans-serif}
-.wrap{max-width:1680px;margin:0 auto;padding:24px 28px 64px}
-header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:6px}
-header .grow{flex:1}
-h1{font-size:20px;margin:0;letter-spacing:-.01em}
-.sub{color:var(--mut);font-size:13px}
+html{background:var(--bg)}
+body{background:transparent}
+body{margin:0;color:var(--ink);font:15px/1.6 var(--font);min-height:100vh;overflow-x:hidden}
+html[lang=fa] body{font-family:Flags,Vazirmatn,var(--font)}
+
+/* ---- background: slow drifting light behind frosted glass ---- */
+.bg{position:fixed;inset:0;z-index:-1;overflow:hidden;pointer-events:none;
+  background:radial-gradient(1200px 700px at 50% -10%,#1a1440 0%,transparent 60%),var(--bg)}
+.bg i{position:absolute;border-radius:50%;filter:blur(90px);opacity:.42;mix-blend-mode:screen}
+.bg i:nth-child(1){width:46vmax;height:46vmax;left:-12vmax;top:8vh;background:var(--acc);animation:drift1 26s ease-in-out infinite alternate}
+.bg i:nth-child(2){width:38vmax;height:38vmax;right:-10vmax;top:-6vh;background:#1f8bff;animation:drift2 30s ease-in-out infinite alternate}
+.bg i:nth-child(3){width:30vmax;height:30vmax;left:35vw;bottom:-14vmax;background:#ff7a3d;opacity:.32;animation:drift3 34s ease-in-out infinite alternate}
+.bg::after{content:"";position:absolute;inset:0;background:
+  linear-gradient(180deg,rgba(7,6,13,.15),rgba(7,6,13,.65))}
+@keyframes drift1{to{transform:translate(18vw,12vh) scale(1.15)}}
+@keyframes drift2{to{transform:translate(-14vw,20vh) scale(.9)}}
+@keyframes drift3{to{transform:translate(-20vw,-10vh) scale(1.2)}}
+@media (prefers-reduced-motion:reduce){.bg i{animation:none}}
+
+.glass{background:var(--glass);border:1px solid var(--stroke);border-radius:var(--r);
+  -webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.08),0 20px 50px -20px rgba(0,0,0,.6)}
+
+.wrap{max-width:1320px;margin:0 auto;padding:22px 24px 72px}
 .ltr{direction:ltr;unicode-bidi:isolate}
-.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
-  padding:18px;margin-top:16px;min-width:0}
-h2{font-size:14px;margin:0 0 14px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut)}
-html[lang=fa] h2{letter-spacing:0}
-.pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:3px 9px;
-  border-radius:99px;border:1px solid var(--line);color:var(--mut)}
-.dot{width:7px;height:7px;border-radius:99px;background:var(--mut);flex:none}
-.dot.up{background:var(--ok)} .dot.down{background:var(--bad)}
-.lang{display:inline-flex;border:1px solid var(--line);border-radius:7px;overflow:hidden}
-.lang button{border:0;border-radius:0;background:transparent;color:var(--mut);font-size:12px;padding:4px 10px}
-.lang button.on{background:var(--acc);color:var(--acc-ink)}
+.sub{color:var(--mut);font-size:13px}
 
-.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px;margin-top:16px}
-.tile{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:14px 16px}
-.tile b{display:block;font-size:24px;line-height:1.2;font-variant-numeric:tabular-nums}
-.tile span{font-size:12px;color:var(--mut);text-transform:uppercase;letter-spacing:.06em}
-html[lang=fa] .tile span{letter-spacing:0}
-.tile.warn b{color:var(--warn)} .tile.ok b{color:var(--ok)}
-.h2row{display:flex;align-items:center;gap:10px;margin-bottom:14px}
-.h2row h2{margin:0}
-.h2row .grow{flex:1}
+/* ---- header ---- */
+header.bar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:14px 18px}
+.brand{display:flex;align-items:center;gap:12px;min-width:0}
+.logo{width:40px;height:40px;border-radius:12px;flex:none;display:grid;place-items:center;
+  background:linear-gradient(135deg,var(--acc),var(--acc-2));box-shadow:0 8px 24px -6px color-mix(in srgb,var(--acc) 70%,transparent)}
+.brand h1{font-size:18px;line-height:1.2;margin:0;font-weight:700;letter-spacing:-.01em}
+.brand .sub{font-size:12px}
+.grow{flex:1}
+.pill{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;padding:5px 11px;
+  border-radius:99px;background:var(--glass-2);border:1px solid var(--stroke);color:var(--mut)}
+.dot{width:8px;height:8px;border-radius:99px;background:var(--dim);flex:none}
+.dot.up{background:var(--ok);box-shadow:0 0 0 3px rgba(95,227,161,.18)}
+.dot.down{background:var(--bad);box-shadow:0 0 0 3px rgba(255,125,140,.18)}
+.lang{display:inline-flex;padding:3px;border-radius:99px;background:var(--glass-2);border:1px solid var(--stroke)}
+.lang button{border:0;background:transparent;color:var(--mut);font-size:12.5px;padding:4px 12px;border-radius:99px}
+.lang button.on{background:var(--ink);color:#0b0a14;font-weight:600}
 
-table{width:100%;border-collapse:collapse;font-size:14px}
-th{text-align:start;font-weight:600;font-size:11px;text-transform:uppercase;
-  letter-spacing:.06em;color:var(--mut);padding:0 0 8px;padding-inline-end:10px;border-bottom:1px solid var(--line)}
-td{padding:11px 0;padding-inline-end:10px;border-bottom:1px solid var(--line);vertical-align:top}
-tr:last-child td{border-bottom:0}
-#sites{overflow-x:auto}
-code{font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;direction:ltr;unicode-bidi:isolate;
-  background:color-mix(in srgb,var(--ink) 7%,transparent);padding:1px 5px;border-radius:4px}
-.dom{font-weight:600}
-.dom a{color:inherit;text-decoration:none;border-bottom:1px solid var(--line)}
+.srv{display:inline-flex;align-items:center;gap:8px;padding:6px 14px 6px 10px;border-radius:99px;font-weight:600;font-size:14px;
+  background:color-mix(in srgb,var(--acc) 20%,transparent);border:1px solid color-mix(in srgb,var(--acc) 55%,transparent);
+  box-shadow:0 0 24px -6px var(--acc);max-width:100%;overflow:hidden}
+.srv .ic{font-size:17px;line-height:1}
+.srv .nm{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.swatches{display:flex;gap:10px;flex-wrap:wrap}
+.swatches button{width:38px;height:38px;padding:0;border-radius:12px;border:2px solid transparent}
+.swatches button.on{border-color:var(--ink);box-shadow:0 0 0 3px rgba(255,255,255,.15)}
+.emojis{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
+.emojis button{padding:5px 9px;font-size:17px;line-height:1.2;border-radius:10px}
+.bprev{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:16px;border-radius:var(--r-sm);
+  background:rgba(0,0,0,.25);border:1px solid var(--stroke);margin-top:20px}
+.bprev img{width:40px;height:40px;border-radius:10px}
+.bprev .tt{font-size:13px;color:var(--mut);background:rgba(255,255,255,.07);padding:6px 12px;border-radius:8px 8px 0 0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#b-name{direction:inherit;text-align:start;unicode-bidi:plaintext}
+
+/* ---- tabs ---- */
+nav.tabs{display:flex;gap:6px;padding:6px;margin:16px 0 22px;overflow-x:auto;scrollbar-width:none;border-radius:16px}
+nav.tabs::-webkit-scrollbar{display:none}
+nav.tabs button{display:inline-flex;align-items:center;gap:8px;flex:none;border:1px solid transparent;
+  background:transparent;color:var(--mut);padding:9px 15px;border-radius:11px;font-size:14px;font-weight:500;white-space:nowrap}
+nav.tabs button:hover{color:var(--ink);background:var(--glass)}
+nav.tabs button.on{color:var(--ink);background:var(--glass-3);border-color:var(--stroke-2);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.12)}
+nav.tabs svg{width:17px;height:17px;flex:none;opacity:.9}
+.badge{font-size:11px;font-weight:600;min-width:20px;padding:1px 7px;border-radius:99px;text-align:center;
+  background:rgba(255,255,255,.12);color:var(--ink)}
+.badge.warn{background:rgba(255,194,77,.18);color:var(--warn)}
+.badge.new{background:var(--acc);color:var(--acc-ink)}
+
+.tab{display:none;animation:fade .25s ease}
+.tab.on{display:block}
+@keyframes fade{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.tab-head{display:flex;align-items:flex-end;gap:16px;flex-wrap:wrap;margin:0 4px 18px}
+.tab-head .txt{flex:1;min-width:min(100%,260px)}
+.tab-head h2{font-size:26px;line-height:1.2;margin:0 0 6px;font-weight:700;letter-spacing:-.02em}
+.tab-head p{margin:0;color:var(--mut);font-size:14.5px;max-width:820px}
+
+.card{padding:22px;margin-top:16px;min-width:0}
+.card:first-child{margin-top:0}
+.card h3{font-size:13px;margin:0 0 14px;text-transform:uppercase;letter-spacing:.08em;color:var(--mut);font-weight:600}
+html[lang=fa] .card h3{letter-spacing:0}
+.h2row{display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap}
+.h2row h3{margin:0}
+
+/* ---- tiles ---- */
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,150px),1fr));gap:14px}
+.tile{padding:18px 20px;position:relative;overflow:hidden}
+.tile::before{content:"";position:absolute;inset:auto -30% -60% auto;width:140px;height:140px;border-radius:50%;
+  background:var(--tc,var(--acc));filter:blur(50px);opacity:.35}
+.tile span{display:block;font-size:12.5px;color:var(--mut)}
+.tile b{display:block;font-size:34px;line-height:1.15;margin-top:6px;font-weight:700;font-variant-numeric:tabular-nums}
+.tile small{display:block;font-size:12px;color:var(--dim);margin-top:4px}
+.tile.ok{--tc:var(--ok)} .tile.ok b{color:var(--ok)}
+.tile.warn{--tc:var(--warn)} .tile.warn b{color:var(--warn)}
+.tile.blue{--tc:var(--acc-2)}
+
+.quick{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),1fr));gap:14px;margin-top:16px}
+.qa{display:flex;gap:14px;align-items:flex-start;padding:18px;text-align:start;cursor:pointer;
+  font:inherit;color:inherit;width:100%;transition:background .2s,border-color .2s,transform .2s}
+.qa:hover{background:var(--glass-2);border-color:var(--stroke-2);transform:translateY(-2px)}
+.qa .ic{width:38px;height:38px;border-radius:11px;flex:none;display:grid;place-items:center;background:var(--glass-3)}
+.qa .ic svg{width:19px;height:19px}
+.qa b{display:block;font-size:15px;margin-bottom:3px}
+.qa span{display:block;font-size:13px;color:var(--mut);line-height:1.5}
+
+/* ---- sites ---- */
+.slist{display:grid;gap:12px}
+.site{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,1.4fr) minmax(0,1.3fr) auto;
+  gap:16px;align-items:start;padding:16px 18px}
+.site .lbl{display:block;font-size:11.5px;color:var(--dim);margin-bottom:4px}
+.dom{font-weight:600;font-size:15px;overflow-wrap:anywhere}
+.dom a{color:inherit;text-decoration:none;border-bottom:1px solid var(--stroke-2)}
 .dom a:hover{border-color:var(--acc)}
-.rt{font-size:12px;color:var(--mut);margin-top:4px;white-space:nowrap}
-.tag{font-size:11px;padding:2px 7px;border-radius:5px;border:1px solid var(--line);
-  color:var(--mut);margin:0 0 3px;margin-inline-end:4px;display:inline-block}
-.tag.ok{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 40%,transparent)}
-.tag.warn{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 40%,transparent)}
-.tag.bad{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 40%,transparent)}
-.acts{text-align:end;white-space:nowrap}
+.rt{font-size:12.5px;color:var(--mut);margin-top:6px;overflow-wrap:anywhere}
+.acts{display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end}
+code{font:12.5px/1.45 var(--mono);direction:ltr;unicode-bidi:isolate;
+  background:rgba(255,255,255,.08);padding:2px 6px;border-radius:6px;overflow-wrap:anywhere}
+.tag{font-size:11.5px;padding:2px 9px;border-radius:99px;background:var(--glass-2);border:1px solid var(--stroke);
+  color:var(--mut);margin:0 0 5px;margin-inline-end:5px;display:inline-block}
+.tag.ok{color:var(--ok);border-color:rgba(95,227,161,.35);background:rgba(95,227,161,.08)}
+.tag.warn{color:var(--warn);border-color:rgba(255,194,77,.35);background:rgba(255,194,77,.08)}
+.tag.bad{color:var(--bad);border-color:rgba(255,125,140,.35);background:rgba(255,125,140,.08)}
+.tag.cdn{color:var(--acc-2);border-color:rgba(82,195,255,.35);background:rgba(82,195,255,.08)}
 
-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));gap:18px 22px}
+/* ---- form ---- */
+.sec{border:0;margin:0;padding:22px;min-width:0}
+.sec + .sec{margin-top:14px}
+.sec legend{display:flex;align-items:center;gap:10px;float:left;width:100%;padding:0;margin:0 0 4px;font-size:16px;font-weight:600}
+.sec legend + *{clear:both}
+.num{width:26px;height:26px;border-radius:8px;display:grid;place-items:center;font-size:13px;font-weight:700;
+  background:linear-gradient(135deg,var(--acc),var(--acc-2));color:var(--acc-ink);flex:none}
+.sec-d{color:var(--mut);font-size:13.5px;margin:0 0 18px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:18px 22px}
 .full{grid-column:1/-1}
-label{display:block;font-size:12.5px;color:var(--mut);margin-bottom:5px}
-label .opt{opacity:.65}
-input[type=text]{width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:7px;
-  background:var(--bg);color:var(--ink);font:inherit;font-size:14px;direction:ltr;text-align:left}
-input[type=text]:focus{outline:2px solid color-mix(in srgb,var(--acc) 45%,transparent);
-  outline-offset:1px;border-color:var(--acc)}
-input[readonly]{opacity:.7}
-select{width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:7px;
-  background:var(--bg);color:var(--ink);font:inherit;font-size:14px}
-select:disabled{opacity:.5}
-.hint{font-size:12px;color:var(--mut);margin-top:6px;line-height:1.6}
+label{display:block;font-size:13px;color:var(--ink);font-weight:500;margin-bottom:7px}
+label .opt{color:var(--dim);font-weight:400}
+input[type=text],select{width:100%;padding:11px 13px;border:1px solid var(--stroke);border-radius:var(--r-sm);
+  background:rgba(0,0,0,.28);color:var(--ink);font:inherit;font-size:14px;transition:border-color .15s,background .15s}
+input[type=text]{direction:ltr;text-align:left}
+input[type=text]::placeholder{color:var(--dim)}
+input[type=text]:focus,select:focus{outline:none;border-color:var(--acc);background:rgba(0,0,0,.4);
+  box-shadow:0 0 0 3px color-mix(in srgb,var(--acc) 22%,transparent)}
+input[readonly]{opacity:.65}
+select{appearance:none;-webkit-appearance:none;padding-inline-end:36px;cursor:pointer;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' fill='none'%3E%3Cpath d='M1 1.5 6 6.5l5-5' stroke='%23a9a6bd' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 13px center}
+html[dir=rtl] select{background-position:left 13px center}
+select option{background:#16142a;color:var(--ink)}
+select:disabled{opacity:.45;cursor:default}
+.hint{font-size:12.5px;color:var(--mut);margin-top:8px;line-height:1.7}
 .hint code{font-size:11.5px}
-.route{display:flex;gap:8px;align-items:center;margin-bottom:8px;max-width:760px}
-.route input{flex:1;min-width:0}
-.route .arr{color:var(--mut);flex:none}
+.route{display:grid;grid-template-columns:minmax(120px,1fr) auto minmax(170px,.9fr) minmax(120px,1fr) auto;
+  gap:8px;align-items:center;margin-bottom:10px}
+.route .arr{color:var(--dim)}
 html[dir=rtl] .route .arr{transform:scaleX(-1)}
-.note{grid-column:1/-1;font-size:12.5px;line-height:1.6;padding:10px 12px;border-radius:8px;
-  border:1px solid color-mix(in srgb,var(--warn) 45%,transparent);
-  background:color-mix(in srgb,var(--warn) 8%,transparent)}
-.checks{grid-column:1/-1;display:grid;gap:14px 22px;grid-template-columns:repeat(auto-fit,minmax(min(100%,280px),1fr))}
-.checks label{display:flex;align-items:flex-start;gap:9px;font-size:13.5px;color:var(--ink);margin:0;cursor:pointer}
-.checks input{margin:4px 0 0;flex:none}
-.checks .hint{margin:2px 0 0}
-.row{grid-column:1/-1;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.routes-empty{font-size:13px;color:var(--dim);padding:4px 0 10px}
+.note{font-size:13px;line-height:1.7;padding:12px 16px;border-radius:var(--r-sm);margin-bottom:14px;
+  border:1px solid rgba(255,194,77,.35);background:rgba(255,194,77,.08)}
+.checks{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(min(100%,280px),1fr))}
+.checks label{display:flex;align-items:flex-start;gap:12px;margin:0;cursor:pointer;padding:14px 16px;
+  border-radius:var(--r-sm);border:1px solid var(--stroke);background:rgba(0,0,0,.18);transition:border-color .15s,background .15s}
+.checks label:hover{border-color:var(--stroke-2)}
+.checks label:has(input:checked){border-color:var(--acc);background:color-mix(in srgb,var(--acc) 10%,transparent)}
+.checks input{margin:3px 0 0;flex:none;accent-color:var(--acc);width:16px;height:16px}
+.checks b{display:block;font-weight:600;font-size:14px}
+.checks .hint{margin:4px 0 0;font-weight:400}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:18px}
 
-button{font:inherit;font-size:14px;padding:9px 16px;border-radius:7px;border:1px solid var(--line);
-  background:var(--card);color:var(--ink);cursor:pointer}
-button:hover{border-color:var(--acc)}
-button.primary{background:var(--acc);color:var(--acc-ink);border-color:var(--acc);font-weight:600}
-button.primary:hover{filter:brightness(1.08)}
-button.link{border:0;background:0;color:var(--mut);padding:4px 6px;font-size:13px}
-button.link:hover{color:var(--bad)}
-button.link.go:hover{color:var(--acc)}
+/* ---- buttons ---- */
+button{font:inherit;font-size:14px;padding:10px 18px;border-radius:var(--r-sm);border:1px solid var(--stroke);
+  background:var(--glass-2);color:var(--ink);cursor:pointer;transition:background .15s,border-color .15s,filter .15s}
+button:hover{border-color:var(--stroke-2);background:var(--glass-3)}
+button.primary{background:linear-gradient(135deg,var(--acc),var(--acc-2));color:#fff;border-color:transparent;font-weight:600;
+  box-shadow:0 10px 26px -10px color-mix(in srgb,var(--acc) 80%,transparent)}
+button.primary:hover{filter:brightness(1.1)}
+button.link{border:0;background:transparent;color:var(--mut);padding:6px 9px;font-size:13px;border-radius:8px}
+button.link:hover{color:var(--bad);background:rgba(255,125,140,.08)}
+button.link.go:hover{color:var(--ink);background:var(--glass-2)}
 button:disabled{opacity:.5;cursor:default}
 
-pre{background:color-mix(in srgb,var(--ink) 6%,transparent);padding:14px 16px;
-  border:1px solid var(--line);border-radius:8px;direction:ltr;text-align:left;
-  font:12.5px/1.7 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;
-  word-break:normal;overflow-wrap:anywhere;max-height:420px;overflow:auto;margin:0}
+/* ---- output, log ---- */
+pre{background:rgba(0,0,0,.35);padding:16px 18px;border:1px solid var(--stroke);border-radius:var(--r-sm);
+  direction:ltr;text-align:left;font:12.5px/1.75 var(--mono);white-space:pre-wrap;
+  word-break:normal;overflow-wrap:anywhere;max-height:520px;overflow:auto;margin:0}
 pre .ln-ok{color:var(--ok)}   pre .ln-warn{color:var(--warn)}
-pre .ln-bad{color:var(--bad)} pre .ln-dim{color:var(--mut)}
+pre .ln-bad{color:var(--bad)} pre .ln-dim{color:var(--dim)}
 pre .ln-hdr{color:var(--ink);font-weight:600}
 pre .d-add{color:var(--add)} pre .d-del{color:var(--del)}
-pre .d-hunk{color:var(--mut)} pre .d-file{color:var(--ink);font-weight:600}
-.empty{color:var(--mut);font-size:14px;padding:14px 0}
-
-details.blk{border-top:1px solid var(--line);padding:10px 0}
+pre .d-hunk{color:var(--dim)} pre .d-file{color:var(--ink);font-weight:600}
+.empty{color:var(--mut);font-size:14px;padding:18px 4px}
+details.blk{border-top:1px solid var(--stroke);padding:12px 0}
 details.blk:first-of-type{border-top:0}
 details.blk summary{display:flex;align-items:center;gap:10px;cursor:pointer;list-style:none;flex-wrap:wrap}
 details.blk summary::-webkit-details-marker{display:none}
 details.blk summary .grow{flex:1;min-width:0;overflow-wrap:anywhere}
-details.blk pre{margin-top:10px;max-height:340px}
-details.blk h3{font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);margin:12px 0 6px}
-.log{max-height:640px;overflow:auto;padding-inline-end:8px}
+details.blk pre{margin-top:10px;max-height:360px}
+details.blk h4{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:14px 0 6px}
+.log{max-height:720px;overflow:auto;padding-inline-end:8px}
 .when{font-size:12.5px;color:var(--mut);white-space:nowrap;font-variant-numeric:tabular-nums}
-.cmd{font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;direction:ltr;unicode-bidi:isolate}
+.cmd{font:12.5px/1.5 var(--mono);direction:ltr;unicode-bidi:isolate}
 
-dialog{border:1px solid var(--line);border-radius:12px;background:var(--card);color:var(--ink);
-  padding:20px;width:min(980px,94vw);box-shadow:0 20px 60px rgba(0,0,0,.35)}
-dialog::backdrop{background:rgba(0,0,0,.55)}
-textarea{width:100%;min-height:52vh;resize:vertical;padding:14px;border:1px solid var(--line);
-  border-radius:8px;background:var(--bg);color:var(--ink);tab-size:4;direction:ltr;text-align:left;
-  font:13px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace}
-textarea:focus{outline:2px solid color-mix(in srgb,var(--acc) 45%,transparent);border-color:var(--acc)}
-#form-card.editing{border-color:var(--acc);box-shadow:0 0 0 1px var(--acc)}
-.toast{position:fixed;left:50%;transform:translateX(-50%);bottom:24px;z-index:9;
-  background:var(--card);border:1px solid var(--line);border-inline-start:3px solid var(--acc);
-  border-radius:8px;padding:11px 16px;font-size:14px;max-width:min(560px,92vw);
-  box-shadow:0 8px 28px rgba(0,0,0,.16)}
+/* ---- guide ---- */
+.steps{counter-reset:s;display:grid;gap:14px}
+.step{padding:20px 22px 20px;position:relative}
+.step h4{display:flex;align-items:center;gap:10px;margin:0 0 10px;font-size:16px}
+.step h4::before{counter-increment:s;content:counter(s);width:26px;height:26px;border-radius:8px;display:grid;place-items:center;
+  font-size:13px;background:linear-gradient(135deg,var(--acc),var(--acc-2));color:var(--acc-ink);flex:none}
+.step p,.step li{color:var(--mut);font-size:14px;line-height:1.75}
+.step p{margin:0 0 8px}
+.step ul{margin:0;padding-inline-start:20px}
+.step b{color:var(--ink)}
+table.cmp{width:100%;border-collapse:collapse;font-size:14px}
+table.cmp th{text-align:start;font-size:12px;color:var(--dim);font-weight:600;padding:0 10px 10px;border-bottom:1px solid var(--stroke)}
+table.cmp td{padding:11px 10px;border-bottom:1px solid var(--stroke);vertical-align:top;color:var(--mut)}
+table.cmp td:first-child{color:var(--ink);font-weight:600;white-space:nowrap}
+table.cmp tr:last-child td{border-bottom:0}
+table.cmp td.yes{color:var(--ok);font-weight:600} table.cmp td.no{color:var(--bad);font-weight:600}
+.cmp-wrap{overflow-x:auto}
+
+/* ---- dialog, toast ---- */
+dialog{border:1px solid var(--stroke-2);border-radius:var(--r);color:var(--ink);padding:22px;width:min(1000px,94vw);
+  background:rgba(20,18,36,.82);-webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur);
+  box-shadow:0 30px 80px rgba(0,0,0,.6)}
+dialog::backdrop{background:rgba(4,3,10,.6);-webkit-backdrop-filter:blur(4px);backdrop-filter:blur(4px)}
+textarea{width:100%;min-height:50vh;resize:vertical;padding:16px;border:1px solid var(--stroke);
+  border-radius:var(--r-sm);background:rgba(0,0,0,.4);color:var(--ink);tab-size:4;direction:ltr;text-align:left;
+  font:13px/1.65 var(--mono)}
+textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-mix(in srgb,var(--acc) 22%,transparent)}
+#form-card.editing .sec:first-of-type{border-color:var(--acc)}
+.toast{position:fixed;left:50%;transform:translateX(-50%);bottom:26px;z-index:9;
+  background:rgba(24,22,42,.88);-webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur);
+  border:1px solid var(--stroke-2);border-inline-start:3px solid var(--ok);
+  border-radius:var(--r-sm);padding:12px 18px;font-size:14px;max-width:min(560px,92vw);
+  box-shadow:0 14px 40px rgba(0,0,0,.45);animation:fade .2s ease}
 .toast.bad{border-inline-start-color:var(--bad)}
+
+@media(max-width:980px){
+  .site{grid-template-columns:1fr 1fr}
+  .site .acts{grid-column:1/-1;justify-content:flex-start}
+}
 @media(max-width:640px){
-  .wrap{padding:16px 16px 56px}
-  th:nth-child(3),td:nth-child(3){display:none}
-  .acts{white-space:normal}
-  .acts button{display:block;margin-inline-start:auto}
+  .wrap{padding:14px 16px 60px}
+  header.bar{padding:12px 14px}
+  .tab-head h2{font-size:22px}
+  .tile{padding:14px 16px}
+  .tile b{font-size:28px}
+  .card,.sec{padding:18px 16px}
+  .site{grid-template-columns:1fr}
+  .route{grid-template-columns:1fr auto;}
+  .route .arr{display:none}
+  .route .r-path,.route .r-type,.route .r-target{grid-column:1/2}
+  .route button{grid-column:2/3;grid-row:1/2}
 }
 </style>
 </head>
 <body>
+<div class="bg"><i></i><i></i><i></i></div>
 <div class="wrap">
 
-<header>
-  <h1>Smart Caddy</h1>
+<header class="bar glass">
+  <div class="brand">
+    <div class="logo" aria-hidden="true">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+        <rect x="3" y="4" width="18" height="6" rx="2" stroke="#fff" stroke-width="1.8"/>
+        <rect x="3" y="14" width="18" height="6" rx="2" stroke="#fff" stroke-width="1.8"/>
+        <circle cx="7" cy="7" r="1.2" fill="#fff"/><circle cx="7" cy="17" r="1.2" fill="#fff"/>
+      </svg>
+    </div>
+    <div><h1>Smart Caddy</h1><div class="sub" data-t="tagline">Reverse proxy control panel</div></div>
+  </div>
+  <span class="srv" id="srv" hidden><span class="ic" id="srv-icon"></span><span class="nm" id="srv-name"></span></span>
   <span class="pill"><span class="dot" id="dot"></span><span id="status" data-t="checking">checking</span></span>
-  <span class="sub ltr" id="meta"></span>
+  <span class="pill ltr" id="meta"></span>
   <span class="grow"></span>
   <div class="lang"><button type="button" data-lang="fa">فارسی</button><button type="button" data-lang="en">EN</button></div>
   <button class="link" id="btn-out" data-t="sign_out">Sign out</button>
 </header>
 
-<div class="tiles">
-  <div class="tile"><span data-t="tile_sites">Sites</span><b id="t-sites">&ndash;</b></div>
-  <div class="tile ok"><span data-t="tile_certs">Certificates</span><b id="t-certs">&ndash;</b></div>
-  <div class="tile" id="t-exp-tile"><span data-t="tile_exp">Expiring &lt; 21 days</span><b id="t-exp">&ndash;</b></div>
-  <div class="tile" id="t-cf-tile"><span data-t="tile_cf">Unmanaged in Caddyfile</span><b id="t-cf">&ndash;</b></div>
-</div>
+<nav class="tabs glass" id="tabs" role="tablist">
+  <button type="button" data-tab="overview" role="tab">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="2"/><rect x="14" y="3" width="7" height="5" rx="2"/><rect x="14" y="12" width="7" height="9" rx="2"/><rect x="3" y="16" width="7" height="5" rx="2"/></svg>
+    <span data-t="tab_overview">Overview</span></button>
+  <button type="button" data-tab="sites" role="tab">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>
+    <span data-t="tab_sites">Sites</span><span class="badge" id="b-sites">0</span></button>
+  <button type="button" data-tab="add" role="tab">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/></svg>
+    <span id="tab-add-label" data-t="tab_add">Add site</span></button>
+  <button type="button" data-tab="caddyfile" role="tab" id="tab-btn-caddyfile" hidden>
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M12 12v6M9 15l3 3 3-3"/></svg>
+    <span data-t="tab_caddyfile">Import</span><span class="badge warn" id="b-cf">0</span></button>
+  <button type="button" data-tab="guide" role="tab">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19a4.5 4.5 0 1 0-1.4-8.8A6 6 0 0 0 4.5 12 3.5 3.5 0 0 0 6 19z"/></svg>
+    <span data-t="tab_guide">Cloudflare CDN</span></button>
+  <button type="button" data-tab="diag" role="tab">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+    <span data-t="tab_diag">Diagnostics</span><span class="badge new" id="b-diag" hidden>•</span></button>
+  <button type="button" data-tab="log" role="tab">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+    <span data-t="tab_log">Activity</span></button>
+  <button type="button" data-tab="settings" role="tab">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+    <span data-t="tab_settings">Settings</span></button>
+</nav>
 
-<div class="card" id="ports-note" hidden>
-  <h2 data-t="heads_up">Heads up</h2>
-  <p id="ports-text" style="margin:0;font-size:14px;line-height:1.6"></p>
-</div>
+<main>
 
-<div class="card">
-  <h2 data-t="sites">Sites</h2>
-  <div id="sites"><div class="empty" data-t="loading">Loading…</div></div>
-</div>
-
-<div class="card" id="cf-card" hidden>
-  <div class="h2row">
-    <h2 data-t="cf_title">Found in Caddyfile</h2><span class="grow"></span>
-    <button type="button" class="primary" id="btn-import-all" data-t="import_all" hidden>Import all</button>
+<!-- ============================================================ overview -->
+<section class="tab" id="tab-overview">
+  <div class="tab-head"><div class="txt"><h2 data-t="tab_overview">Overview</h2><p data-t="tab_overview_d"></p></div></div>
+  <div class="tiles">
+    <div class="tile glass blue"><span data-t="tile_sites">Sites</span><b id="t-sites">&ndash;</b><small data-t="tile_sites_s"></small></div>
+    <div class="tile glass ok"><span data-t="tile_certs">Certificates</span><b id="t-certs">&ndash;</b><small data-t="tile_certs_s"></small></div>
+    <div class="tile glass" id="t-exp-tile"><span data-t="tile_exp">Expiring &lt; 21 days</span><b id="t-exp">&ndash;</b><small data-t="tile_exp_s"></small></div>
+    <div class="tile glass" id="t-cf-tile"><span data-t="tile_cf">Unmanaged in Caddyfile</span><b id="t-cf">&ndash;</b><small data-t="tile_cf_s"></small></div>
   </div>
-  <div class="hint" style="margin:-6px 0 10px" data-t="cf_hint"></div>
-  <div id="cf-list"></div>
-</div>
 
-<div class="card" id="form-card">
-  <h2 id="form-title" data-t="form_add">Add a site</h2>
+  <div class="card glass" id="ports-note" hidden style="margin-top:16px">
+    <h3 data-t="heads_up">Heads up</h3>
+    <p id="ports-text" style="margin:0;font-size:14px;line-height:1.75;color:var(--mut)"></p>
+  </div>
+
+  <div class="quick">
+    <button type="button" class="qa glass" data-goto="add">
+      <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="var(--acc)" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></span>
+      <span><b data-t="qa_add">Add a site</b><span data-t="qa_add_d"></span></span></button>
+    <button type="button" class="qa glass" data-goto="guide">
+      <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="var(--acc-2)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19a4.5 4.5 0 1 0-1.4-8.8A6 6 0 0 0 4.5 12 3.5 3.5 0 0 0 6 19z"/></svg></span>
+      <span><b data-t="qa_cdn">Hide a config behind Cloudflare</b><span data-t="qa_cdn_d"></span></span></button>
+    <button type="button" class="qa glass" id="qa-doctor">
+      <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="var(--warm)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg></span>
+      <span><b data-t="qa_doctor">Run a full check</b><span data-t="qa_doctor_d"></span></span></button>
+  </div>
+</section>
+
+<!-- ============================================================ sites -->
+<section class="tab" id="tab-sites">
+  <div class="tab-head"><div class="txt"><h2 data-t="tab_sites">Sites</h2><p data-t="tab_sites_d"></p></div>
+    <button type="button" class="primary" data-goto="add" data-t="qa_add">Add a site</button></div>
+  <div id="sites"><div class="empty glass card" data-t="loading">Loading…</div></div>
+</section>
+
+<!-- ============================================================ add / edit -->
+<section class="tab" id="tab-add">
+  <div class="tab-head"><div class="txt"><h2 id="form-title" data-t="form_add">Add a site</h2><p data-t="tab_add_d"></p></div></div>
+  <div id="form-card">
   <form id="add" autocomplete="off">
     <div class="note" id="edit-note" hidden></div>
 
-    <div>
-      <label for="f-domain" data-t="f_domain">Domain</label>
-      <input type="text" id="f-domain" placeholder="panel.example.com" required>
-      <div class="hint" data-t="f_domain_h"></div>
-    </div>
-    <div>
-      <label for="f-target" data-t="f_target">Main backend</label>
-      <input type="text" id="f-target" placeholder="8088" required>
-      <div class="hint" data-th="f_target_h"></div>
-    </div>
+    <fieldset class="sec glass">
+      <legend><span class="num">1</span><span data-t="sec_basic">Address and backend</span></legend>
+      <p class="sec-d" data-t="sec_basic_d"></p>
+      <div class="grid">
+        <div>
+          <label for="f-domain" data-t="f_domain">Domain</label>
+          <input type="text" id="f-domain" placeholder="panel.example.com" required>
+          <div class="hint" data-th="f_domain_h"></div>
+        </div>
+        <div>
+          <label for="f-target" data-t="f_target">Main backend</label>
+          <input type="text" id="f-target" placeholder="8088" required>
+          <div class="hint" data-th="f_target_h"></div>
+        </div>
+      </div>
+    </fieldset>
 
-    <div class="full">
-      <label><span data-t="f_routes">Routes</span> <span class="opt" data-t="optional">(optional)</span></label>
+    <fieldset class="sec glass">
+      <legend><span class="num">2</span><span data-t="f_routes">Routes</span> <span class="opt sub" data-t="optional">(optional)</span></legend>
+      <p class="sec-d" data-th="f_routes_h"></p>
       <div id="routes"></div>
-      <button type="button" class="link go" id="btn-route" data-t="add_route">+ Add route</button>
-      <div class="hint" data-th="f_routes_h"></div>
-    </div>
+      <div class="routes-empty" id="routes-empty" data-t="routes_none">No routes - every request goes to the main backend.</div>
+      <button type="button" id="btn-route" data-t="add_route">+ Add route</button>
+      <div class="hint" data-th="f_routes_types"></div>
+    </fieldset>
 
-    <div>
-      <label for="f-path"><span data-t="f_path">Path prefix</span> <span class="opt" data-t="optional">(optional)</span></label>
-      <input type="text" id="f-path" placeholder="/5wSobQvUFuNy4zBUcc">
-      <div class="hint" data-t="f_path_h"></div>
-    </div>
-    <div>
-      <label for="f-host"><span data-t="f_host">Host header</span> <span class="opt" data-t="optional">(optional)</span></label>
-      <input type="text" id="f-host" placeholder="127.0.0.1">
-      <div class="hint" data-th="f_host_h"></div>
-    </div>
+    <fieldset class="sec glass">
+      <legend><span class="num">3</span><span data-t="sec_opts">Certificate and options</span></legend>
+      <p class="sec-d" data-t="sec_opts_d"></p>
+      <div class="grid">
+        <div>
+          <label for="f-cert" data-t="f_cert">SSL certificate</label>
+          <select id="f-cert">
+            <option value="caddy" data-t="cert_caddy">Caddy</option>
+            <option value="certbot" data-t="cert_certbot">certbot</option>
+            <option value="internal" data-t="cert_internal">Self-signed</option>
+          </select>
+          <div class="hint" data-t="f_cert_h"></div>
+        </div>
+        <div>
+          <label for="f-path"><span data-t="f_path">Path prefix</span> <span class="opt" data-t="optional">(optional)</span></label>
+          <input type="text" id="f-path" placeholder="/5wSobQvUFuNy4zBUcc">
+          <div class="hint" data-t="f_path_h"></div>
+        </div>
+        <div>
+          <label for="f-host"><span data-t="f_host">Host header</span> <span class="opt" data-t="optional">(optional)</span></label>
+          <input type="text" id="f-host" placeholder="127.0.0.1">
+          <div class="hint" data-th="f_host_h"></div>
+        </div>
+      </div>
+    </fieldset>
 
-    <div>
-      <label for="f-cert" data-t="f_cert">SSL certificate</label>
-      <select id="f-cert">
-        <option value="caddy" data-t="cert_caddy">Caddy</option>
-        <option value="certbot" data-t="cert_certbot">certbot</option>
-        <option value="internal" data-t="cert_internal">Self-signed</option>
-      </select>
-      <div class="hint" data-t="f_cert_h"></div>
-    </div>
-
-    <div class="checks">
-      <label><input type="checkbox" id="f-panel">
-        <span><span data-t="c_panel">Admin panel</span><div class="hint" data-t="c_panel_h"></div></span></label>
-      <label><input type="checkbox" id="f-notls">
-        <span><span data-t="c_notls">Plain HTTP</span><div class="hint" data-t="c_notls_h"></div></span></label>
-      <label><input type="checkbox" id="f-xray">
-        <span><span data-t="c_xray">Behind Xray</span><div class="hint" data-t="c_xray_h"></div></span></label>
-    </div>
+    <fieldset class="sec glass">
+      <legend><span class="num">4</span><span data-t="sec_mode">Site type</span></legend>
+      <p class="sec-d" data-t="sec_mode_d"></p>
+      <div class="checks">
+        <label><input type="checkbox" id="f-panel">
+          <span><b data-t="c_panel">Admin panel</b><div class="hint" data-t="c_panel_h"></div></span></label>
+        <label><input type="checkbox" id="f-notls">
+          <span><b data-t="c_notls">Plain HTTP</b><div class="hint" data-t="c_notls_h"></div></span></label>
+        <label><input type="checkbox" id="f-xray">
+          <span><b data-t="c_xray">Behind Xray</b><div class="hint" data-t="c_xray_h"></div></span></label>
+      </div>
+    </fieldset>
 
     <div class="row">
       <button type="submit" class="primary" id="btn-add" data-t="btn_add">Add site</button>
       <button type="button" class="link" id="btn-cancel" data-t="cancel" hidden>Cancel</button>
     </div>
   </form>
-</div>
-
-<div class="card" id="out-card">
-  <div class="h2row"><h2 id="out-title" data-t="diag_title">Diagnostics &amp; output</h2><span class="grow"></span>
-    <button type="button" class="link go" id="btn-doctor" data-t="btn_doctor">Run diagnostics</button></div>
-  <div class="hint" id="out-idle" data-t="diag_idle"></div>
-  <pre id="out" hidden></pre>
-</div>
-
-<div class="card">
-  <div class="h2row">
-    <h2 data-t="log_title">Activity log</h2><span class="grow"></span>
-    <button type="button" class="link go" id="btn-log" data-t="refresh">Refresh</button>
+  <div class="card glass" id="form-out-card" hidden style="margin-top:16px">
+    <h3 id="form-out-title" data-t="output">Output</h3>
+    <pre id="form-out"></pre>
   </div>
-  <div class="hint" style="margin:-6px 0 10px" data-t="log_hint"></div>
-  <div class="log" id="log"><div class="empty" data-t="loading">Loading…</div></div>
-</div>
+  </div>
+</section>
 
+<!-- ============================================================ caddyfile import -->
+<section class="tab" id="tab-caddyfile">
+  <div class="tab-head"><div class="txt"><h2 data-t="cf_title">Found in Caddyfile</h2><p data-t="cf_hint"></p></div>
+    <button type="button" class="primary" id="btn-import-all" data-t="import_all" hidden>Import all</button></div>
+  <div class="card glass" id="cf-card"><div id="cf-list"></div></div>
+</section>
+
+<!-- ============================================================ guide -->
+<section class="tab" id="tab-guide">
+  <div class="tab-head"><div class="txt"><h2 data-t="g_title">Hide your server behind Cloudflare</h2><p data-t="g_intro"></p></div></div>
+
+  <div class="card glass">
+    <h3 data-t="g_which">Which configs can go through Cloudflare</h3>
+    <div class="cmp-wrap"><table class="cmp">
+      <thead><tr><th data-t="g_th_type">Transport</th><th data-t="g_th_cdn">Through CDN</th><th data-t="g_th_route">Route type here</th><th data-t="g_th_note">Notes</th></tr></thead>
+      <tbody>
+        <tr><td>XHTTP</td><td class="yes" data-t="g_yes">Yes</td><td><code>XHTTP / gRPC (h2c)</code></td><td data-th="g_n_xhttp"></td></tr>
+        <tr><td>gRPC</td><td class="yes" data-t="g_yes">Yes</td><td><code>XHTTP / gRPC (h2c)</code></td><td data-th="g_n_grpc"></td></tr>
+        <tr><td>WebSocket</td><td class="yes" data-t="g_yes">Yes</td><td><code>HTTP / WS / HTTPUpgrade</code></td><td data-th="g_n_ws"></td></tr>
+        <tr><td>HTTPUpgrade</td><td class="yes" data-t="g_yes">Yes</td><td><code>HTTP / WS / HTTPUpgrade</code></td><td data-th="g_n_hu"></td></tr>
+        <tr><td>Reality · TCP · Hysteria2 · Shadowsocks</td><td class="no" data-t="g_no">No</td><td>&ndash;</td><td data-th="g_n_no"></td></tr>
+      </tbody>
+    </table></div>
+  </div>
+
+  <div class="steps" style="margin-top:16px">
+    <div class="step glass"><h4 data-t="g_s1_t"></h4><div data-th="g_s1"></div></div>
+    <div class="step glass"><h4 data-t="g_s2_t"></h4><div data-th="g_s2"></div></div>
+    <div class="step glass"><h4 data-t="g_s3_t"></h4><div data-th="g_s3"></div></div>
+    <div class="step glass"><h4 data-t="g_s4_t"></h4><div data-th="g_s4"></div></div>
+    <div class="step glass"><h4 data-t="g_s5_t"></h4><div data-th="g_s5"></div></div>
+  </div>
+</section>
+
+<!-- ============================================================ diagnostics -->
+<section class="tab" id="tab-diag">
+  <div class="tab-head"><div class="txt"><h2 data-t="diag_title">Diagnostics &amp; output</h2><p data-t="diag_idle"></p></div>
+    <button type="button" class="primary" id="btn-doctor" data-t="btn_doctor">Run diagnostics</button></div>
+  <div class="card glass" id="out-card">
+    <h3 id="out-title" data-t="output">Output</h3>
+    <div class="empty" id="out-idle" data-t="diag_empty">Nothing yet.</div>
+    <pre id="out" hidden></pre>
+  </div>
+</section>
+
+<!-- ============================================================ activity -->
+<section class="tab" id="tab-log">
+  <div class="tab-head"><div class="txt"><h2 data-t="log_title">Activity log</h2><p data-t="log_hint"></p></div>
+    <button type="button" id="btn-log" data-t="refresh">Refresh</button></div>
+  <div class="card glass"><div class="log" id="log"><div class="empty" data-t="loading">Loading…</div></div></div>
+</section>
+
+<!-- ============================================================ settings -->
+<section class="tab" id="tab-settings">
+  <div class="tab-head"><div class="txt"><h2 data-t="tab_settings">Settings</h2><p data-t="set_d"></p></div></div>
+  <div class="card glass">
+    <h3 data-t="set_id">Server identity</h3>
+    <p class="sec-d" data-t="set_id_d"></p>
+    <div class="grid">
+      <div>
+        <label for="b-name" data-t="b_name">Server name</label>
+        <input type="text" id="b-name" maxlength="32" placeholder="Turkey · Main">
+        <div class="hint" data-t="b_name_h"></div>
+      </div>
+      <div>
+        <label for="b-icon" data-t="b_icon">Icon</label>
+        <input type="text" id="b-icon" maxlength="16" placeholder="🇹🇷">
+        <div class="emojis" id="b-emojis"></div>
+        <div class="hint" data-t="b_icon_h"></div>
+      </div>
+    </div>
+    <label style="margin-top:20px" data-t="b_color">Accent colour</label>
+    <div class="swatches" id="b-colors"></div>
+    <div class="bprev">
+      <img id="b-prev-fav" alt="">
+      <span class="tt" id="b-prev-title"></span>
+      <span class="srv" id="b-prev-srv"><span class="ic" id="b-prev-icon"></span><span class="nm" id="b-prev-name"></span></span>
+    </div>
+    <div class="row">
+      <button type="button" class="primary" id="b-save" data-t="b_save">Save</button>
+      <button type="button" class="link" id="b-revert" data-t="b_revert">Undo changes</button>
+    </div>
+  </div>
+</section>
+
+</main>
 </div>
 
 <dialog id="raw">
   <div class="h2row">
-    <h2 id="raw-title" class="ltr">Config</h2><span class="grow"></span>
+    <h3 id="raw-title" class="ltr" style="font-size:16px;text-transform:none;letter-spacing:0;color:var(--ink)">Config</h3><span class="grow"></span>
     <button type="button" class="link" id="raw-close" data-t="close">Close</button>
   </div>
   <textarea id="raw-text" spellcheck="false" autocomplete="off"></textarea>
-  <div class="hint" style="margin:8px 0 14px" data-th="raw_hint"></div>
+  <div class="hint" style="margin:10px 0 14px" data-th="raw_hint"></div>
+  <pre id="raw-out" hidden style="margin-bottom:14px;max-height:220px"></pre>
   <div style="display:flex;gap:10px;align-items:center">
     <button type="button" class="primary" id="raw-save" data-t="raw_save">Save &amp; reload</button>
     <button type="button" class="link" id="raw-cancel" data-t="cancel">Cancel</button>
@@ -3578,6 +3970,45 @@ textarea:focus{outline:2px solid color-mix(in srgb,var(--acc) 45%,transparent);b
 
 <script>
 const $ = s => document.querySelector(s);
+
+// ---------------------------------------------------------------- identity
+const BRAND_COLORS = {violet:['#8f80ff','#52c3ff'], blue:['#4f8bff','#3ee0ff'], green:['#2fd68f','#3ec9ff'],
+                      orange:['#ff8a3d','#ffc94d'], pink:['#ff5fa2','#a77bff'], red:['#ff5468','#ff9d5c']};
+let BRAND = Object.assign({name:'', icon:'', color:'violet'}, /*__BRAND__*/null || {});
+
+function escXml(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+// Favicon text: a flag becomes its two letters (Windows has no flag emoji),
+// any other icon is used as is, else the name's initials, else "SM".
+function favText(b){
+  const cps = [...(b.icon || '')];
+  if (cps.length === 2 && cps.every(c => { const n = c.codePointAt(0); return n >= 0x1F1E6 && n <= 0x1F1FF; }))
+    return cps.map(c => String.fromCharCode(c.codePointAt(0) - 0x1F1E6 + 65)).join('');
+  if (cps.length) return b.icon;
+  const w = (b.name || '').trim().split(/\s+/).filter(Boolean);
+  if (w.length) return (w.length > 1 ? [...w[0]][0] + [...w[1]][0] : [...w[0]].slice(0, 2).join('')).toUpperCase();
+  return 'SM';
+}
+function favUrl(b){
+  const c = BRAND_COLORS[b.color] || BRAND_COLORS.violet, txt = favText(b);
+  const fs = /^[A-Z0-9]{1,2}$/.test(txt) ? 28 : ([...txt].length > 2 ? 22 : 36);
+  const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">'
+    + '<stop offset="0" stop-color="' + c[0] + '"/><stop offset="1" stop-color="' + c[1] + '"/></linearGradient></defs>'
+    + '<rect width="64" height="64" rx="16" fill="url(#g)"/><text x="32" y="34" text-anchor="middle" dominant-baseline="middle" '
+    + 'font-family="Segoe UI,Arial,sans-serif" font-weight="700" font-size="' + fs + '" fill="#fff">' + escXml(txt) + '</text></svg>';
+  return 'data:image/svg+xml,' + encodeURIComponent(svg);
+}
+function brandTitle(b){ return (b.name ? (b.icon ? b.icon + ' ' : '') + b.name + ' · ' : '') + 'Smart Caddy'; }
+function applyBrand(b){
+  const c = BRAND_COLORS[b.color] || BRAND_COLORS.violet;
+  document.documentElement.style.setProperty('--acc', c[0]);
+  document.documentElement.style.setProperty('--acc-2', c[1]);
+  $('#fav').href = favUrl(b);
+  document.title = brandTitle(b);
+  $('#srv').hidden = !(b.name || b.icon);
+  $('#srv-icon').textContent = b.icon || '';
+  $('#srv-icon').hidden = !b.icon;
+  $('#srv-name').textContent = b.name || '';
+}
 
 // ---------------------------------------------------------------- language
 const I18N = {
@@ -3603,11 +4034,11 @@ en: {
   output:'Output',
   form_add:'Add a site', form_edit:'Edit {0}',
   f_domain:'Domain',
-  f_domain_h:'The address visitors type. Its A record must point at this server, with any CDN or cloud proxy (the orange cloud) turned off, or no certificate can be issued.',
+  f_domain_h:'The address visitors type. Its A record must point at this server. Behind Cloudflare, keep the cloud <b>grey</b> until the certificate is issued, then turn it orange.',
   f_target:'Main backend',
   f_target_h:'Where requests go when no route below matches: <code>8088</code> a port on this server · <code>https://127.0.0.1:27389</code> an app that speaks HTTPS itself · <code>/var/www/site</code> serve files from a folder · <code>example.com</code> proxy another website · <code>redirect:https://x.com</code> send visitors elsewhere.',
   f_routes:'Routes', add_route:'+ Add route', route_path:'/dns-query/*', route_target:'8000',
-  f_routes_h:'Send particular paths to a different backend. A DNS server, for example: <code>/dns-query/*</code> → <code>8000</code> for DNS-over-HTTPS and <code>/panel*</code> → <code>8000</code> for its admin page, while everything else goes to the main backend. <code>*</code> matches anything after it; routes are checked before the main backend.',
+  f_routes_h:'Send particular paths to a different backend; everything else goes to the main backend. A DNS server: <code>/dns-query/*</code> → <code>8000</code>. A hidden Xray config: <code>/my-secret-path*</code> → <code>3103</code>. <code>*</code> matches anything after it, and routes are checked before the main backend.',
   f_path:'Path prefix',
   f_path_h:'Only for apps that live under a secret path, like x-ui. It is recorded and used for the link in the list; nothing is blocked, because the app already answers 404 outside its path.',
   f_host:'Host header',
@@ -3644,7 +4075,50 @@ en: {
   confirm_dup:'{0} is defined both here in the Caddyfile and in Smart Caddy.\n\nKeep the Caddyfile block: it replaces the managed copy and leaves the Caddyfile. The replaced copy stays in the activity log, and nothing changes if Caddy rejects it.',
   act_add:'Added', act_add_r:'Edited', act_del:'Removed', act_import:'Imported', act_put:'Config saved',
   act_fixbind:'Fixed bind', act_repair:'Repaired', act_uninstall:'Uninstalled', act_del_cert:'Certificate deleted',
-  act_renew:'Certificate renewed', act_cert:'SSL handed to Caddy'
+  act_renew:'Certificate renewed', act_cert:'SSL handed to Caddy',
+  tagline:'Reverse proxy control panel',
+  tab_settings:'Settings',
+  set_d:'Settings for this panel. They are stored on this server and survive updates.',
+  set_id:'Server identity',
+  set_id_d:'Give this server a name, an icon and a colour. They appear in the browser tab, the favicon, the header and the sign-in page, so when you run Smart Caddy on several servers you always know which one is open.',
+  b_name:'Server name', b_name_h:'Short and clear, e.g. Turkey, Iran - main, Germany 2. Up to 32 characters; Persian works too.',
+  b_icon:'Icon', b_icon_h:'One emoji or a flag. A flag shows as its two letters in the favicon (TR, IR), because Windows has no flag emoji.',
+  b_color:'Accent colour', b_save:'Save', b_saved:'Server identity saved', b_revert:'Undo changes', b_noname:'No name yet',
+  tab_overview:'Overview', tab_sites:'Sites', tab_add:'Add site', tab_edit:'Edit site', tab_caddyfile:'Import',
+  tab_guide:'Cloudflare CDN', tab_diag:'Diagnostics', tab_log:'Activity',
+  tab_overview_d:'The state of Caddy, your sites and their certificates at a glance. This page refreshes by itself every 20 seconds.',
+  tab_sites_d:'Every domain Caddy serves on this server. Edit opens it in the form; Config opens the raw Caddyfile text, which Caddy checks before anything is applied.',
+  tab_add_d:'Put a domain online in four short steps. Only the domain and the main backend are required - everything else can stay as it is.',
+  tile_sites_s:'domains served', tile_certs_s:'valid HTTPS certificates', tile_exp_s:'Caddy renews them by itself', tile_cf_s:'blocks you can import',
+  qa_add:'Add a site', qa_add_d:'Point a domain at an app, a panel, a folder or another website.',
+  qa_cdn:'Hide a config behind Cloudflare', qa_cdn_d:'Send XHTTP, gRPC, WebSocket or HTTPUpgrade through the orange cloud, so only Cloudflare\'s IP is visible.',
+  qa_doctor:'Run a full check', qa_doctor_d:'Ports, permissions, certificates, DNS and Xray fallbacks in one go.',
+  sec_basic:'Address and backend', sec_basic_d:'Which domain visitors open, and where Caddy sends them.',
+  sec_opts:'Certificate and options', sec_opts_d:'The defaults suit almost every site. Change them only when you know you need to.',
+  sec_mode:'Site type', sec_mode_d:'Tick what describes this site. Leave all three empty for an ordinary website or app.',
+  routes_none:'No routes - every request goes to the main backend.',
+  rt_http:'HTTP / WS / HTTPUpgrade', rt_h2c:'XHTTP / gRPC (h2c)',
+  f_routes_types:'Route type: <b>HTTP / WS / HTTPUpgrade</b> for websites, WebSocket and HTTPUpgrade inbounds · <b>XHTTP / gRPC (h2c)</b> for Xray XHTTP and gRPC inbounds - Caddy talks cleartext HTTP/2 to them and streams without buffering. The inbound itself listens on <code>127.0.0.1</code> with security <code>none</code>; Caddy does the TLS.',
+  diag_empty:'Nothing yet. Run diagnostics, or take an action anywhere in the panel - its output lands here.',
+  g_title:'Hide your server behind Cloudflare',
+  g_intro:'Put Caddy between Cloudflare and an Xray inbound. Clients connect to Cloudflare, so a ping of the domain returns Cloudflare\'s IP while the traffic still leaves from this server. One domain can carry several configs, each on its own secret path.',
+  g_which:'Which configs can go through Cloudflare', g_th_type:'Transport', g_th_cdn:'Through CDN', g_th_route:'Route type here', g_th_note:'Notes',
+  g_yes:'Yes', g_no:'No',
+  g_n_xhttp:'Mode <code>packet-up</code> works everywhere. <code>auto</code> / <code>stream-up</code> also need gRPC switched on in Cloudflare.',
+  g_n_grpc:'Switch on <b>Network → gRPC</b> in Cloudflare. Route path: <code>/serviceName/*</code>.',
+  g_n_ws:'Works out of the box. Client ALPN <code>http/1.1</code>.',
+  g_n_hu:'Same as WebSocket. Client ALPN <code>http/1.1</code>.',
+  g_n_no:'Cloudflare only carries HTTP. These need a direct connection to the server.',
+  g_s1_t:'Prepare the inbound in x-ui',
+  g_s1:'<ul><li><b>Listen</b>: <code>127.0.0.1</code> and any free port, e.g. <code>3103</code></li><li><b>Security</b>: <code>none</code> - TLS ends at Caddy. An inbound that keeps its own TLS puts <code>pinnedPeerCertSha256</code> into the share link, and behind Cloudflare that pin never matches</li><li><b>Path</b>: a long random path, e.g. <code>/k8Jq2xVt</code></li><li><b>Host</b>: your CDN domain, e.g. <code>cdn.example.com</code></li></ul>',
+  g_s2_t:'Add the site here',
+  g_s2:'<ul><li><b>Domain</b>: <code>cdn.example.com</code> (cloud still grey)</li><li><b>Main backend</b>: a cover site such as <code>redirect:https://www.google.com</code>, so the bare domain looks ordinary</li><li><b>Route</b>: <code>/k8Jq2xVt*</code> → <code>3103</code>, with the route type from the table above</li><li>More configs: one more route each, on the same domain</li></ul>',
+  g_s3_t:'Switch on Cloudflare',
+  g_s3:'<ul><li>Wait until the site shows a certificate, then turn the cloud <b>orange</b></li><li><b>SSL/TLS</b> → <code>Full (strict)</code></li><li><b>Network</b> → gRPC <b>on</b> (gRPC and XHTTP stream modes), WebSockets on</li><li>Keep <b>Always Use HTTPS</b> off, so Caddy can renew the certificate over port 80</li></ul>',
+  g_s4_t:'The client link',
+  g_s4:'<p>In x-ui → <b>Hosts</b> (or External Proxy) give the inbound an entry, so subscriptions come out right:</p><ul><li>Address <code>cdn.example.com</code> or a clean Cloudflare IP · port <code>443</code></li><li>Security <code>tls</code>, SNI and Host <code>cdn.example.com</code>, fingerprint <code>chrome</code></li><li>ALPN <code>h2,http/1.1</code> for XHTTP and gRPC, <code>http/1.1</code> for WebSocket and HTTPUpgrade</li></ul>',
+  g_s5_t:'Check it',
+  g_s5:'<ul><li><code>ping cdn.example.com</code> shows a Cloudflare IP</li><li>Connected through the config, a what-is-my-IP site shows this server\'s IP</li><li><code>curl -I https://cdn.example.com/k8Jq2xVt</code> answers <code>400</code> or <code>404</code> with <code>server: cloudflare</code> - that answer comes from Xray, so the path works. <code>502</code> means the inbound is not listening</li></ul>'
 },
 fa: {
   checking:'در حال بررسی', caddy_running:'Caddy فعال است', caddy_down:'Caddy خاموش است', sign_out:'خروج',
@@ -3668,11 +4142,11 @@ fa: {
   output:'خروجی',
   form_add:'افزودن سایت', form_edit:'ویرایش {0}',
   f_domain:'دامنه',
-  f_domain_h:'آدرسی که کاربر در مرورگر می‌زند. رکورد A آن باید به IP همین سرور اشاره کند و CDN یا پروکسی ابری (ابر نارنجی) خاموش باشد؛ وگرنه گواهی SSL صادر نمی‌شود.',
+  f_domain_h:'آدرسی که کاربر در مرورگر می‌زند. رکورد A آن باید به IP همین سرور اشاره کند. اگر پشت Cloudflare است، تا وقتی گواهی صادر نشده ابر را <b>خاکستری</b> نگه دارید و بعد نارنجی کنید.',
   f_target:'مقصد اصلی',
   f_target_h:'درخواست‌هایی که با هیچ‌کدام از مسیرهای پایین جور نیستند به اینجا می‌روند: <code>8088</code> یک پورت روی همین سرور · <code>https://127.0.0.1:27389</code> برنامه‌ای که خودش HTTPS دارد · <code>/var/www/site</code> نمایش فایل‌های یک پوشه · <code>example.com</code> پروکسی به یک سایت دیگر · <code>redirect:https://x.com</code> فرستادن بازدیدکننده به جای دیگر.',
   f_routes:'مسیرها', add_route:'+ افزودن مسیر', route_path:'/dns-query/*', route_target:'8000',
-  f_routes_h:'مسیرهای مشخص را به مقصد دیگری بفرستید. مثلاً برای سرور DNS: <code>/dns-query/*</code> ← <code>8000</code> برای DNS-over-HTTPS و <code>/panel*</code> ← <code>8000</code> برای صفحهٔ مدیریتش؛ بقیهٔ درخواست‌ها به مقصد اصلی می‌روند. <code>*</code> یعنی هر چیزی بعد از آن. مسیرها قبل از مقصد اصلی بررسی می‌شوند.',
+  f_routes_h:'مسیرهای مشخص را به مقصد دیگری بفرستید؛ بقیهٔ درخواست‌ها به مقصد اصلی می‌روند. سرور DNS: <code>/dns-query/*</code> ← <code>8000</code>. یک کانفیگ مخفی Xray: <code>/my-secret-path*</code> ← <code>3103</code>. <code>*</code> یعنی هر چیزی بعد از آن، و مسیرها قبل از مقصد اصلی بررسی می‌شوند.',
   f_path:'پیشوند مسیر',
   f_path_h:'فقط برای برنامه‌هایی که زیر یک مسیر مخفی هستند، مثل x-ui. ثبت می‌شود و برای لینک داخل لیست استفاده می‌شود؛ چیزی مسدود نمی‌شود، چون خود برنامه بیرون از مسیرش 404 می‌دهد.',
   f_host:'هدر Host',
@@ -3709,7 +4183,50 @@ fa: {
   confirm_dup:'{0} هم اینجا در Caddyfile و هم در Smart Caddy تعریف شده است.\n\nبلاک Caddyfile نگه داشته شود: جای نسخهٔ مدیریت‌شده را می‌گیرد و از Caddyfile خارج می‌شود. نسخهٔ جایگزین‌شده در گزارش تغییرات می‌ماند و اگر Caddy قبول نکند هیچ چیز تغییر نمی‌کند.',
   act_add:'افزوده شد', act_add_r:'ویرایش شد', act_del:'حذف شد', act_import:'وارد شد', act_put:'کانفیگ ذخیره شد',
   act_fixbind:'اصلاح bind', act_repair:'تعمیر', act_uninstall:'حذف نصب', act_del_cert:'گواهی حذف شد',
-  act_renew:'گواهی تمدید شد', act_cert:'SSL به Caddy سپرده شد'
+  act_renew:'گواهی تمدید شد', act_cert:'SSL به Caddy سپرده شد',
+  tagline:'پنل مدیریت ریورس پروکسی',
+  tab_settings:'تنظیمات',
+  set_d:'تنظیمات این پنل. روی همین سرور ذخیره می‌شوند و با آپدیت از بین نمی‌روند.',
+  set_id:'هویت سرور',
+  set_id_d:'برای این سرور یک نام، آیکون و رنگ انتخاب کنید. در تب مرورگر، آیکون سایت (favicon)، بالای پنل و صفحهٔ ورود نمایش داده می‌شوند تا وقتی Smart Caddy را روی چند سرور دارید، همیشه بدانید کدام باز است.',
+  b_name:'نام سرور', b_name_h:'کوتاه و واضح، مثلاً ترکیه، ایران - اصلی، آلمان ۲. حداکثر ۳۲ کاراکتر؛ فارسی هم می‌شود.',
+  b_icon:'آیکون', b_icon_h:'یک ایموجی یا پرچم. پرچم در favicon به‌صورت دو حرف نمایش داده می‌شود (TR، IR)، چون ویندوز ایموجی پرچم ندارد.',
+  b_color:'رنگ', b_save:'ذخیره', b_saved:'هویت سرور ذخیره شد', b_revert:'لغو تغییرات', b_noname:'هنوز نامی ندارد',
+  tab_overview:'داشبورد', tab_sites:'سایت‌ها', tab_add:'افزودن سایت', tab_edit:'ویرایش سایت', tab_caddyfile:'وارد کردن',
+  tab_guide:'CDN کلودفلر', tab_diag:'عیب‌یابی', tab_log:'گزارش تغییرات',
+  tab_overview_d:'وضعیت Caddy، سایت‌ها و گواهی‌هایشان در یک نگاه. این صفحه هر ۲۰ ثانیه خودش به‌روز می‌شود.',
+  tab_sites_d:'همهٔ دامنه‌هایی که Caddy روی این سرور سرویس می‌دهد. «ویرایش» آن را در فرم باز می‌کند و «کانفیگ» متن خام Caddyfile را؛ Caddy قبل از اعمال، آن را بررسی می‌کند.',
+  tab_add_d:'یک دامنه را در چهار قدم کوتاه آنلاین کنید. فقط دامنه و مقصد اصلی لازم است؛ بقیه را می‌توانید همان‌طور که هست بگذارید.',
+  tile_sites_s:'دامنهٔ فعال', tile_certs_s:'گواهی HTTPS معتبر', tile_exp_s:'Caddy خودش تمدیدشان می‌کند', tile_cf_s:'بلاک قابل وارد کردن',
+  qa_add:'افزودن سایت', qa_add_d:'یک دامنه را به یک برنامه، پنل، پوشه یا سایت دیگر وصل کنید.',
+  qa_cdn:'مخفی کردن کانفیگ پشت Cloudflare', qa_cdn_d:'کانفیگ‌های XHTTP، gRPC، WebSocket یا HTTPUpgrade را از ابر نارنجی رد کنید تا فقط IP کلودفلر دیده شود.',
+  qa_doctor:'بررسی کامل', qa_doctor_d:'پورت‌ها، دسترسی فایل‌ها، گواهی‌ها، DNS و fallbackهای Xray یک‌جا بررسی می‌شوند.',
+  sec_basic:'آدرس و مقصد', sec_basic_d:'کاربر چه دامنه‌ای را باز می‌کند و Caddy او را به کجا می‌فرستد.',
+  sec_opts:'گواهی و تنظیمات', sec_opts_d:'پیش‌فرض‌ها برای تقریباً همهٔ سایت‌ها مناسب‌اند. فقط وقتی لازم است تغییرشان دهید.',
+  sec_mode:'نوع سایت', sec_mode_d:'گزینه‌ای را که این سایت را توصیف می‌کند تیک بزنید. برای سایت یا برنامهٔ معمولی هر سه را خالی بگذارید.',
+  routes_none:'مسیری تعریف نشده - همهٔ درخواست‌ها به مقصد اصلی می‌روند.',
+  rt_http:'HTTP / WS / HTTPUpgrade', rt_h2c:'XHTTP / gRPC (h2c)',
+  f_routes_types:'نوع مسیر: <b>HTTP / WS / HTTPUpgrade</b> برای سایت‌ها و اینباندهای WebSocket و HTTPUpgrade · <b>XHTTP / gRPC (h2c)</b> برای اینباندهای XHTTP و gRPC در Xray؛ Caddy با HTTP/2 بدون رمز به آن‌ها وصل می‌شود و بدون بافر استریم می‌کند. خود اینباند روی <code>127.0.0.1</code> با security <code>none</code> گوش می‌دهد و TLS را Caddy انجام می‌دهد.',
+  diag_empty:'هنوز چیزی نیست. عیب‌یابی را اجرا کنید یا هر کاری در پنل انجام دهید؛ خروجی‌اش اینجا می‌آید.',
+  g_title:'سرور را پشت Cloudflare مخفی کنید',
+  g_intro:'Caddy را بین Cloudflare و یک اینباند Xray قرار دهید. کلاینت‌ها به Cloudflare وصل می‌شوند؛ پینگ دامنه IP کلودفلر را برمی‌گرداند ولی ترافیک همچنان از همین سرور خارج می‌شود. روی یک دامنه می‌شود چند کانفیگ گذاشت، هر کدام روی مسیر مخفی خودش.',
+  g_which:'کدام کانفیگ‌ها از Cloudflare رد می‌شوند', g_th_type:'ترنسپورت', g_th_cdn:'پشت CDN', g_th_route:'نوع مسیر در اینجا', g_th_note:'توضیحات',
+  g_yes:'بله', g_no:'خیر',
+  g_n_xhttp:'حالت <code>packet-up</code> همه‌جا کار می‌کند. <code>auto</code> و <code>stream-up</code> به روشن بودن gRPC در Cloudflare هم نیاز دارند.',
+  g_n_grpc:'در Cloudflare گزینهٔ <b>Network → gRPC</b> را روشن کنید. مسیر: <code>/serviceName/*</code>.',
+  g_n_ws:'بدون تنظیم اضافه کار می‌کند. ALPN کلاینت: <code>http/1.1</code>.',
+  g_n_hu:'مثل WebSocket. ALPN کلاینت: <code>http/1.1</code>.',
+  g_n_no:'Cloudflare فقط HTTP را رد می‌کند. این‌ها باید مستقیم به سرور وصل شوند.',
+  g_s1_t:'اینباند را در x-ui آماده کنید',
+  g_s1:'<ul><li><b>Listen</b>: <code>127.0.0.1</code> و یک پورت آزاد، مثلاً <code>3103</code></li><li><b>Security</b>: <code>none</code> - TLS روی Caddy تمام می‌شود. اینباندی که TLS خودش را نگه دارد، <code>pinnedPeerCertSha256</code> را داخل لینک می‌گذارد و پشت Cloudflare این pin هیچ‌وقت جور نمی‌شود</li><li><b>Path</b>: یک مسیر تصادفی بلند، مثلاً <code>/k8Jq2xVt</code></li><li><b>Host</b>: دامنهٔ CDN شما، مثلاً <code>cdn.example.com</code></li></ul>',
+  g_s2_t:'سایت را اینجا اضافه کنید',
+  g_s2:'<ul><li><b>دامنه</b>: <code>cdn.example.com</code> (ابر هنوز خاکستری)</li><li><b>مقصد اصلی</b>: یک سایت پوششی مثل <code>redirect:https://www.google.com</code> تا خود دامنه عادی به نظر برسد</li><li><b>مسیر</b>: <code>/k8Jq2xVt*</code> ← <code>3103</code> با نوع مسیر مطابق جدول بالا</li><li>کانفیگ‌های بیشتر: برای هر کدام یک مسیر دیگر روی همین دامنه</li></ul>',
+  g_s3_t:'Cloudflare را روشن کنید',
+  g_s3:'<ul><li>صبر کنید تا سایت گواهی بگیرد، بعد ابر را <b>نارنجی</b> کنید</li><li><b>SSL/TLS</b> ← <code>Full (strict)</code></li><li><b>Network</b> ← gRPC <b>روشن</b> (برای gRPC و حالت‌های stream در XHTTP) و WebSockets روشن</li><li><b>Always Use HTTPS</b> را خاموش نگه دارید تا Caddy بتواند گواهی را از پورت 80 تمدید کند</li></ul>',
+  g_s4_t:'لینک کلاینت',
+  g_s4:'<p>در x-ui ← <b>Hosts</b> (یا External Proxy) برای اینباند یک ردیف بسازید تا لینک‌های ساب درست ساخته شوند:</p><ul><li>آدرس <code>cdn.example.com</code> یا یک IP تمیز کلودفلر · پورت <code>443</code></li><li>Security <code>tls</code>، SNI و Host برابر <code>cdn.example.com</code>، fingerprint <code>chrome</code></li><li>ALPN برای XHTTP و gRPC <code>h2,http/1.1</code> و برای WebSocket و HTTPUpgrade <code>http/1.1</code></li></ul>',
+  g_s5_t:'تست کنید',
+  g_s5:'<ul><li><code>ping cdn.example.com</code> باید IP کلودفلر را نشان دهد</li><li>وقتی با کانفیگ وصل هستید، سایت‌های what-is-my-IP باید IP همین سرور را نشان دهند</li><li><code>curl -I https://cdn.example.com/k8Jq2xVt</code> باید <code>400</code> یا <code>404</code> با <code>server: cloudflare</code> بدهد؛ این جواب از خود Xray است، یعنی مسیر درست کار می‌کند. <code>502</code> یعنی اینباند گوش نمی‌دهد</li></ul>'
 }};
 
 let LANG = 'en';
@@ -3730,6 +4247,7 @@ function applyLang(){
   document.querySelectorAll('[data-th]').forEach(e => e.innerHTML = t(e.dataset.th));
   document.querySelectorAll('[data-lang]').forEach(b => b.classList.toggle('on', b.dataset.lang === LANG));
   formTexts();
+  renderPreview(DRAFT || BRAND);
   if (STATE) render(STATE);
   if (LOG) renderLog(LOG);
 }
@@ -3744,6 +4262,30 @@ document.querySelectorAll('[data-lang]').forEach(b => b.onclick = () => {
 let busy = false, STATE = null, LOG = null, SITES = [];
 let EDITING = null;          // the site object being edited, null while adding
 let XRAY_TOUCHED = false;    // once the user sets it themselves, stop guessing
+
+// ---------------------------------------------------------------- tabs
+const TABS = ['overview', 'sites', 'add', 'caddyfile', 'guide', 'diag', 'log', 'settings'];
+let TAB = 'overview';
+
+function setTab(name, push){
+  if (!TABS.includes(name)) name = 'overview';
+  if (name === 'caddyfile' && $('#tab-btn-caddyfile').hidden) name = 'sites';
+  const moved = name !== TAB;
+  TAB = name;
+  document.querySelectorAll('#tabs [data-tab]').forEach(b => {
+    const on = b.dataset.tab === name;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-selected', on ? 'true' : 'false');
+  });
+  document.querySelectorAll('main > .tab').forEach(s => s.classList.toggle('on', s.id === 'tab-' + name));
+  if (name === 'diag') $('#b-diag').hidden = true;
+  try { localStorage.setItem('sc-tab', name); } catch(_) {}
+  if (push !== false && location.hash !== '#' + name) history.replaceState(null, '', '#' + name);
+  if (moved) window.scrollTo({top: 0, behavior: 'smooth'});
+}
+document.querySelectorAll('#tabs [data-tab]').forEach(b => b.onclick = () => setTab(b.dataset.tab));
+document.querySelectorAll('[data-goto]').forEach(b => b.onclick = () => setTab(b.dataset.goto));
+window.addEventListener('hashchange', () => setTab(location.hash.slice(1), false));
 
 function esc(s){
   return String(s).replace(/[&<>"']/g, c =>
@@ -3783,12 +4325,15 @@ function paintDiff(text){
   }).join('\n');
 }
 
-function show(title, text){
+// Output always lands in the Diagnostics tab. A failure opens it; anything
+// else just marks the tab, so the page you are on stays put.
+function show(title, text, fail){
   $('#out-title').textContent = title;
   $('#out').innerHTML = text ? paint(text) : esc(t('no_output'));
   $('#out-idle').hidden = true;
   $('#out').hidden = false;
-  $('#out-card').scrollIntoView({behavior:'smooth', block:'nearest'});
+  if (fail) setTab('diag');
+  else if (TAB !== 'diag') $('#b-diag').hidden = false;
 }
 
 async function api(path, body){
@@ -3826,6 +4371,10 @@ async function load(){
   const d = await api('/api/state');
   if (!d || !d.sites) return;
   STATE = d;
+  // another browser may have changed the identity; never clobber an unsaved draft
+  if (d.brand && !DRAFT && JSON.stringify(d.brand) !== JSON.stringify(BRAND)){
+    BRAND = d.brand; applyBrand(BRAND); fillSettings(BRAND);
+  }
   render(d);
 }
 
@@ -3858,14 +4407,14 @@ function render(d){
   renderCaddyfile(d.caddyfile || []);
 
   SITES = d.sites;
+  $('#b-sites').textContent = d.sites.length;
   if (!d.sites.length){
     const any = (d.caddyfile || []).some(b => b.importable);
-    $('#sites').innerHTML = '<div class="empty">' + esc(t(any ? 'no_sites_cf' : 'no_sites')) + '</div>';
+    $('#sites').innerHTML = '<div class="empty glass card">' + esc(t(any ? 'no_sites_cf' : 'no_sites')) + '</div>';
     return;
   }
 
-  let h = '<table><thead><tr><th>' + esc(t('th_domain')) + '</th><th>' + esc(t('th_backend'))
-        + '</th><th>' + esc(t('th_notes')) + '</th><th></th></tr></thead><tbody>';
+  let h = '<div class="slist">';
   d.sites.forEach((s, i) => {
     const pth = s.paths.length ? s.paths[0] : '';
     const scheme = (s.cert === 'none') ? 'http://' : 'https://';
@@ -3880,18 +4429,20 @@ function render(d){
     else if (s.imported) notes += '<span class="tag">' + esc(t('tag_imported')) + '</span>';
     let backend = '<code>' + esc(s.target) + '</code>';
     for (const r of s.routes)
-      backend += '<div class="rt ltr"><code>' + esc(r.path) + '</code> → <code>' + esc(r.target) + '</code></div>';
-    h += '<tr>'
-      +  '<td class="dom"><a class="ltr" href="' + esc(url) + '" target="_blank" rel="noopener">' + esc(s.domain) + '</a></td>'
-      +  '<td>' + backend + '</td>'
-      +  '<td>' + notes + '</td>'
-      +  '<td class="acts">'
+      backend += '<div class="rt ltr"><code>' + esc(r.path) + '</code> → <code>' + esc(r.target) + '</code>'
+              +  (/^h2c:\/\//.test(r.target) ? ' <span class="tag cdn">XHTTP / gRPC</span>' : '') + '</div>';
+    h += '<div class="site glass">'
+      +  '<div><span class="lbl">' + esc(t('th_domain')) + '</span>'
+      +  '<div class="dom"><a class="ltr" href="' + esc(url) + '" target="_blank" rel="noopener">' + esc(s.domain) + '</a></div></div>'
+      +  '<div><span class="lbl">' + esc(t('th_backend')) + '</span>' + backend + '</div>'
+      +  '<div><span class="lbl">' + esc(t('th_notes')) + '</span>' + notes + '</div>'
+      +  '<div class="acts">'
       +  '<button class="link go" data-edit="' + i + '">' + esc(t('edit')) + '</button>'
       +  '<button class="link go" data-raw="' + esc(s.domain) + '">' + esc(t('config')) + '</button>'
-      +  '<button class="link" data-del="' + esc(s.domain) + '">' + esc(t('remove')) + '</button></td>'
-      +  '</tr>';
+      +  '<button class="link" data-del="' + esc(s.domain) + '">' + esc(t('remove')) + '</button></div>'
+      +  '</div>';
   });
-  $('#sites').innerHTML = h + '</tbody></table>';
+  $('#sites').innerHTML = h + '</div>';
 
   document.querySelectorAll('[data-del]').forEach(b => b.onclick = () => remove(b.dataset.del));
   document.querySelectorAll('[data-raw]').forEach(b => b.onclick = () => openRaw(b.dataset.raw));
@@ -3918,15 +4469,20 @@ function renderTiles(d){
   $('#t-sites').textContent = d.sites.length;
   $('#t-certs').textContent = certs;
   $('#t-exp').textContent = expiring;
-  $('#t-exp-tile').className = 'tile' + (expiring ? ' warn' : '');
+  $('#t-exp-tile').className = 'tile glass' + (expiring ? ' warn' : '');
   $('#t-cf').textContent = unmanaged;
-  $('#t-cf-tile').className = 'tile' + (unmanaged ? ' warn' : '');
+  $('#t-cf-tile').className = 'tile glass' + (unmanaged ? ' warn' : '');
 }
 
 function renderCaddyfile(blocks){
-  const card = $('#cf-card');
-  if (!blocks.length){ card.hidden = true; return; }
-  card.hidden = false;
+  const importable = blocks.filter(b => b.importable).length;
+  $('#tab-btn-caddyfile').hidden = !blocks.length;
+  $('#b-cf').textContent = importable || blocks.length;
+  $('#b-cf').className = 'badge' + (importable ? ' warn' : '');
+  if (!blocks.length){
+    if (TAB === 'caddyfile') setTab('sites');
+    return;
+  }
   const open = new Set([...document.querySelectorAll('#cf-list details[open]')].map(x => x.dataset.k));
   let h = '';
   for (const b of blocks){
@@ -3962,7 +4518,7 @@ async function remove(domain){
   const r = await api('/api/del', {domain, purge_cert:false});
   busy = false;
   toast(r.ok ? t('removed', domain) : t('remove_failed', domain), !r.ok);
-  show(t('remove') + ' ' + domain, r.out);
+  show(t('remove') + ' ' + domain, r.out, !r.ok);
   if (EDITING && EDITING.domain === domain) stopEdit();
   refresh();
 }
@@ -3974,7 +4530,7 @@ async function importSites(domains, replace){
   const r = await api('/api/import', {domains, replace: !!replace});
   busy = false;
   toast(r.ok ? t('imported_n', domains.length) : t('import_failed'), !r.ok);
-  show(t('import'), r.out);
+  show(t('import'), r.out, !r.ok);
   refresh();
 }
 
@@ -3986,7 +4542,7 @@ async function toCaddy(domain){
   const r = await api('/api/cert', {domain});
   busy = false;
   toast(r.ok ? t('to_caddy_done', domain) : t('toast_failed'), !r.ok);
-  show('SSL ' + domain, r.out);
+  show('SSL ' + domain, r.out, !r.ok);
   refresh();
 }
 
@@ -4002,35 +4558,57 @@ async function renewCert(domain){
 }
 
 // ---------------------------------------------------------------- routes
+// A route row is: path -> type -> backend. The "XHTTP / gRPC" type stores
+// the backend as h2c://host:port, which is what Caddy needs for those.
+function routeTexts(row){
+  const sel = row.querySelector('.r-type');
+  sel.options[0].textContent = t('rt_http');
+  sel.options[1].textContent = t('rt_h2c');
+  row.querySelector('.r-path').placeholder = sel.value === 'h2c' ? '/k8Jq2xVt*' : t('route_path');
+  row.querySelector('.r-target').placeholder = sel.value === 'h2c' ? '3103' : t('route_target');
+}
+function syncRoutes(){ $('#routes-empty').hidden = !!document.querySelector('#routes .route'); }
+
 function addRouteRow(path, target){
+  let type = 'http';
+  target = target || '';
+  if (/^h2c:\/\//.test(target)){ type = 'h2c'; target = target.slice(6).replace(/^127\.0\.0\.1:(\d+)$/, '$1'); }
   const row = document.createElement('div');
   row.className = 'route';
   row.innerHTML = '<input type="text" class="r-path"><span class="arr">→</span>'
+                + '<select class="r-type"><option value="http"></option><option value="h2c"></option></select>'
                 + '<input type="text" class="r-target">'
                 + '<button type="button" class="link" aria-label="remove">✕</button>';
   row.querySelector('.r-path').value = path || '';
-  row.querySelector('.r-target').value = target || '';
-  row.querySelector('.r-path').placeholder = t('route_path');
-  row.querySelector('.r-target').placeholder = t('route_target');
-  row.querySelector('button').onclick = () => row.remove();
+  row.querySelector('.r-target').value = target;
+  row.querySelector('.r-type').value = type;
+  row.querySelector('.r-type').onchange = () => routeTexts(row);
+  routeTexts(row);
+  row.querySelector('button').onclick = () => { row.remove(); syncRoutes(); };
   $('#routes').appendChild(row);
+  syncRoutes();
   return row;
 }
 $('#btn-route').onclick = () => addRouteRow().querySelector('.r-path').focus();
 
 function readRoutes(){
-  return [...document.querySelectorAll('#routes .route')].map(r => ({
-    path: r.querySelector('.r-path').value.trim(),
-    target: r.querySelector('.r-target').value.trim()
-  })).filter(r => r.path || r.target);
+  return [...document.querySelectorAll('#routes .route')].map(r => {
+    let target = r.querySelector('.r-target').value.trim();
+    if (r.querySelector('.r-type').value === 'h2c' && target){
+      target = target.replace(/^[a-z0-9]+:\/\//i, '');
+      if (/^\d+$/.test(target)) target = '127.0.0.1:' + target;
+      target = 'h2c://' + target;
+    }
+    return {path: r.querySelector('.r-path').value.trim(), target};
+  }).filter(r => r.path || r.target);
 }
 
 // ---------------------------------------------------------------- form
 function formTexts(){
   $('#form-title').textContent = EDITING ? t('form_edit', EDITING.domain) : t('form_add');
   $('#btn-add').textContent = t(EDITING ? 'btn_save' : 'btn_add');
-  document.querySelectorAll('#routes .r-path').forEach(i => i.placeholder = t('route_path'));
-  document.querySelectorAll('#routes .r-target').forEach(i => i.placeholder = t('route_target'));
+  $('#tab-add-label').textContent = t(EDITING ? 'tab_edit' : 'tab_add');
+  document.querySelectorAll('#routes .route').forEach(routeTexts);
   if (EDITING && EDITING.imported) $('#edit-note').innerHTML = t('note_imported');
 }
 
@@ -4048,12 +4626,14 @@ function startEdit(s){
   XRAY_TOUCHED = true;
   $('#routes').innerHTML = '';
   for (const r of s.routes) addRouteRow(r.path, r.target);
+  syncRoutes();
   $('#f-domain').readOnly = true;
   $('#edit-note').hidden = !s.imported;
   $('#form-card').classList.add('editing');
   $('#btn-cancel').hidden = false;
+  $('#form-out-card').hidden = true;
   formTexts();
-  $('#form-card').scrollIntoView({behavior:'smooth', block:'start'});
+  setTab('add');
   $('#f-target').focus({preventScroll:true});
 }
 
@@ -4061,6 +4641,7 @@ function stopEdit(){
   EDITING = null;
   $('#add').reset();
   $('#routes').innerHTML = '';
+  syncRoutes();
   $('#f-xray').checked = false;
   $('#f-cert').value = 'caddy';
   syncCert();
@@ -4100,8 +4681,14 @@ $('#add').onsubmit = async e => {
   $('#btn-add').disabled = false;
   busy = false;
   toast(r.ok ? t(editing ? 'toast_updated' : 'toast_live', body.domain) : t('toast_failed'), !r.ok);
-  show((editing ? t('edit') : t('btn_add')) + ' ' + body.domain, r.out);
+  const title = (editing ? t('edit') : t('btn_add')) + ' ' + body.domain;
+  show(title, r.out);
+  // the output stays under the form too: behind Xray it holds the fallback row to add
+  $('#form-out-title').textContent = title;
+  $('#form-out').innerHTML = r.out ? paint(r.out) : esc(t('no_output'));
+  $('#form-out-card').hidden = false;
   if (r.ok) stopEdit(); else formTexts();
+  $('#form-out-card').scrollIntoView({behavior:'smooth', block:'nearest'});
   refresh();
 };
 
@@ -4113,11 +4700,15 @@ $('#btn-out').onclick = async () => {
 $('#btn-doctor').onclick = async () => {
   if (busy) return;
   busy = true;
+  $('#btn-doctor').disabled = true;
+  setTab('diag');
   show(t('diag'), t('running'));
   const r = await api('/api/doctor');
   busy = false;
+  $('#btn-doctor').disabled = false;
   show(t('diag'), r.out);
 };
+$('#qa-doctor').onclick = () => $('#btn-doctor').click();
 
 // ---------------------------------------------------------------- raw editor
 let RAW = null;
@@ -4128,6 +4719,7 @@ async function openRaw(domain){
   RAW = domain;
   $('#raw-title').textContent = domain;
   $('#raw-text').value = r.config;
+  $('#raw-out').hidden = true;
   $('#raw').showModal();
   $('#raw-text').focus();
 }
@@ -4153,8 +4745,58 @@ $('#raw-save').onclick = async () => {
   busy = false;
   toast(r.ok ? t('raw_saved', domain) : t('raw_rejected'), !r.ok);
   show(t('config') + ' ' + domain, r.out);
+  // a rejection keeps the editor open, so show why right inside it
+  $('#raw-out').innerHTML = r.out ? paint(r.out) : esc(t('no_output'));
+  $('#raw-out').hidden = !!r.ok;
   if (r.ok) closeRaw();
   refresh();
+};
+
+
+// ---------------------------------------------------------------- settings
+const ICON_PICKS = ['🇮🇷','🇹🇷','🇩🇪','🇳🇱','🇫🇮','🇫🇷','🇬🇧','🇺🇸','🇦🇪','🇦🇲','⚡','🛡️','🚀','🌐','🏠','🎮'];
+let DRAFT = null;            // unsaved identity while the settings tab is edited
+
+function draftFromForm(){
+  const on = document.querySelector('#b-colors .on');
+  return {name: $('#b-name').value.trim(), icon: $('#b-icon').value.replace(/\s+/g, ''),
+          color: on ? on.dataset.c : 'violet'};
+}
+function renderPreview(b){
+  $('#b-prev-fav').src = favUrl(b);
+  $('#b-prev-title').textContent = brandTitle(b);
+  $('#b-prev-icon').textContent = b.icon || '';
+  $('#b-prev-icon').hidden = !b.icon;
+  $('#b-prev-name').textContent = b.name || t('b_noname');
+}
+function fillSettings(b){
+  $('#b-name').value = b.name || '';
+  $('#b-icon').value = b.icon || '';
+  document.querySelectorAll('#b-colors button').forEach(x => x.classList.toggle('on', x.dataset.c === (b.color || 'violet')));
+  renderPreview(b);
+}
+function onDraft(){ DRAFT = draftFromForm(); applyBrand(DRAFT); renderPreview(DRAFT); }
+
+$('#b-colors').innerHTML = Object.entries(BRAND_COLORS).map(([k, c]) =>
+  '<button type="button" data-c="' + k + '" aria-label="' + k + '" style="background:linear-gradient(135deg,' + c[0] + ',' + c[1] + ')"></button>').join('');
+$('#b-emojis').innerHTML = ICON_PICKS.map(e => '<button type="button">' + e + '</button>').join('');
+document.querySelectorAll('#b-colors button').forEach(x => x.onclick = () => {
+  document.querySelectorAll('#b-colors button').forEach(y => y.classList.toggle('on', y === x));
+  onDraft();
+});
+document.querySelectorAll('#b-emojis button').forEach(x => x.onclick = () => { $('#b-icon').value = x.textContent; onDraft(); });
+$('#b-name').oninput = onDraft;
+$('#b-icon').oninput = onDraft;
+$('#b-revert').onclick = () => { DRAFT = null; fillSettings(BRAND); applyBrand(BRAND); };
+$('#b-save').onclick = async () => {
+  if (busy) return;
+  busy = true;
+  $('#b-save').disabled = true;
+  const r = await api('/api/brand', draftFromForm());
+  $('#b-save').disabled = false;
+  busy = false;
+  if (r.ok){ BRAND = r.brand; DRAFT = null; fillSettings(BRAND); applyBrand(BRAND); toast(t('b_saved')); }
+  else toast(r.out || t('toast_failed'), true);
 };
 
 // ---------------------------------------------------------------- activity log
@@ -4197,9 +4839,9 @@ function renderLog(list){
       +  '<span class="tag">' + esc(t(e.src === 'panel' ? 'src_panel' : 'src_cli')) + '</span>'
       +  '<span class="sub ltr">' + esc(e.who || '') + '</span></summary>'
       +  '<div class="cmd sub" style="margin-top:8px">$ smart-caddy ' + esc(e.cmd) + '</div>'
-      +  '<h3>' + esc(t('log_changes')) + '</h3>'
+      +  '<h4>' + esc(t('log_changes')) + '</h4>'
       +  (e.diff ? '<pre>' + paintDiff(e.diff) + '</pre>' : '<div class="sub">' + esc(t('log_nodiff')) + '</div>')
-      +  '<h3>' + esc(t('log_output')) + '</h3><pre>' + (e.out ? paint(e.out) : esc(t('no_output'))) + '</pre>'
+      +  '<h4>' + esc(t('log_output')) + '</h4><pre>' + (e.out ? paint(e.out) : esc(t('no_output'))) + '</pre>'
       +  '</details>';
   }
   $('#log').innerHTML = h;
@@ -4208,8 +4850,15 @@ $('#btn-log').onclick = loadLog;
 
 function refresh(){ load(); loadLog(); }
 
+applyBrand(BRAND);
+fillSettings(BRAND);
 applyLang();
 stopEdit();
+{
+  let first = location.hash.slice(1);
+  if (!TABS.includes(first)) { try { first = localStorage.getItem('sc-tab') || ''; } catch(_) { first = ''; } }
+  setTab(first || 'overview', !!first);
+}
 refresh();
 setInterval(() => { if (!busy && !$('#raw').open) refresh(); }, 20000);
 </script>
