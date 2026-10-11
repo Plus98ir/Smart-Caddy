@@ -3599,7 +3599,7 @@ html[lang=fa] body{font-family:Flags,Vazirmatn,var(--font)}
   -webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur);
   box-shadow:inset 0 1px 0 rgba(255,255,255,.08),0 20px 50px -20px rgba(0,0,0,.6)}
 
-.wrap{max-width:1320px;margin:0 auto;padding:22px 24px 72px}
+.wrap{max-width:none;margin:0;padding:22px 24px 72px}
 .ltr{direction:ltr;unicode-bidi:isolate}
 .sub{color:var(--mut);font-size:13px}
 
@@ -3653,18 +3653,21 @@ nav.tabs button.on{color:var(--ink);background:var(--glass-3);border-color:var(-
 nav.tabs svg{width:18px;height:18px;flex:none;opacity:.9}
 nav.tabs button > span:not(.badge){transition:opacity .15s;overflow:hidden;text-overflow:ellipsis}
 nav.tabs .badge{margin-inline-start:auto}
-nav.tabs .sep{flex:1;min-height:10px}
+nav.tabs .hr{flex:none;height:1px;margin:2px 6px 6px;background:var(--stroke)}
+nav.tabs #btn-pin{align-self:flex-start;width:auto;padding:8px 13px}
 #btn-pin svg{transition:transform .15s}
 html:not(.pin) #btn-pin svg{transform:rotate(35deg)}
 html.pin #btn-pin{color:var(--acc)}
-body{padding-inline-start:calc(var(--rail) + var(--gap));transition:padding .2s ease}
-html.pin body{padding-inline-start:calc(var(--side) + var(--gap))}
-html.pin nav.tabs,html:not(.pin) nav.tabs:hover,nav.tabs:focus-within{width:var(--side)}
-html:not(.pin) nav.tabs:hover,html:not(.pin) nav.tabs:focus-within{box-shadow:0 0 50px -6px rgba(0,0,0,.75)}
+/* the page always keeps the open menu's width free, so pinning never moves the content */
+body{padding-inline-start:calc(var(--side) + var(--gap))}
 @media(min-width:901px){
-  /* closed rail: icons only, the count sits on the icon */
-  html:not(.pin) nav.tabs:not(:hover):not(:focus-within) button > span:not(.badge){opacity:0}
-  html:not(.pin) nav.tabs:not(:hover):not(:focus-within) .badge{position:absolute;top:3px;inset-inline-start:27px;
+  html.pin nav.tabs,html:not(.pin):not(.navshut) nav.tabs:hover,html:not(.pin) nav.tabs:focus-within{width:var(--side)}
+  html:not(.pin):not(.navshut) nav.tabs:hover,html:not(.pin) nav.tabs:focus-within{box-shadow:0 0 50px -6px rgba(0,0,0,.75)}
+  /* closed rail: icons only, the count sits on the icon. navshut = closed right after a click, until the mouse leaves */
+  html:not(.pin) nav.tabs:not(:hover):not(:focus-within) button > span:not(.badge),
+  html.navshut:not(.pin) nav.tabs:not(:focus-within) button > span:not(.badge){opacity:0}
+  html:not(.pin) nav.tabs:not(:hover):not(:focus-within) .badge,
+  html.navshut:not(.pin) nav.tabs:not(:focus-within) .badge{position:absolute;top:3px;inset-inline-start:27px;
     font-size:10px;min-width:16px;padding:0 4px;line-height:16px}
 }
 #btn-menu{display:none;padding:8px 10px;line-height:0}
@@ -3909,6 +3912,9 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
 </header>
 
 <nav class="tabs glass" id="tabs" role="tablist">
+  <button type="button" id="btn-pin">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5M9 3h6l-1 7 4 3v2H6v-2l4-3z"/></svg></button>
+  <span class="hr"></span>
   <button type="button" data-tab="overview" role="tab">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="2"/><rect x="14" y="3" width="7" height="5" rx="2"/><rect x="14" y="12" width="7" height="9" rx="2"/><rect x="3" y="16" width="7" height="5" rx="2"/></svg>
     <span data-t="tab_overview">Overview</span></button>
@@ -3933,10 +3939,6 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
   <button type="button" data-tab="settings" role="tab">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
     <span data-t="tab_settings">Settings</span></button>
-  <span class="sep"></span>
-  <button type="button" id="btn-pin">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5M9 3h6l-1 7 4 3v2H6v-2l4-3z"/></svg>
-    <span id="pin-txt"></span></button>
 </nav>
 <div class="scrim" id="scrim"></div>
 
@@ -4273,7 +4275,7 @@ en: {
   act_renew:'Certificate renewed', act_cert:'SSL handed to Caddy',
   tagline:'Reverse proxy control panel',
   tab_settings:'Settings',
-  nav_pin:'Keep menu open', nav_unpin:'Auto-hide menu', nav_menu:'Menu',
+  nav_pin:'Pin menu', nav_unpin:'Unpin menu', nav_menu:'Menu',
   set_d:'Settings for this panel. They are stored on this server and survive updates.',
   set_id:'Server identity',
   set_id_d:'Give this server a name, an icon and a colour. They appear in the browser tab, the favicon, the header and the sign-in page, so when you run Smart Caddy on several servers you always know which one is open.',
@@ -4382,7 +4384,7 @@ fa: {
   act_renew:'گواهی تمدید شد', act_cert:'SSL به Caddy سپرده شد',
   tagline:'پنل مدیریت ریورس پروکسی',
   tab_settings:'تنظیمات',
-  nav_pin:'منو باز بماند', nav_unpin:'منو خودکار جمع شود', nav_menu:'منو',
+  nav_pin:'پین منو', nav_unpin:'برداشتن پین منو', nav_menu:'منو',
   set_d:'تنظیمات این پنل. روی همین سرور ذخیره می‌شوند و با آپدیت از بین نمی‌روند.',
   set_id:'هویت سرور',
   set_id_d:'برای این سرور یک نام، آیکون و رنگ انتخاب کنید. در تب مرورگر، آیکون سایت (favicon)، بالای پنل و صفحهٔ ورود نمایش داده می‌شوند تا وقتی Smart Caddy را روی چند سرور دارید، همیشه بدانید کدام باز است.',
@@ -4486,14 +4488,17 @@ function setTab(name, push){
   if (push !== false && location.hash !== '#' + name) history.replaceState(null, '', '#' + name);
   if (moved) window.scrollTo({top: 0, behavior: 'smooth'});
 }
-document.querySelectorAll('#tabs [data-tab]').forEach(b => b.onclick = () => { setTab(b.dataset.tab); navOpen(false); });
+document.querySelectorAll('#tabs [data-tab]').forEach(b => b.onclick = () => { setTab(b.dataset.tab); navOpen(false); navShut(); });
 
 // side menu: pinned open, or a rail that opens on hover (saved per browser); a drawer on phones
 let PIN = false;
 try { PIN = localStorage.getItem('sc-pin') === '1'; } catch(_) {}
 function navTexts(){
   document.documentElement.classList.toggle('pin', PIN);
-  $('#pin-txt').textContent = t(PIN ? 'nav_unpin' : 'nav_pin');
+  const pin = $('#btn-pin');
+  pin.title = t(PIN ? 'nav_unpin' : 'nav_pin');
+  pin.setAttribute('aria-label', pin.title);
+  pin.setAttribute('aria-pressed', PIN ? 'true' : 'false');
   $('#btn-menu').title = t('nav_menu');
   // the closed rail shows icons only, so each one carries its name
   document.querySelectorAll('#tabs button').forEach(b => {
@@ -4503,6 +4508,15 @@ function navOpen(on){
   document.documentElement.classList.toggle('navopen', on);
   $('#btn-menu').setAttribute('aria-expanded', on ? 'true' : 'false');
 }
+// an unpinned menu folds back as soon as a tab is clicked with the mouse,
+// and only opens again once the mouse has left it and come back
+function navShut(){
+  const nav = $('#tabs');
+  if (PIN || !matchMedia('(min-width:901px)').matches || !nav.matches(':hover')) return;
+  if (nav.contains(document.activeElement)) document.activeElement.blur();
+  document.documentElement.classList.add('navshut');
+}
+$('#tabs').addEventListener('mouseleave', () => document.documentElement.classList.remove('navshut'));
 $('#btn-pin').onclick = () => {
   PIN = !PIN;
   try { localStorage.setItem('sc-pin', PIN ? '1' : '0'); } catch(_) {}
