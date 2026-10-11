@@ -20,7 +20,7 @@
 # =============================================================================
 set -euo pipefail
 
-VERSION="1.6.0"
+VERSION="1.6.1"
 SELF_NAME="smart-caddy"
 CONF_FILE="/etc/smart-caddy.conf"
 
@@ -2629,7 +2629,7 @@ CLI = shutil.which("smart-caddy") or "/usr/local/bin/smart-caddy"
 CONF = "/etc/smart-caddy.conf"
 AUTH_FILE = os.environ.get("SMART_CADDY_PANEL_AUTH", "/etc/smart-caddy-panel.json")
 ACTIVITY_LOG = os.environ.get("SMART_CADDY_ACTIVITY", "/var/log/smart-caddy/activity.jsonl")
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 
 COOKIE = "sc_session"
 SESSION_HOURS = 12
@@ -3604,7 +3604,7 @@ html[lang=fa] body{font-family:Flags,Vazirmatn,var(--font)}
 .sub{color:var(--mut);font-size:13px}
 
 /* ---- header ---- */
-header.bar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:14px 18px}
+header.bar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:14px 18px;margin-bottom:24px}
 .brand{display:flex;align-items:center;gap:12px;min-width:0}
 .logo{width:40px;height:40px;border-radius:12px;flex:none;display:grid;place-items:center;
   background:linear-gradient(135deg,var(--acc),var(--acc-2));box-shadow:0 8px 24px -6px color-mix(in srgb,var(--acc) 70%,transparent)}
@@ -3636,15 +3636,40 @@ header.bar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:14px 
 .bprev .tt{font-size:13px;color:var(--mut);background:rgba(255,255,255,.07);padding:6px 12px;border-radius:8px 8px 0 0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #b-name{direction:inherit;text-align:start;unicode-bidi:plaintext}
 
-/* ---- tabs ---- */
-nav.tabs{display:flex;gap:6px;padding:6px;margin:16px 0 22px;overflow-x:auto;scrollbar-width:none;border-radius:16px}
+/* ---- side menu: icon rail, opens with names on hover (auto-hide); the pin keeps it open.
+   Phones: a drawer from the side, opened with the menu button in the header ---- */
+:root{--rail:66px;--side:232px;--gap:14px}
+nav.tabs{position:fixed;z-index:20;top:var(--gap);bottom:var(--gap);inset-inline-start:var(--gap);width:var(--rail);
+  display:flex;flex-direction:column;gap:4px;padding:10px;margin:0;border-radius:18px;
+  overflow-x:hidden;overflow-y:auto;scrollbar-width:none;background:rgba(18,16,32,.72);
+  transition:width .2s ease,box-shadow .2s ease,transform .25s ease}
 nav.tabs::-webkit-scrollbar{display:none}
-nav.tabs button{display:inline-flex;align-items:center;gap:8px;flex:none;border:1px solid transparent;
-  background:transparent;color:var(--mut);padding:9px 15px;border-radius:11px;font-size:14px;font-weight:500;white-space:nowrap}
+nav.tabs button{position:relative;display:flex;align-items:center;gap:12px;flex:none;width:100%;border:1px solid transparent;
+  background:transparent;color:var(--mut);padding:11px 13px;border-radius:12px;font-size:14px;font-weight:500;
+  white-space:nowrap;text-align:start}
 nav.tabs button:hover{color:var(--ink);background:var(--glass)}
 nav.tabs button.on{color:var(--ink);background:var(--glass-3);border-color:var(--stroke-2);
   box-shadow:inset 0 1px 0 rgba(255,255,255,.12)}
-nav.tabs svg{width:17px;height:17px;flex:none;opacity:.9}
+nav.tabs svg{width:18px;height:18px;flex:none;opacity:.9}
+nav.tabs button > span:not(.badge){transition:opacity .15s;overflow:hidden;text-overflow:ellipsis}
+nav.tabs .badge{margin-inline-start:auto}
+nav.tabs .sep{flex:1;min-height:10px}
+#btn-pin svg{transition:transform .15s}
+html:not(.pin) #btn-pin svg{transform:rotate(35deg)}
+html.pin #btn-pin{color:var(--acc)}
+body{padding-inline-start:calc(var(--rail) + var(--gap));transition:padding .2s ease}
+html.pin body{padding-inline-start:calc(var(--side) + var(--gap))}
+html.pin nav.tabs,html:not(.pin) nav.tabs:hover,nav.tabs:focus-within{width:var(--side)}
+html:not(.pin) nav.tabs:hover,html:not(.pin) nav.tabs:focus-within{box-shadow:0 0 50px -6px rgba(0,0,0,.75)}
+@media(min-width:901px){
+  /* closed rail: icons only, the count sits on the icon */
+  html:not(.pin) nav.tabs:not(:hover):not(:focus-within) button > span:not(.badge){opacity:0}
+  html:not(.pin) nav.tabs:not(:hover):not(:focus-within) .badge{position:absolute;top:3px;inset-inline-start:27px;
+    font-size:10px;min-width:16px;padding:0 4px;line-height:16px}
+}
+#btn-menu{display:none;padding:8px 10px;line-height:0}
+#btn-menu svg{width:20px;height:20px}
+.scrim{display:none}
 .badge{font-size:11px;font-weight:600;min-width:20px;padding:1px 7px;border-radius:99px;text-align:center;
   background:rgba(255,255,255,.12);color:var(--ink)}
 .badge.warn{background:rgba(255,194,77,.18);color:var(--warn)}
@@ -3795,7 +3820,8 @@ details.blk h4{font-size:12px;text-transform:uppercase;letter-spacing:.06em;colo
 table.cmp{width:100%;border-collapse:collapse;font-size:14px}
 table.cmp th{text-align:start;font-size:12px;color:var(--dim);font-weight:600;padding:0 10px 10px;border-bottom:1px solid var(--stroke)}
 table.cmp td{padding:11px 10px;border-bottom:1px solid var(--stroke);vertical-align:top;color:var(--mut)}
-table.cmp td:first-child{color:var(--ink);font-weight:600;white-space:nowrap}
+table.cmp td:first-child{color:var(--ink);font-weight:600;min-width:110px}
+table.cmp td code{white-space:nowrap}
 table.cmp tr:last-child td{border-bottom:0}
 table.cmp td.yes{color:var(--ok);font-weight:600} table.cmp td.no{color:var(--bad);font-weight:600}
 .cmp-wrap{overflow-x:auto}
@@ -3817,6 +3843,24 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
   box-shadow:0 14px 40px rgba(0,0,0,.45);animation:fade .2s ease}
 .toast.bad{border-inline-start-color:var(--bad)}
 
+@media(max-width:900px){
+  body,html.pin body{padding-inline-start:0}
+  #btn-menu{display:inline-flex}
+  #btn-pin{display:none}
+  nav.tabs,html.pin nav.tabs,nav.tabs:hover,nav.tabs:focus-within{width:min(270px,82vw);transform:translateX(calc(-100% - 2 * var(--gap)));
+    box-shadow:none;background:rgba(18,16,32,.92)}
+  html[dir=rtl] nav.tabs{transform:translateX(calc(100% + 2 * var(--gap)))}
+  html.navopen nav.tabs,html.navopen[dir=rtl] nav.tabs{transform:none;box-shadow:0 0 60px rgba(0,0,0,.7)}
+  html.navopen .scrim{display:block;position:fixed;inset:0;z-index:19;background:rgba(4,3,10,.55);
+    -webkit-backdrop-filter:blur(3px);backdrop-filter:blur(3px)}
+  table.cmp thead{display:none}
+  table.cmp,table.cmp tbody,table.cmp tr,table.cmp td{display:block;width:100%}
+  table.cmp tr{padding:12px 0;border-bottom:1px solid var(--stroke)}
+  table.cmp tr:last-child{border-bottom:0}
+  table.cmp td,table.cmp tr:last-child td{border:0;padding:3px 0}
+  table.cmp td:first-child{font-size:15px;white-space:normal}
+  table.cmp td[data-l]:not(:first-child)::before{content:attr(data-l);display:block;font-size:11.5px;color:var(--dim);font-weight:500}
+}
 @media(max-width:980px){
   .site{grid-template-columns:1fr 1fr}
   .site .acts{grid-column:1/-1;justify-content:flex-start}
@@ -3833,6 +3877,9 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
   .route .arr{display:none}
   .route .r-path,.route .r-type,.route .r-target{grid-column:1/2}
   .route button{grid-column:2/3;grid-row:1/2}
+  #log summary{gap:6px 10px}
+  #log summary .grow{order:9;flex-basis:100%}
+  #log summary .sub{overflow-wrap:anywhere;min-width:0}
 }
 </style>
 </head>
@@ -3841,6 +3888,8 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
 <div class="wrap">
 
 <header class="bar glass">
+  <button type="button" class="link go" id="btn-menu" aria-controls="tabs" aria-expanded="false">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
   <div class="brand">
     <div class="logo" aria-hidden="true">
       <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
@@ -3884,7 +3933,12 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
   <button type="button" data-tab="settings" role="tab">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
     <span data-t="tab_settings">Settings</span></button>
+  <span class="sep"></span>
+  <button type="button" id="btn-pin">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5M9 3h6l-1 7 4 3v2H6v-2l4-3z"/></svg>
+    <span id="pin-txt"></span></button>
 </nav>
+<div class="scrim" id="scrim"></div>
 
 <main>
 
@@ -4219,6 +4273,7 @@ en: {
   act_renew:'Certificate renewed', act_cert:'SSL handed to Caddy',
   tagline:'Reverse proxy control panel',
   tab_settings:'Settings',
+  nav_pin:'Keep menu open', nav_unpin:'Auto-hide menu', nav_menu:'Menu',
   set_d:'Settings for this panel. They are stored on this server and survive updates.',
   set_id:'Server identity',
   set_id_d:'Give this server a name, an icon and a colour. They appear in the browser tab, the favicon, the header and the sign-in page, so when you run Smart Caddy on several servers you always know which one is open.',
@@ -4327,6 +4382,7 @@ fa: {
   act_renew:'گواهی تمدید شد', act_cert:'SSL به Caddy سپرده شد',
   tagline:'پنل مدیریت ریورس پروکسی',
   tab_settings:'تنظیمات',
+  nav_pin:'منو باز بماند', nav_unpin:'منو خودکار جمع شود', nav_menu:'منو',
   set_d:'تنظیمات این پنل. روی همین سرور ذخیره می‌شوند و با آپدیت از بین نمی‌روند.',
   set_id:'هویت سرور',
   set_id_d:'برای این سرور یک نام، آیکون و رنگ انتخاب کنید. در تب مرورگر، آیکون سایت (favicon)، بالای پنل و صفحهٔ ورود نمایش داده می‌شوند تا وقتی Smart Caddy را روی چند سرور دارید، همیشه بدانید کدام باز است.',
@@ -4387,6 +4443,12 @@ function applyLang(){
   // static, trusted strings that carry <code>/<b> markup
   document.querySelectorAll('[data-th]').forEach(e => e.innerHTML = t(e.dataset.th));
   document.querySelectorAll('[data-lang]').forEach(b => b.classList.toggle('on', b.dataset.lang === LANG));
+  // phone layout of the comparison table: each cell carries its column name
+  document.querySelectorAll('table.cmp').forEach(tb => {
+    const heads = [...tb.querySelectorAll('thead th')].map(th => th.textContent);
+    tb.querySelectorAll('tbody tr').forEach(tr => [...tr.children].forEach((td, i) => td.dataset.l = heads[i] || ''));
+  });
+  navTexts();
   formTexts();
   renderPreview(DRAFT || BRAND);
   if (STATE) render(STATE);
@@ -4424,7 +4486,31 @@ function setTab(name, push){
   if (push !== false && location.hash !== '#' + name) history.replaceState(null, '', '#' + name);
   if (moved) window.scrollTo({top: 0, behavior: 'smooth'});
 }
-document.querySelectorAll('#tabs [data-tab]').forEach(b => b.onclick = () => setTab(b.dataset.tab));
+document.querySelectorAll('#tabs [data-tab]').forEach(b => b.onclick = () => { setTab(b.dataset.tab); navOpen(false); });
+
+// side menu: pinned open, or a rail that opens on hover (saved per browser); a drawer on phones
+let PIN = false;
+try { PIN = localStorage.getItem('sc-pin') === '1'; } catch(_) {}
+function navTexts(){
+  document.documentElement.classList.toggle('pin', PIN);
+  $('#pin-txt').textContent = t(PIN ? 'nav_unpin' : 'nav_pin');
+  $('#btn-menu').title = t('nav_menu');
+  // the closed rail shows icons only, so each one carries its name
+  document.querySelectorAll('#tabs button').forEach(b => {
+    const l = b.querySelector('span:not(.badge)'); if (l) b.title = l.textContent; });
+}
+function navOpen(on){
+  document.documentElement.classList.toggle('navopen', on);
+  $('#btn-menu').setAttribute('aria-expanded', on ? 'true' : 'false');
+}
+$('#btn-pin').onclick = () => {
+  PIN = !PIN;
+  try { localStorage.setItem('sc-pin', PIN ? '1' : '0'); } catch(_) {}
+  navTexts();
+};
+$('#btn-menu').onclick = () => navOpen(!document.documentElement.classList.contains('navopen'));
+$('#scrim').onclick = () => navOpen(false);
+document.addEventListener('keydown', e => { if (e.key === 'Escape') navOpen(false); });
 document.querySelectorAll('[data-goto]').forEach(b => b.onclick = () => setTab(b.dataset.goto));
 window.addEventListener('hashchange', () => setTab(location.hash.slice(1), false));
 
