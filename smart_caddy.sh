@@ -400,6 +400,9 @@ clear_stage() {
 apply() {
 	local log; log=$(mktemp)
 
+	# a new bind address needs HTTP/3 off too when UDP 443 is taken
+	ensure_h3_off
+
 	if ! caddy validate --config "$CADDYFILE" >"$log" 2>&1; then
 		grep -iE 'error|invalid|cannot|ambiguous' "$log" | head -20 >&2 || cat "$log" >&2
 		rm -f "$log"; rollback
@@ -778,6 +781,7 @@ cmd_install() {
 		ok "already present - left alone"
 		ACME_EMAIL=$(grep -oP '^\s*email\s+\K\S+' "$CADDYFILE" | head -1 || true)
 	fi
+	ensure_h3_off
 
 	hdr "5/9  File permissions"
 	fix_perms
@@ -1098,6 +1102,116 @@ ensure_global_server_block() {
 	fi
 	stage_edit "$CADDYFILE"
 	write_inplace "$CADDYFILE" "$tmp"
+}
+
+# =============================================================================
+#  HTTP/3 off when UDP 443 belongs to another program
+#
+#  Caddy serves HTTP/3 on UDP 443 next to every HTTPS site. A QUIC server on
+#  the same box (Hysteria, e.g. the DNSGuard game accelerator) needs that
+#  port too, and whoever starts second fails - typically Caddy after a
+#  reboot. 'servers <ip>:443 { protocols h1 h2 }' keeps Caddy on TCP. Once
+#  such a block is in the Caddyfile it counts as the decision, so addresses
+#  added later get one as well, even while the other program is stopped.
+# =============================================================================
+
+# Name of a program other than Caddy on UDP :443 (any address), or empty.
+udp443_owner() {
+	ss -ulnpH 2>/dev/null | awk '$4 ~ /:443$/' \
+		| sed -n 's/.*users:(("\([^"]*\)".*/\1/p' | grep -vx caddy | head -1 || true
+}
+
+# Listener addresses (ip:443) that already have HTTP/3 off in the global block.
+h3_off_addrs() {
+	[[ -r "$CADDYFILE" ]] || return 0
+	awk '
+		!inb && match($0, /^[ \t]*servers[ \t]+[^ \t{]*:443[ \t]*\{/) {
+			a = $0; sub(/^[ \t]*servers[ \t]+/, "", a); sub(/[ \t]*\{.*$/, "", a)
+			inb = 1; d = 1; next
+		}
+		inb {
+			if ($0 ~ /^[ \t]*protocols[ \t]/ && $0 !~ /h3/) print a
+			o = $0; c = $0
+			d += gsub(/\{/, "", o) - gsub(/\}/, "", c)
+			if (d <= 0) inb = 0
+		}
+	' "$CADDYFILE" 2>/dev/null || true
+}
+
+# Addresses Caddy serves HTTPS on: every public 'bind' of a site, or ':443'
+# when sites are not bound at all.
+caddy_https_addrs() {
+	local ips
+	ips=$( { [[ -n "$FRONT_IP" ]] && echo "$FRONT_IP"
+		cat "$CADDYFILE" "$SITES_DIR"/*.caddy 2>/dev/null \
+			| grep -oP '^\s*bind\s+\K[0-9.]+(\s+[0-9.]+)*' | tr ' \t' '\n\n'
+	} | grep -E '^[0-9]+(\.[0-9]+){3}$' | grep -v '^127\.' | sort -u || true)
+	if [[ -n "$ips" ]]; then sed 's/$/:443/' <<<"$ips"; else echo ":443"; fi
+}
+
+# Does Caddy have to leave UDP 443 alone?
+h3_must_be_off() {
+	[[ -n "$(caddy_front_port)" ]] && return 1     # Caddy is not on :443 at all
+	[[ -n "$(udp443_owner)" ]] && return 0
+	[[ -f /etc/systemd/system/dnsguard-accel.service ]] && return 0
+	[[ -n "$(h3_off_addrs)" ]]                      # decided earlier
+}
+
+# ensure_h3_off [quiet] - add/repair 'protocols h1 h2' for every HTTPS address.
+# Sets H3_CHANGED=1 when the Caddyfile was edited; always returns 0.
+H3_CHANGED=0
+ensure_h3_off() {
+	H3_CHANGED=0
+	[[ -f "$CADDYFILE" ]] || return 0
+	h3_must_be_off || return 0
+	local quiet="${1:-}" a have tmp staged=0 who
+	have=" $(h3_off_addrs | tr '\n' ' ') "
+	who="$(udp443_owner)"
+	while read -r a; do
+		[[ -z "$a" || "$have" == *" $a "* ]] && continue
+		if [[ $staged -eq 0 && " ${_rb_old[*]:-} " != *" $CADDYFILE|"* ]]; then
+			stage_edit "$CADDYFILE"; staged=1
+		fi
+		tmp="$(mktemp)"
+		if grep -qE "^[[:space:]]*servers[[:space:]]+${a//./\\.}[[:space:]]*\{" "$CADDYFILE"; then
+			# a block for this address exists: (re)write its protocols line
+			awk -v addr="$a" '
+				!inb && $0 ~ /^[ \t]*servers[ \t]/ {
+					h = $0; sub(/^[ \t]*servers[ \t]+/, "", h); sub(/[ \t]*\{.*$/, "", h)
+					if (h == addr) { print; print "\t\tprotocols h1 h2"; inb = 1; d = 1; next }
+				}
+				inb {
+					if ($0 ~ /^[ \t]*protocols[ \t]/) next
+					o = $0; c = $0
+					d += gsub(/\{/, "", o) - gsub(/\}/, "", c)
+					if (d <= 0) inb = 0
+				}
+				{ print }
+			' "$CADDYFILE" > "$tmp"
+		elif grep -qE '^\s*\{\s*$' "$CADDYFILE"; then
+			awk -v addr="$a" '
+				{ print }
+				!done && $0 ~ /^[ \t]*\{[ \t]*$/ {
+					print "\t# no HTTP/3: UDP 443 is used by another program (smart-caddy)"
+					printf "\tservers %s {\n\t\tprotocols h1 h2\n\t}\n", addr
+					done = 1
+				}
+			' "$CADDYFILE" > "$tmp"
+		else
+			{
+				echo "{"
+				echo -e "\t# no HTTP/3: UDP 443 is used by another program (smart-caddy)"
+				printf '\tservers %s {\n\t\tprotocols h1 h2\n\t}\n' "$a"
+				echo "}"
+				echo
+				cat "$CADDYFILE"
+			} > "$tmp"
+		fi
+		write_inplace "$CADDYFILE" "$tmp"
+		H3_CHANGED=1
+		[[ -n "$quiet" ]] || ok "HTTP/3 off on $a${who:+ (UDP 443 is used by '$who')}"
+	done < <(caddy_https_addrs)
+	return 0
 }
 
 cmd_add() {
@@ -1796,6 +1910,18 @@ cmd_repair() {
 	else
 		ok "no leftover placeholder site"
 	fi
+	ensure_h3_off
+	if [[ $H3_CHANGED -eq 1 ]]; then
+		if caddy validate --config "$CADDYFILE" >/dev/null 2>&1; then
+			clear_stage
+			systemctl restart caddy 2>/dev/null && ok "Caddy restarted without HTTP/3" \
+				|| { warn "Caddy did not start:"; last_caddy_error | sed 's/^/       /'; }
+		else
+			rollback; warn "Caddy rejected the HTTP/3 change - Caddyfile restored"
+		fi
+	elif h3_must_be_off; then
+		ok "HTTP/3 already off - UDP 443 stays free for other programs"
+	fi
 
 	hdr "Repairing the panel service"
 	if [[ -f "$UI_UNIT" && ! -f /etc/smart-caddy-panel.json ]]; then
@@ -1961,6 +2087,21 @@ cmd_doctor() {
 		dim "fix: $SELF_NAME fixbind"
 	else
 		ok "all blocks bound to $FRONT_IP"
+	fi
+
+	hdr "5a UDP 443 (HTTP/3)"
+	local u443; u443="$(udp443_owner)"
+	if [[ -n "$(caddy_front_port)" ]]; then
+		dim "Caddy is behind a front proxy - not on :443"
+	elif h3_must_be_off; then
+		local need=0 a ha; ha=" $(h3_off_addrs | tr '\n' ' ') "
+		while read -r a; do
+			if [[ "$ha" == *" $a "* ]]; then ok "HTTP/3 off on $a"
+			else warn "HTTP/3 still on for $a${u443:+ - '$u443' needs UDP 443}"; need=1; fi
+		done < <(caddy_https_addrs)
+		[[ $need -eq 0 ]] || dim "fix: $SELF_NAME repair   (Caddy may fail to start after a reboot)"
+	else
+		ok "no other program on UDP 443 - Caddy may serve HTTP/3"
 	fi
 
 	hdr "6  certbot certificate access"
