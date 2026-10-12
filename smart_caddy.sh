@@ -2669,6 +2669,29 @@ def cert_expiry(path):
     return None
 
 
+CADDY_CERTS = "/var/lib/caddy/.local/share/caddy/certificates"
+
+
+def caddy_cert_file(domain):
+    """The certificate Caddy holds for a domain, from any issuer (Let's Encrypt,
+    ZeroSSL, ...). With more than one, the newest wins - the one Caddy serves.
+    Caddy renews it in place, so other programs (x-ui, Xray) can point at it."""
+    best, best_t = "", -1.0
+    try:
+        issuers = os.listdir(CADDY_CERTS)
+    except OSError:
+        return ""
+    for iss in issuers:
+        f = os.path.join(CADDY_CERTS, iss, domain, domain + ".crt")
+        try:
+            t = os.path.getmtime(f)
+        except OSError:
+            continue
+        if t > best_t:
+            best, best_t = f, t
+    return best
+
+
 # Directives the form knows how to write back. A site that uses anything else
 # is edited as raw text, because the form would silently drop the rest.
 FORM_TOP = {"bind", "encode", "tls", "reverse_proxy", "handle", "root",
@@ -2810,8 +2833,8 @@ def read_sites():
         if info["host_header"] == domain:      # same as {host}: nothing forced
             info["host_header"] = ""
 
-        cert, expires = "auto", None
-        m = re.search(r"^\s*tls\s+(/\S+)\s", text, re.M)
+        cert, expires, cert_file, key_file = "auto", None, "", ""
+        m = re.search(r"^\s*tls\s+(/\S+)\s+(/\S+)", text, re.M)
         if "tls internal" in text:
             cert = "internal"
         elif info["behind_xray"]:
@@ -2820,13 +2843,14 @@ def read_sites():
             cert = "none"
         elif m:
             cert = "certbot"
-            expires = cert_expiry(m.group(1))
+            cert_file, key_file = m.group(1), m.group(2)
+            expires = cert_expiry(cert_file)
         else:
-            guess = f"/var/lib/caddy/.local/share/caddy/certificates/" \
-                    f"acme-v02.api.letsencrypt.org-directory/{domain}/{domain}.crt"
-            if os.path.exists(guess):
+            cert_file = caddy_cert_file(domain)
+            if cert_file:
                 cert = "caddy"
-                expires = cert_expiry(guess)
+                key_file = cert_file[:-4] + ".key"
+                expires = cert_expiry(cert_file)
             else:
                 cert = "pending"
 
@@ -2834,6 +2858,8 @@ def read_sites():
             "domain": domain,
             "cert": cert,
             "expires": expires,
+            "cert_file": cert_file,
+            "key_file": key_file,
             "imported": bool(re.search(r"^# (imported by|custom config)", text, re.M)),
         })
         sites.append(info)
@@ -3198,6 +3224,21 @@ class Handler(BaseHTTPRequestHandler):
                 {"ok": False,
                  "out": "backend must be a port, host:port, https://host:port, "
                         "a directory path, another domain, or redirect:<url>"}, 400)
+
+        # The browser re-sends a POST when the connection drops before the
+        # answer arrives (a front proxy like DNSGuard restarting mid-request).
+        # The first copy already added the site - say so instead of failing.
+        if not replace:
+            f = os.path.join(SITES_DIR, domain + ".caddy")
+            try:
+                fresh = time.time() - os.path.getmtime(f) < 300
+                with open(f) as fh:
+                    same = parse_site(fh.read())["target"] == target
+            except OSError:
+                fresh = same = False
+            if fresh and same:
+                return self.send_json({"ok": True, "out":
+                    f"[ ok ] {domain} was added a moment ago with this backend - nothing more to do"})
 
         args = ["add", domain, target, "--yes", "--no-dns-check"]
         if replace:
@@ -3722,6 +3763,14 @@ html[lang=fa] .card h3{letter-spacing:0}
 .dom{font-weight:600;font-size:15px;overflow-wrap:anywhere}
 .dom a{color:inherit;text-decoration:none;border-bottom:1px solid var(--stroke-2)}
 .dom a:hover{border-color:var(--acc)}
+.note.info{border-color:rgba(82,195,255,.3);background:rgba(82,195,255,.06)}
+.cert-card{padding:16px 18px;display:grid;gap:10px}
+.cert-card .chead{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px}
+.cert-card .sec-d{margin:0}
+.cpath{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:10px;align-items:center}
+.cpath .lbl{font-size:11.5px;color:var(--dim);min-width:72px}
+.cpath code{overflow-wrap:anywhere;word-break:break-all}
+@media (max-width:620px){.cpath{grid-template-columns:minmax(0,1fr) auto}.cpath .lbl{grid-column:1/-1}}
 .rt{font-size:12.5px;color:var(--mut);margin-top:6px;overflow-wrap:anywhere}
 .acts{display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end}
 code{font:12.5px/1.45 var(--mono);direction:ltr;unicode-bidi:isolate;
@@ -3924,6 +3973,9 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
   <button type="button" data-tab="add" role="tab">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/></svg>
     <span id="tab-add-label" data-t="tab_add">Add site</span></button>
+  <button type="button" data-tab="certs" role="tab">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/><circle cx="12" cy="15.5" r="1.5"/></svg>
+    <span data-t="tab_certs">Certificates</span></button>
   <button type="button" data-tab="caddyfile" role="tab" id="tab-btn-caddyfile" hidden>
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M12 12v6M9 15l3 3 3-3"/></svg>
     <span data-t="tab_caddyfile">Import</span><span class="badge warn" id="b-cf">0</span></button>
@@ -3977,6 +4029,12 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
   <div class="tab-head"><div class="txt"><h2 data-t="tab_sites">Sites</h2><p data-t="tab_sites_d"></p></div>
     <button type="button" class="primary" data-goto="add" data-t="qa_add">Add a site</button></div>
   <div id="sites"><div class="empty glass card" data-t="loading">Loading…</div></div>
+</section>
+
+<!-- ============================================================ certificates -->
+<section class="tab" id="tab-certs">
+  <div class="tab-head"><div class="txt"><h2 data-t="tab_certs">Certificates</h2><p data-t="tab_certs_d"></p></div></div>
+  <div id="certs"><div class="empty glass card" data-t="loading">Loading…</div></div>
 </section>
 
 <!-- ============================================================ add / edit -->
@@ -4283,7 +4341,11 @@ en: {
   b_icon:'Icon', b_icon_h:'One emoji or a flag. A flag shows as its two letters in the favicon (TR, IR), because Windows has no flag emoji.',
   b_color:'Accent colour', b_save:'Save', b_saved:'Server identity saved', b_revert:'Undo changes', b_noname:'No name yet',
   tab_overview:'Overview', tab_sites:'Sites', tab_add:'Add site', tab_edit:'Edit site', tab_caddyfile:'Import',
-  tab_guide:'Cloudflare CDN', tab_diag:'Diagnostics', tab_log:'Activity',
+  tab_guide:'Cloudflare CDN', tab_diag:'Diagnostics', tab_log:'Activity', tab_certs:'Certificates',
+  tab_certs_d:'Where the certificate and key of every site sit on this server. Copy a path into x-ui, Xray or any program that serves TLS itself on the same domain.',
+  certs_note:'Caddy renews these files <b>in place</b>, so a program that points at these paths always reads a fresh certificate - nothing to copy after a renewal. Xray re-reads its certificate files by itself; programs that load them only at start need a restart once in a while.',
+  certs_none:'No certificates on this server yet.', certs_pending:'Caddy has not got a certificate for this domain yet. The domain must point to this server and reach Caddy on ports 80/443; see Diagnostics.',
+  cert_file:'Certificate', key_file:'Key', copy:'Copy', copied:'Copied',
   tab_overview_d:'The state of Caddy, your sites and their certificates at a glance. This page refreshes by itself every 20 seconds.',
   tab_sites_d:'Every domain Caddy serves on this server. Edit opens it in the form; Config opens the raw Caddyfile text, which Caddy checks before anything is applied.',
   tab_add_d:'Put a domain online in four short steps. Only the domain and the main backend are required - everything else can stay as it is.',
@@ -4392,7 +4454,11 @@ fa: {
   b_icon:'آیکون', b_icon_h:'یک ایموجی یا پرچم. پرچم در favicon به‌صورت دو حرف نمایش داده می‌شود (TR، IR)، چون ویندوز ایموجی پرچم ندارد.',
   b_color:'رنگ', b_save:'ذخیره', b_saved:'هویت سرور ذخیره شد', b_revert:'لغو تغییرات', b_noname:'هنوز نامی ندارد',
   tab_overview:'داشبورد', tab_sites:'سایت‌ها', tab_add:'افزودن سایت', tab_edit:'ویرایش سایت', tab_caddyfile:'وارد کردن',
-  tab_guide:'CDN کلودفلر', tab_diag:'عیب‌یابی', tab_log:'گزارش تغییرات',
+  tab_guide:'CDN کلودفلر', tab_diag:'عیب‌یابی', tab_log:'گزارش تغییرات', tab_certs:'گواهی‌ها',
+  tab_certs_d:'محل فایل گواهی و کلید هر سایت روی این سرور. مسیر را کپی کنید و در x-ui، Xray یا هر برنامه‌ای که خودش TLS همان دامنه را سرو می‌کند بگذارید.',
+  certs_note:'Caddy این فایل‌ها را <b>در همان مسیر</b> تمدید می‌کند؛ پس برنامه‌ای که به این مسیرها اشاره کند همیشه گواهی تازه را می‌خواند و بعد از تمدید کپی لازم نیست. Xray فایل گواهی را خودش دوباره می‌خواند؛ برنامه‌هایی که فقط هنگام شروع می‌خوانند، گاهی یک restart لازم دارند.',
+  certs_none:'هنوز گواهی‌ای روی این سرور نیست.', certs_pending:'Caddy هنوز برای این دامنه گواهی نگرفته است. دامنه باید به این سرور اشاره کند و از پورت ۸۰/۴۴۳ به Caddy برسد؛ «عیب‌یابی» را ببینید.',
+  cert_file:'گواهی', key_file:'کلید', copy:'کپی', copied:'کپی شد',
   tab_overview_d:'وضعیت Caddy، سایت‌ها و گواهی‌هایشان در یک نگاه. این صفحه هر ۲۰ ثانیه خودش به‌روز می‌شود.',
   tab_sites_d:'همهٔ دامنه‌هایی که Caddy روی این سرور سرویس می‌دهد. «ویرایش» آن را در فرم باز می‌کند و «کانفیگ» متن خام Caddyfile را؛ Caddy قبل از اعمال، آن را بررسی می‌کند.',
   tab_add_d:'یک دامنه را در چهار قدم کوتاه آنلاین کنید. فقط دامنه و مقصد اصلی لازم است؛ بقیه را می‌توانید همان‌طور که هست بگذارید.',
@@ -4469,7 +4535,7 @@ let EDITING = null;          // the site object being edited, null while adding
 let XRAY_TOUCHED = false;    // once the user sets it themselves, stop guessing
 
 // ---------------------------------------------------------------- tabs
-const TABS = ['overview', 'sites', 'add', 'caddyfile', 'guide', 'diag', 'log', 'settings'];
+const TABS = ['overview', 'sites', 'add', 'certs', 'caddyfile', 'guide', 'diag', 'log', 'settings'];
 let TAB = 'overview';
 
 function setTab(name, push){
@@ -4646,6 +4712,7 @@ function render(d){
 
   renderTiles(d);
   renderCaddyfile(d.caddyfile || []);
+  renderCerts(d.sites);
 
   SITES = d.sites;
   $('#b-sites').textContent = d.sites.length;
@@ -4695,6 +4762,48 @@ function render(d){
     const s = SITES[+b.dataset.edit];
     s.form_ok ? startEdit(s) : openRaw(s.domain);
   });
+}
+
+// Where each certificate and key sit on disk, ready to paste into x-ui, Xray
+// or any other program that serves TLS itself on the same domain.
+function renderCerts(sites){
+  const withFile = sites.filter(s => s.cert_file);
+  const rest = sites.filter(s => !s.cert_file && (s.cert === 'pending' || s.cert === 'auto'));
+  if (!withFile.length && !rest.length){
+    $('#certs').innerHTML = '<div class="empty glass card">' + esc(t('certs_none')) + '</div>';
+    return;
+  }
+  const row = (lbl, path) =>
+    '<div class="cpath"><span class="lbl">' + esc(lbl) + '</span>'
+    + '<code class="ltr">' + esc(path) + '</code>'
+    + '<button type="button" class="link go" data-copy="' + esc(path) + '">' + esc(t('copy')) + '</button></div>';
+  let h = '<div class="note info">' + t('certs_note') + '</div><div class="slist">';
+  for (const s of withFile)
+    h += '<div class="cert-card glass">'
+      +  '<div class="chead"><span class="dom ltr">' + esc(s.domain) + '</span>' + certTag(s) + '</div>'
+      +  row(t('cert_file'), s.cert_file) + row(t('key_file'), s.key_file)
+      +  '</div>';
+  for (const s of rest)
+    h += '<div class="cert-card glass"><div class="chead"><span class="dom ltr">' + esc(s.domain) + '</span>'
+      +  '<span class="tag warn">' + esc(t('tag_pending')) + '</span></div>'
+      +  '<p class="sec-d">' + esc(t('certs_pending')) + '</p></div>';
+  $('#certs').innerHTML = h + '</div>';
+  document.querySelectorAll('#certs [data-copy]').forEach(b => b.onclick = () => copyText(b.dataset.copy));
+  document.querySelectorAll('#certs [data-renew]').forEach(b => b.onclick = () => renewCert(b.dataset.renew));
+  document.querySelectorAll('#certs [data-cert]').forEach(b => b.onclick = () => toCaddy(b.dataset.cert));
+}
+
+async function copyText(s){
+  try { await navigator.clipboard.writeText(s); }
+  catch(_){
+    // plain-http panels have no clipboard API: fall back to a hidden textarea
+    const ta = document.createElement('textarea');
+    ta.value = s; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); } catch(_) {}
+    ta.remove();
+  }
+  toast(t('copied'));
 }
 
 function renderTiles(d){
