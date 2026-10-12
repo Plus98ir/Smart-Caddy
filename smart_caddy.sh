@@ -288,6 +288,10 @@ certbot_key()    { printf '%s/%s/privkey.pem'   "$LE_LIVE" "$1"; }
 caddy_cert_dir() { printf '%s/certificates/%s/%s' "$CADDY_DATA" "$ACME_HOST" "$1"; }
 site_file()      { printf '%s/%s.caddy' "$SITES_DIR" "$1"; }
 
+# Sites on Cloudflare DNS name {env.CF_API_TOKEN}; systemd gives it to the
+# running Caddy, and every validate needs it too or the DNS module refuses.
+caddy_validate() { CF_API_TOKEN="$(cf_token)" caddy validate --config "$CADDYFILE"; }
+
 caddy_has_cert() { [[ -f "$(caddy_cert_dir "$1")/$1.crt" ]]; }
 
 # Which certificate files exist for a domain, whether or not a site uses them.
@@ -298,6 +302,10 @@ stored_cert_kind() {   # -> certbot | caddy | none
 	echo none
 }
 
+# Does a site file have an HTTPS block? A plain http:// block next to one is
+# only the redirect written behind a front proxy - that site is still HTTPS.
+has_https_block() { grep -E '^[A-Za-z0-9*]' "$1" 2>/dev/null | grep -qv '^http://'; }
+
 # Which certificate a site actually serves. A leftover certbot copy must not
 # hide the fact that Caddy is the one issuing and renewing it.
 cert_kind() {   # -> certbot | caddy | internal | none
@@ -305,7 +313,7 @@ cert_kind() {   # -> certbot | caddy | internal | none
 	[[ -f "$f" ]] || { stored_cert_kind "$d"; return; }
 	if   grep -qE '^\s*tls\s+internal' "$f"; then echo internal
 	elif grep -qE '^\s*tls\s+/' "$f";      then echo certbot
-	elif grep -qE '^\s*http://' "$f";       then echo none
+	elif ! has_https_block "$f";           then echo none
 	elif caddy_has_cert "$d";               then echo caddy
 	else echo none; fi
 }
@@ -403,7 +411,8 @@ apply() {
 	# a new bind address needs HTTP/3 off too when UDP 443 is taken
 	ensure_h3_off
 
-	if ! caddy validate --config "$CADDYFILE" >"$log" 2>&1; then
+	# the running Caddy gets the Cloudflare token from systemd; validate needs it too
+	if ! caddy_validate >"$log" 2>&1; then
 		grep -iE 'error|invalid|cannot|ambiguous' "$log" | head -20 >&2 || cat "$log" >&2
 		rm -f "$log"; rollback
 		die "Caddy config is invalid - everything was rolled back, Caddy untouched."
@@ -873,7 +882,7 @@ cmd_install() {
 	fi
 
 	hdr "9/9  Final check"
-	if caddy validate --config "$CADDYFILE" >/dev/null 2>&1; then
+	if caddy_validate >/dev/null 2>&1; then
 		ok "config is valid"
 		if systemctl reload caddy 2>/dev/null; then
 			ok "Caddy reloaded"
@@ -885,7 +894,7 @@ cmd_install() {
 		fi
 	else
 		warn "config still invalid:"
-		caddy validate --config "$CADDYFILE" 2>&1 | grep -i error | head -10 | sed 's/^/       /'
+		caddy_validate 2>&1 | grep -i error | head -10 | sed 's/^/       /'
 		dim "clean backup: $bak"
 	fi
 
@@ -1271,6 +1280,7 @@ cmd_add() {
 			--no-buffer)    nobuffer=1;            shift ;;
 			--panel)        preset="panel";        shift ;;
 			--auto-cert)    cert_mode="acme";      shift ;;
+			--dns-cloudflare) cert_mode="cfdns";   shift ;;
 			--certbot)      cert_mode="certbot";   shift ;;
 			--self-signed)  cert_mode="internal";  shift ;;
 			--no-tls)       cert_mode="none";      shift ;;
@@ -1384,6 +1394,8 @@ cmd_add() {
 
 	# auto keeps whatever an edited site already used; for a new one it reuses
 	# a certificate that is already on disk rather than issuing another
+	[[ "$cert_mode" == auto && $replace -eq 1 ]] && site_uses_cf "$domain" && cert_mode="cfdns"
+	[[ "$cert_mode" == cfdns ]] && cf_require "$domain"
 	local tls_block="" kind; kind="$(cert_kind "$domain")"
 	[[ "$kind" == none || "$kind" == internal ]] && kind="$(stored_cert_kind "$domain")"
 	case "$cert_mode" in
@@ -1392,6 +1404,10 @@ cmd_add() {
 		acme)
 			if caddy_has_cert "$domain"; then ok "Caddy already holds a certificate - it renews it by itself"
 			else info "Caddy will get a certificate from Let's Encrypt and renew it by itself"; fi ;;
+		cfdns)
+			tls_block="$CF_TLS_BLOCK"
+			if caddy_has_cert "$domain"; then ok "Caddy already holds a certificate - it renews it through Cloudflare DNS"
+			else info "Caddy will get the certificate through Cloudflare DNS - :80/:443 do not have to be reachable"; fi ;;
 		certbot)
 			[[ -f "$(certbot_cert "$domain")" ]] \
 				|| die "no certbot certificate for $domain in $LE_LIVE - use --auto-cert to let Caddy get one"
@@ -1579,21 +1595,19 @@ cmd_add() {
 	[[ $behind_xray -eq 0 ]] && front_register "$domain"
 
 	if { [[ "$cert_mode" == "auto" && "$kind" == "none" ]]; } \
-	   || { [[ "$cert_mode" == "acme" ]] && ! caddy_has_cert "$domain"; }; then
-		printf '%s[info]%s waiting for certificate issuance' "$C_INF" "$C_OFF"
-		local i
-		for i in $(seq 1 30); do
-			if caddy_has_cert "$domain"; then
-				printf '\n'; ok "certificate issued, expires: $(cert_expiry "$domain")"
-				break
-			fi
-			printf '.'; sleep 2
-			if [[ $i -eq 30 ]]; then
-				printf '\n'
-				warn "not issued yet - usually means port 80 is not reachable for this domain"
-				dim "check: journalctl -u caddy -n 40 --no-pager | grep -i acme"
-			fi
-		done
+	   || { [[ "$cert_mode" == "acme" || "$cert_mode" == "cfdns" ]] && ! caddy_has_cert "$domain"; }; then
+		if wait_cert "$domain"; then
+			ok "certificate issued, expires: $(cert_expiry "$domain")"
+		elif [[ "$cert_mode" == "cfdns" ]]; then
+			warn "not issued yet - Cloudflare DNS checks can take a few minutes"
+			dim "check: journalctl -u caddy -n 40 --no-pager | grep -iE 'acme|cloudflare'"
+		elif cf_fallback "$domain"; then
+			ok "certificate issued through Cloudflare DNS, expires: $(cert_expiry "$domain")"
+		else
+			warn "not issued yet - usually means port 80 is not reachable for this domain"
+			[[ -z "$(cf_token)" ]] && dim "a Cloudflare API token lets Caddy get it through DNS instead: $SELF_NAME cloudflare token"
+			dim "check: journalctl -u caddy -n 40 --no-pager | grep -i acme"
+		fi
 	fi
 
 	if [[ $behind_xray -eq 1 ]]; then
@@ -1669,10 +1683,15 @@ certbot_renew_ok() {
 cmd_cert() {
 	need_root cert
 	local domain="${1:-}" to="${2:-}"
-	valid_domain "$domain" || die "usage: $SELF_NAME cert <domain> caddy"
-	[[ "$to" == caddy ]] || die "usage: $SELF_NAME cert <domain> caddy"
+	local use="usage: $SELF_NAME cert <domain> caddy|cloudflare|http"
+	valid_domain "$domain" || die "$use"
+	[[ "$to" =~ ^(caddy|cloudflare|http)$ ]] || die "$use"
 	local f; f="$(site_file "$domain")"
 	[[ -f "$f" ]] || die "$domain not found in $SITES_DIR"
+	if [[ "$to" != caddy ]]; then
+		cert_method "$domain" "$to"
+		return
+	fi
 	if ! grep -qE '^\s*tls\s+/' "$f"; then
 		ok "$domain already uses Caddy's own certificate handling"
 		return 0
@@ -1750,6 +1769,221 @@ cmd_renew() {
 		dim "check: journalctl -u caddy -n 40 --no-pager | grep -i acme"
 		die "renewal failed - the previous certificate (expires $old) is back in place"
 	fi
+}
+
+# =============================================================================
+#  Cloudflare DNS-01
+#
+#  Let's Encrypt normally checks a name over :80/:443. That fails whenever
+#  something else answers there for it - a front proxy passing the name
+#  straight to Xray, a CDN-only port, a closed firewall. With a Cloudflare API
+#  token Caddy proves ownership with a DNS TXT record instead and never needs
+#  those ports. The token lives in a root-only file that systemd hands to
+#  Caddy as CF_API_TOKEN; site files only carry {env.CF_API_TOKEN}.
+# =============================================================================
+CF_ENV="/etc/smart-caddy-cloudflare.env"
+CF_DROPIN="/etc/systemd/system/caddy.service.d/smart-caddy-cloudflare.conf"
+CF_MODULE="dns.providers.cloudflare"
+CF_PKG="github.com/caddy-dns/cloudflare"
+CF_TLS_BLOCK=$'\ttls {\n\t\tdns cloudflare {env.CF_API_TOKEN}\n\t\tresolvers 1.1.1.1 8.8.8.8\n\t}'
+
+cf_module_ok() { have caddy && caddy list-modules 2>/dev/null | grep -qx "$CF_MODULE"; }
+cf_token()     { [[ -r "$CF_ENV" ]] && grep -oP '^CF_API_TOKEN=\K\S+' "$CF_ENV" | head -1 || true; }
+site_uses_cf() { grep -qE '^\s*dns\s+cloudflare' "$(site_file "$1")" 2>/dev/null; }
+cf_sites() {
+	grep -lE '^\s*dns\s+cloudflare' "$SITES_DIR"/*.caddy 2>/dev/null \
+		| xargs -r -n1 basename | sed 's/\.caddy$//' || true
+}
+
+# cf_api <token> <path> - GET from the Cloudflare API, JSON on stdout
+cf_api() {
+	curl -fsS --max-time 15 -H "Authorization: Bearer $1" "https://api.cloudflare.com/client/v4$2"
+}
+
+# The Cloudflare zone a name belongs to, if the token can see it:
+# a.b.example.com -> b.example.com -> example.com
+cf_zone_for() {
+	local z="$1" tok="${2:-}"
+	[[ -n "$tok" ]] || tok="$(cf_token)"
+	[[ -n "$tok" ]] || return 1
+	while :; do
+		if cf_api "$tok" "/zones?name=$z" 2>/dev/null | grep -q '"count":[1-9]'; then
+			echo "$z"; return 0
+		fi
+		[[ "$z" == *.*.* ]] || return 1
+		z="${z#*.}"
+	done
+}
+
+# Swap Caddy's build for one with the Cloudflare DNS module. Caddy's own
+# 'add-package' fetches it from caddyserver.com; the old binary is kept and
+# put back if anything goes wrong.
+cf_install_module() {
+	cf_module_ok && { ok "Caddy already has the Cloudflare DNS module"; return 0; }
+	have caddy || die "caddy is not installed"
+	local bin log; bin="$(readlink -f "$(command -v caddy)")"; log="$(mktemp)"
+	info "adding $CF_PKG to Caddy - downloads a Caddy build from caddyserver.com (~40 MB)"
+	cp -p "$bin" "$bin.smart-caddy.bak"
+	if ! caddy add-package "$CF_PKG" >"$log" 2>&1 || ! cf_module_ok; then
+		tail -n 5 "$log" | sed 's/^/       /' >&2; rm -f "$log"
+		cp -p "$bin.smart-caddy.bak" "$bin"
+		dim "caddyserver.com must be reachable; behind a filter set https_proxy and run it again"
+		die "could not add the module - Caddy is unchanged"
+	fi
+	rm -f "$log"
+	# a package upgrade would bring back a build without the module
+	if have apt-mark && apt-mark hold caddy >/dev/null 2>&1; then
+		ok "caddy package held - apt upgrades will not replace this build"
+	fi
+	if systemctl restart caddy; then
+		ok "Caddy restarted with the Cloudflare DNS module"
+	else
+		cp -p "$bin.smart-caddy.bak" "$bin"; systemctl restart caddy || true
+		die "Caddy did not start with the new build - the previous one is back"
+	fi
+}
+
+# Everything a Cloudflare DNS site needs, or a clear reason why not.
+cf_require() {
+	local d="${1:-}"
+	[[ -n "$(cf_token)" ]] || die "no Cloudflare API token yet - $SELF_NAME cloudflare token  (or Settings in the panel)"
+	if ! cf_module_ok; then
+		warn "Caddy has no Cloudflare DNS module yet"
+		ask "Add it now? (downloads a Caddy build with the module, restarts Caddy)" y || die "cancelled"
+		cf_install_module
+	fi
+	if [[ -n "$d" ]]; then
+		local z; z="$(cf_zone_for "$d")" \
+			|| die "$d is not in a Cloudflare zone this token can edit - add the zone to the token (Zone:DNS:Edit)"
+		ok "$d is in the Cloudflare zone $z"
+	fi
+}
+
+# Rewrite a site file's certificate setting: drop any tls line/block, then
+# add the Cloudflare one (mode cloudflare) or nothing (mode http = Caddy's
+# normal HTTP/TLS-ALPN check). Result on stdout.
+cf_rewrite_tls() {
+	python3 - "$1" "$2" "$CF_TLS_BLOCK" <<'PY'
+import re, sys
+path, mode, block = sys.argv[1], sys.argv[2], sys.argv[3]
+text = open(path).read()
+text = re.sub(r"^[ \t]*tls[ \t]*\{[ \t]*\n(?:[^\n]*\n)*?[ \t]*\}[ \t]*\n", "", text, flags=re.M)
+text = re.sub(r"^[ \t]*tls[ \t]+[^\n{]*\n", "", text, flags=re.M)
+if mode == "cloudflare":
+    m = re.search(r"^(?!http://)[^\s#}][^\n]*\{[ \t]*\n([ \t]*bind[^\n]*\n)?", text, re.M)
+    if not m:
+        sys.exit("no HTTPS site block in " + path)
+    text = text[:m.end()] + block + "\n" + text[m.end():]
+sys.stdout.write(text)
+PY
+}
+
+cf_status() {
+	hdr "Cloudflare DNS certificates"
+	if cf_module_ok; then ok "Caddy has the Cloudflare DNS module"
+	else warn "Caddy has no Cloudflare DNS module  ->  $SELF_NAME cloudflare module"; fi
+	local tok; tok="$(cf_token)"
+	if [[ -n "$tok" ]]; then ok "API token saved (...${tok: -4}) in $CF_ENV"
+	else warn "no API token  ->  $SELF_NAME cloudflare token"; fi
+	local s; s="$(cf_sites | tr '\n' ' ')"
+	if [[ -n "$s" ]]; then info "sites using it: $s"; else dim "no site uses it yet"; fi
+}
+
+# cloudflare [status | token [TOKEN|-] | module | clear]
+cmd_cloudflare() {
+	need_root cloudflare
+	local sub="${1:-status}"; [[ $# -gt 0 ]] && shift
+	case "$sub" in
+		status) cf_status ;;
+		token)
+			local tok="${1:-}"
+			# the panel passes it in the environment - never on a command line
+			[[ "$tok" == "-" ]] && tok="${SMART_CADDY_CF_TOKEN:-}"
+			if [[ -z "$tok" && -t 0 ]]; then
+				read -r -s -p "  Cloudflare API token (Zone:DNS:Edit): " tok; echo
+			fi
+			tok="${tok//[[:space:]]/}"
+			[[ "$tok" =~ ^[A-Za-z0-9._-]{20,200}$ ]] || die "that does not look like a Cloudflare API token"
+			hdr "Checking the token with Cloudflare"
+			local js zones
+			js="$(cf_api "$tok" "/zones?per_page=50")" \
+				|| die "Cloudflare refused the token (or api.cloudflare.com is unreachable from here)"
+			zones="$(python3 -c 'import json,sys; print(" ".join(z["name"] for z in json.load(sys.stdin).get("result") or []))' <<<"$js" 2>/dev/null || true)"
+			if [[ -n "$zones" ]]; then ok "token works - zones: $zones"
+			else warn "the token works but sees no zones - give it Zone:DNS:Edit on your domains"; fi
+			( umask 077; printf 'CF_API_TOKEN=%s\n' "$tok" > "$CF_ENV" )
+			chmod 600 "$CF_ENV"
+			mkdir -p "$(dirname "$CF_DROPIN")"
+			printf '# written by smart-caddy: Cloudflare token for DNS-01 certificates\n[Service]\nEnvironmentFile=-%s\n' \
+				"$CF_ENV" > "$CF_DROPIN"
+			systemctl daemon-reload
+			ok "token saved in $CF_ENV (root only)"
+			if cf_module_ok; then
+				systemctl restart caddy && ok "Caddy restarted to pick up the token"
+			else
+				dim "next: $SELF_NAME cloudflare module   (or 'Add module' in the panel)"
+			fi ;;
+		module) cf_install_module ;;
+		clear|remove)
+			local s; s="$(cf_sites | tr '\n' ' ')"
+			[[ -z "$s" ]] || die "these sites still use Cloudflare DNS: $s- switch each first: $SELF_NAME cert <domain> http"
+			rm -f "$CF_ENV" "$CF_DROPIN"; systemctl daemon-reload
+			ok "token removed" ;;
+		*) die "usage: $SELF_NAME cloudflare [status | token [TOKEN] | module | clear]" ;;
+	esac
+}
+
+# cert <domain> cloudflare|http - how Caddy proves the domain to Let's Encrypt.
+# The certificate on disk stays; the new method is used from the next issue on.
+cert_method() {
+	local d="$1" to="$2" f; f="$(site_file "$1")"
+	grep -qE '^\s*tls\s+internal' "$f" && die "$d uses a self-signed certificate - edit the site to change that"
+	grep -q "behind an Xray fallback" "$f" && die "$d is behind Xray - its certificate is on the Xray inbound"
+	has_https_block "$f" || die "$d is plain HTTP - no certificate to manage"
+	if [[ "$to" == cloudflare ]]; then
+		site_uses_cf "$d" && { ok "$d already uses Cloudflare DNS"; return 0; }
+		hdr "Switching $d to Cloudflare DNS"
+		cf_require "$d"
+	else
+		site_uses_cf "$d" || ! grep -qE '^\s*tls\s+/' "$f" || die "$d uses a certbot certificate - hand it to Caddy first: $SELF_NAME cert $d caddy"
+		site_uses_cf "$d" || { ok "$d already uses Caddy's normal HTTP check"; return 0; }
+		hdr "Switching $d to the HTTP check"
+	fi
+	local tmp; tmp="$(mktemp)"
+	cf_rewrite_tls "$f" "$to" > "$tmp" || { rm -f "$tmp"; die "could not rewrite $f"; }
+	stage_edit "$f"; write_inplace "$f" "$tmp"
+	apply
+	if wait_cert "$d"; then
+		ok "Caddy holds the certificate, expires: $(cert_expiry "$d")"
+		[[ "$to" == cloudflare ]] && dim "it is renewed through Cloudflare DNS from now on"
+	else
+		warn "not issued yet"
+		dim "check: journalctl -u caddy -n 40 --no-pager | grep -iE 'acme|cloudflare'"
+	fi
+}
+
+# Wait up to ~60 s for Caddy to hold a certificate for <domain>.
+wait_cert() {
+	caddy_has_cert "$1" && return 0
+	printf '%s[info]%s waiting for certificate issuance' "$C_INF" "$C_OFF"
+	local i
+	for i in $(seq 1 30); do
+		caddy_has_cert "$1" && { printf '\n'; return 0; }
+		printf '.'; sleep 2
+	done
+	printf '\n'; return 1
+}
+
+# HTTP check failed: switch <domain> to Cloudflare DNS when that can work.
+cf_fallback() {
+	local d="$1" f; f="$(site_file "$1")"
+	[[ -n "$(cf_token)" ]] && cf_module_ok && cf_zone_for "$d" >/dev/null || return 1
+	info "Let's Encrypt could not reach $d over HTTP - trying Cloudflare DNS instead"
+	local tmp; tmp="$(mktemp)"
+	cf_rewrite_tls "$f" cloudflare > "$tmp" || { rm -f "$tmp"; return 1; }
+	stage_edit "$f"; write_inplace "$f" "$tmp"; rm -f "$tmp"
+	apply
+	wait_cert "$d"
 }
 
 # =============================================================================
@@ -1912,7 +2146,7 @@ cmd_repair() {
 	fi
 	ensure_h3_off
 	if [[ $H3_CHANGED -eq 1 ]]; then
-		if caddy validate --config "$CADDYFILE" >/dev/null 2>&1; then
+		if caddy_validate >/dev/null 2>&1; then
 			clear_stage
 			systemctl restart caddy 2>/dev/null && ok "Caddy restarted without HTTP/3" \
 				|| { warn "Caddy did not start:"; last_caddy_error | sed 's/^/       /'; }
@@ -1995,9 +2229,9 @@ cmd_repair() {
 	[[ $fixed -eq 0 ]] && ok "nothing to fix" || true
 	if caddy_can_read "$CADDYFILE"; then ok "user '$CADDY_USER' can read the config"
 	else warn "user '$CADDY_USER' still cannot read it - check: namei -l $CADDYFILE"; fi
-	if ! caddy validate --config "$CADDYFILE" >/dev/null 2>&1; then
+	if ! caddy_validate >/dev/null 2>&1; then
 		warn "the config is still invalid:"
-		caddy validate --config "$CADDYFILE" 2>&1 | grep -i error | head -5 | sed 's/^/       /'
+		caddy_validate 2>&1 | grep -i error | head -5 | sed 's/^/       /'
 	elif systemctl reload caddy 2>/dev/null || systemctl restart caddy 2>/dev/null; then
 		ok "Caddy reloaded"
 	else
@@ -2063,10 +2297,10 @@ cmd_doctor() {
 	hdr "3  Caddy service"
 	if systemctl is-active caddy >/dev/null 2>&1; then ok "running"
 	else warn "not running"; dim "journalctl -u caddy -n 30 --no-pager"; fi
-	if caddy validate --config "$CADDYFILE" >/dev/null 2>&1; then ok "config is valid"
+	if caddy_validate >/dev/null 2>&1; then ok "config is valid"
 	else
 		warn "config is invalid:"
-		caddy validate --config "$CADDYFILE" 2>&1 | grep -i error | head -8 | sed 's/^/       /'
+		caddy_validate 2>&1 | grep -i error | head -8 | sed 's/^/       /'
 	fi
 
 	hdr "4  File permissions"
@@ -2102,6 +2336,19 @@ cmd_doctor() {
 		[[ $need -eq 0 ]] || dim "fix: $SELF_NAME repair   (Caddy may fail to start after a reboot)"
 	else
 		ok "no other program on UDP 443 - Caddy may serve HTTP/3"
+	fi
+
+	local cfs; cfs="$(cf_sites | tr '\n' ' ')"
+	if [[ -n "$cfs" ]]; then
+		hdr "5b Cloudflare DNS certificates"
+		info "sites: $cfs"
+		if cf_module_ok; then ok "Caddy has the Cloudflare DNS module"
+		else
+			warn "Caddy lost its Cloudflare DNS module (a package upgrade?) - Caddy cannot start with these sites"
+			dim "fix: $SELF_NAME cloudflare module"
+		fi
+		if [[ -n "$(cf_token)" ]]; then ok "API token saved"
+		else warn "no API token - renewals will fail"; dim "fix: $SELF_NAME cloudflare token"; fi
 	fi
 
 	hdr "6  certbot certificate access"
@@ -2692,6 +2939,51 @@ def caddy_cert_file(domain):
     return best
 
 
+CF_ENV = "/etc/smart-caddy-cloudflare.env"
+CF_CACHE = {"t": 0, "module": False}
+
+
+def cf_state():
+    """Cloudflare DNS readiness for the panel. 'caddy list-modules' is slow-ish,
+    so its answer is cached for a minute."""
+    now = time.time()
+    if now - CF_CACHE["t"] > 60:
+        try:
+            out = subprocess.run(["caddy", "list-modules"], capture_output=True, text=True, timeout=10)
+            CF_CACHE["module"] = "dns.providers.cloudflare" in out.stdout.split()
+        except Exception:
+            CF_CACHE["module"] = False
+        CF_CACHE["t"] = now
+    hint = ""
+    try:
+        with open(CF_ENV) as fh:
+            m = re.search(r"^CF_API_TOKEN=(\S+)", fh.read(), re.M)
+            if m:
+                hint = "..." + m.group(1)[-4:]
+    except OSError:
+        pass
+    return {"module": CF_CACHE["module"], "token": bool(hint), "hint": hint}
+
+
+def cf_check_token(token):
+    """Ask Cloudflare whether the token works. -> (True, [zones]) or (False, why)"""
+    import urllib.request
+    import urllib.error
+    req = urllib.request.Request("https://api.cloudflare.com/client/v4/zones?per_page=50",
+                                 headers={"Authorization": "Bearer " + token,
+                                          "User-Agent": "smart-caddy"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            js = json.load(r)
+    except urllib.error.HTTPError as exc:
+        return False, f"Cloudflare refused the token (HTTP {exc.code})"
+    except Exception as exc:
+        return False, f"api.cloudflare.com is unreachable from this server: {exc}"
+    if not js.get("success"):
+        return False, "Cloudflare refused the token"
+    return True, [z.get("name", "") for z in js.get("result") or []]
+
+
 # Directives the form knows how to write back. A site that uses anything else
 # is edited as raw text, because the form would silently drop the rest.
 FORM_TOP = {"bind", "encode", "tls", "reverse_proxy", "handle", "root",
@@ -2860,6 +3152,7 @@ def read_sites():
             "expires": expires,
             "cert_file": cert_file,
             "key_file": key_file,
+            "cert_via": "cloudflare" if re.search(r"^\s*dns\s+cloudflare", text, re.M) else "",
             "imported": bool(re.search(r"^# (imported by|custom config)", text, re.M)),
         })
         sites.append(info)
@@ -3193,6 +3486,7 @@ class Handler(BaseHTTPRequestHandler):
                 "sites": read_sites(),
                 "caddyfile": caddyfile_blocks(),
                 "brand": load_brand(),
+                "cloudflare": cf_state(),
             })
         if path == "/api/config":
             domain = (parse_qs(urlparse(self.path).query).get("domain") or [""])[0].lower()
@@ -3208,9 +3502,27 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"ok": True, "log": read_log()})
         self.send_json({"error": "not found"}, 404)
 
-    def cli(self, args):
+    def actor(self):
         auth = load_auth() or {}
-        return run_cli(args, actor=f"{auth.get('user', 'panel')}@{self.client_ip()}")
+        return f"{auth.get('user', 'panel')}@{self.client_ip()}"
+
+    def cli(self, args, timeout=120):
+        return run_cli(args, timeout=timeout, actor=self.actor())
+
+    def cli_detached(self, args, extra_env=None):
+        """Start the CLI and return at once - for anything that restarts Caddy,
+        which this very request travels through. The outcome goes to the
+        activity log. Returns an error text, or "" when started."""
+        env = dict(os.environ, SMART_CADDY_SOURCE="panel", SMART_CADDY_ACTOR=self.actor())
+        env.update(extra_env or {})
+        try:
+            proc = subprocess.Popen([CLI] + args, env=env,
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, start_new_session=True)
+            threading.Thread(target=proc.wait, daemon=True).start()
+        except Exception as exc:
+            return str(exc)
+        return ""
 
     def do_add(self, data, replace=False):
         domain = str(data.get("domain", "")).strip().lower()
@@ -3280,12 +3592,13 @@ class Handler(BaseHTTPRequestHandler):
         if data.get("nobuffer"):    args.append("--no-buffer")
         cert = str(data.get("cert", ""))
         if cert == "caddy":         args.append("--auto-cert")
+        elif cert == "cloudflare":  args.append("--dns-cloudflare")
         elif cert == "certbot":     args.append("--certbot")
         elif cert == "internal":    args.append("--self-signed")
         if data.get("self_signed"): args.append("--self-signed")
         if data.get("no_tls"):      args.append("--no-tls")
 
-        return self.send_json(self.cli(args))
+        return self.send_json(self.cli(args, timeout=240))
 
     def do_POST(self):
         path = urlparse(self.path).path
@@ -3374,24 +3687,46 @@ class Handler(BaseHTTPRequestHandler):
             domain = str(data.get("domain", "")).strip().lower()
             if not RE_DOMAIN.match(domain):
                 return self.send_json({"ok": False, "out": "invalid domain"}, 400)
-            auth = load_auth() or {}
-            env = dict(os.environ, SMART_CADDY_SOURCE="panel",
-                       SMART_CADDY_ACTOR=f"{auth.get('user', 'panel')}@{self.client_ip()}")
-            try:
-                proc = subprocess.Popen([CLI, "renew", domain], env=env,
-                                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                        stderr=subprocess.DEVNULL, start_new_session=True)
-                threading.Thread(target=proc.wait, daemon=True).start()
-            except Exception as exc:
-                return self.send_json({"ok": False, "out": str(exc)})
+            err = self.cli_detached(["renew", domain])
+            if err:
+                return self.send_json({"ok": False, "out": err})
             return self.send_json({"ok": True, "started": True,
                                    "out": f"renewing {domain} - the result appears in the activity log"})
+
+        if path == "/api/cloudflare":
+            action = str(data.get("action", ""))
+            if action == "token":
+                token = re.sub(r"\s+", "", str(data.get("token", "")))
+                if not re.fullmatch(r"[A-Za-z0-9._-]{20,200}", token):
+                    return self.send_json({"ok": False, "out": "that does not look like a Cloudflare API token"})
+                ok, zones = cf_check_token(token)
+                if not ok:
+                    return self.send_json({"ok": False, "out": zones})
+                # saving restarts Caddy, which carries this request - run detached
+                err = self.cli_detached(["cloudflare", "token", "-"], {"SMART_CADDY_CF_TOKEN": token})
+                if err:
+                    return self.send_json({"ok": False, "out": err})
+                CF_CACHE["t"] = 0
+                return self.send_json({"ok": True, "zones": zones})
+            if action == "module":
+                err = self.cli_detached(["cloudflare", "module"])
+                if err:
+                    return self.send_json({"ok": False, "out": err})
+                CF_CACHE["t"] = 0
+                return self.send_json({"ok": True, "started": True})
+            if action == "clear":
+                CF_CACHE["t"] = 0
+                return self.send_json(self.cli(["cloudflare", "clear"]))
+            return self.send_json({"ok": False, "out": "unknown action"}, 400)
 
         if path == "/api/cert":
             domain = str(data.get("domain", "")).strip().lower()
             if not RE_DOMAIN.match(domain):
                 return self.send_json({"ok": False, "out": "invalid domain"}, 400)
-            return self.send_json(self.cli(["cert", domain, "caddy"]))
+            to = str(data.get("to", "caddy"))
+            if to not in ("caddy", "cloudflare", "http"):
+                return self.send_json({"ok": False, "out": "invalid method"}, 400)
+            return self.send_json(self.cli(["cert", domain, to], timeout=180))
 
         if path == "/api/brand":
             try:
@@ -3763,6 +4098,8 @@ html[lang=fa] .card h3{letter-spacing:0}
 .dom{font-weight:600;font-size:15px;overflow-wrap:anywhere}
 .dom a{color:inherit;text-decoration:none;border-bottom:1px solid var(--stroke-2)}
 .dom a:hover{border-color:var(--acc)}
+.cf-state{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 16px}
+.cert-card .acts2{display:flex;flex-wrap:wrap;gap:6px 14px;align-items:center}
 .note.info{border-color:rgba(82,195,255,.3);background:rgba(82,195,255,.06)}
 .cert-card{padding:16px 18px;display:grid;gap:10px}
 .cert-card .chead{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px}
@@ -3794,11 +4131,11 @@ code{font:12.5px/1.45 var(--mono);direction:ltr;unicode-bidi:isolate;
 .full{grid-column:1/-1}
 label{display:block;font-size:13px;color:var(--ink);font-weight:500;margin-bottom:7px}
 label .opt{color:var(--dim);font-weight:400}
-input[type=text],select{width:100%;padding:11px 13px;border:1px solid var(--stroke);border-radius:var(--r-sm);
+input[type=text],input[type=password],select{width:100%;padding:11px 13px;border:1px solid var(--stroke);border-radius:var(--r-sm);
   background:rgba(0,0,0,.28);color:var(--ink);font:inherit;font-size:14px;transition:border-color .15s,background .15s}
-input[type=text]{direction:ltr;text-align:left}
-input[type=text]::placeholder{color:var(--dim)}
-input[type=text]:focus,select:focus{outline:none;border-color:var(--acc);background:rgba(0,0,0,.4);
+input[type=text],input[type=password]{direction:ltr;text-align:left}
+input[type=text]::placeholder,input[type=password]::placeholder{color:var(--dim)}
+input[type=text]:focus,input[type=password]:focus,select:focus{outline:none;border-color:var(--acc);background:rgba(0,0,0,.4);
   box-shadow:0 0 0 3px color-mix(in srgb,var(--acc) 22%,transparent)}
 input[readonly]{opacity:.65}
 select{appearance:none;-webkit-appearance:none;padding-inline-end:36px;cursor:pointer;
@@ -4078,6 +4415,7 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
           <label for="f-cert" data-t="f_cert">SSL certificate</label>
           <select id="f-cert">
             <option value="caddy" data-t="cert_caddy">Caddy</option>
+            <option value="cloudflare" data-t="cert_cf">Caddy - Cloudflare DNS</option>
             <option value="certbot" data-t="cert_certbot">certbot</option>
             <option value="internal" data-t="cert_internal">Self-signed</option>
           </select>
@@ -4202,6 +4540,20 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
     <div class="row">
       <button type="button" class="primary" id="b-save" data-t="b_save">Save</button>
       <button type="button" class="link" id="b-revert" data-t="b_revert">Undo changes</button>
+    </div>
+  </div>
+
+  <div class="card glass" id="cf-card">
+    <h3 data-t="cf_title">Cloudflare DNS certificates</h3>
+    <p class="sec-d" data-t="cf_d"></p>
+    <div class="cf-state" id="cf-state"></div>
+    <label for="cf-token" data-t="cf_token">API token</label>
+    <input type="password" id="cf-token" class="ltr" autocomplete="off" spellcheck="false" placeholder="Cloudflare API token">
+    <div class="hint" data-th="cf_token_h"></div>
+    <div class="row">
+      <button type="button" class="primary" id="cf-save" data-t="cf_save">Check and save</button>
+      <button type="button" id="cf-module" data-t="cf_module" hidden>Add the module to Caddy</button>
+      <button type="button" class="link" id="cf-clear" data-t="cf_clear" hidden>Remove token</button>
     </div>
   </div>
 </section>
@@ -4344,8 +4696,23 @@ en: {
   tab_guide:'Cloudflare CDN', tab_diag:'Diagnostics', tab_log:'Activity', tab_certs:'Certificates',
   tab_certs_d:'Where the certificate and key of every site sit on this server. Copy a path into x-ui, Xray or any program that serves TLS itself on the same domain.',
   certs_note:'Caddy renews these files <b>in place</b>, so a program that points at these paths always reads a fresh certificate - nothing to copy after a renewal. Xray re-reads its certificate files by itself; programs that load them only at start need a restart once in a while.',
-  certs_none:'No certificates on this server yet.', certs_pending:'Caddy has not got a certificate for this domain yet. The domain must point to this server and reach Caddy on ports 80/443; see Diagnostics.',
+  certs_none:'No certificates on this server yet.', certs_pending:'Caddy has not got a certificate for this domain yet. If ports 80/443 do not reach Caddy for it, switch it to Cloudflare DNS below.',
   cert_file:'Certificate', key_file:'Key', copy:'Copy', copied:'Copied',
+  cert_cf:'Caddy - through Cloudflare DNS (no :80/:443 needed)',
+  via_http:'HTTP check', via_cf:'Cloudflare DNS', use_cf:'Use Cloudflare DNS', use_http:'Use the HTTP check',
+  certs_pending_cf:'Caddy is getting the certificate through Cloudflare DNS - this can take a few minutes.',
+  certs_pending_nocf:'Caddy has not got a certificate for this domain yet. The domain must point to this server and reach Caddy on ports 80/443. If something else answers there for it (a front proxy, Xray), set a Cloudflare token in Settings - Caddy then gets it through DNS.',
+  confirm_use_cf:'Get and renew the certificate of {0} through Cloudflare DNS from now on?\n\nPorts 80/443 no longer have to reach Caddy for it. The current certificate stays until it is renewed.',
+  confirm_use_http:'Go back to the normal HTTP check for {0}?\n\nLet\'s Encrypt must then reach Caddy on port 80 or 443 for every renewal.',
+  cf_title:'Cloudflare DNS certificates',
+  cf_d:'For domains Let\'s Encrypt cannot reach on ports 80/443 - a front proxy sending the name to Xray, a firewall, a CDN-only setup. With a Cloudflare API token Caddy proves the domain with a DNS record instead. Choose it per site in the form, or switch a site on the Certificates page; when the normal HTTP check fails, Smart Caddy also switches to it by itself.',
+  cf_token:'API token', cf_save:'Check and save', cf_module:'Add the module to Caddy', cf_clear:'Remove token',
+  cf_token_h:'Cloudflare -> My Profile -> API Tokens -> Create Token -> template <b>Edit zone DNS</b>, zones: the domains you need. Stored on this server only, readable by root alone; never shown again.',
+  cf_has_token:'token saved {0}', cf_no_token:'no token yet', cf_has_module:'Caddy has the Cloudflare module', cf_no_module:'Caddy has no Cloudflare module yet',
+  cf_saved:'Token works and is saved. Zones it can edit: {0}\n\nCaddy restarts once to load it. If Caddy has no Cloudflare module yet, add it with the button below the token.',
+  confirm_cf_module:'Add the Cloudflare DNS module to Caddy?\n\nThe server downloads a Caddy build with the module from caddyserver.com (~40 MB), keeps the old one as a backup and restarts Caddy - sites are down for a second. The caddy package is held so apt does not undo it.',
+  cf_module_started:'Adding the module - this takes up to two minutes. Caddy restarts at the end; the result appears in the activity log, and this page updates by itself.',
+  confirm_cf_clear:'Remove the Cloudflare token from this server?', done_ok:'Done',
   tab_overview_d:'The state of Caddy, your sites and their certificates at a glance. This page refreshes by itself every 20 seconds.',
   tab_sites_d:'Every domain Caddy serves on this server. Edit opens it in the form; Config opens the raw Caddyfile text, which Caddy checks before anything is applied.',
   tab_add_d:'Put a domain online in four short steps. Only the domain and the main backend are required - everything else can stay as it is.',
@@ -4457,8 +4824,23 @@ fa: {
   tab_guide:'CDN کلودفلر', tab_diag:'عیب‌یابی', tab_log:'گزارش تغییرات', tab_certs:'گواهی‌ها',
   tab_certs_d:'محل فایل گواهی و کلید هر سایت روی این سرور. مسیر را کپی کنید و در x-ui، Xray یا هر برنامه‌ای که خودش TLS همان دامنه را سرو می‌کند بگذارید.',
   certs_note:'Caddy این فایل‌ها را <b>در همان مسیر</b> تمدید می‌کند؛ پس برنامه‌ای که به این مسیرها اشاره کند همیشه گواهی تازه را می‌خواند و بعد از تمدید کپی لازم نیست. Xray فایل گواهی را خودش دوباره می‌خواند؛ برنامه‌هایی که فقط هنگام شروع می‌خوانند، گاهی یک restart لازم دارند.',
-  certs_none:'هنوز گواهی‌ای روی این سرور نیست.', certs_pending:'Caddy هنوز برای این دامنه گواهی نگرفته است. دامنه باید به این سرور اشاره کند و از پورت ۸۰/۴۴۳ به Caddy برسد؛ «عیب‌یابی» را ببینید.',
+  certs_none:'هنوز گواهی‌ای روی این سرور نیست.', certs_pending:'Caddy هنوز برای این دامنه گواهی نگرفته است. اگر پورت ۸۰/۴۴۳ برای این دامنه به Caddy نمی‌رسد، با دکمهٔ زیر آن را به DNS کلودفلر ببرید.',
   cert_file:'گواهی', key_file:'کلید', copy:'کپی', copied:'کپی شد',
+  cert_cf:'Caddy - از راه DNS کلودفلر (پورت ۸۰/۴۴۳ لازم نیست)',
+  via_http:'بررسی HTTP', via_cf:'DNS کلودفلر', use_cf:'استفاده از DNS کلودفلر', use_http:'بازگشت به بررسی HTTP',
+  certs_pending_cf:'Caddy در حال گرفتن گواهی از راه DNS کلودفلر است - ممکن است چند دقیقه طول بکشد.',
+  certs_pending_nocf:'Caddy هنوز برای این دامنه گواهی نگرفته است. دامنه باید به این سرور اشاره کند و از پورت ۸۰/۴۴۳ به Caddy برسد. اگر برنامهٔ دیگری آن‌جا جواب این دامنه را می‌دهد (پروکسی جلویی، Xray)، در «تنظیمات» توکن کلودفلر بگذارید تا Caddy گواهی را از راه DNS بگیرد.',
+  confirm_use_cf:'گواهی {0} از این به بعد از راه DNS کلودفلر گرفته و تمدید شود؟\n\nدیگر لازم نیست پورت ۸۰/۴۴۳ برای این دامنه به Caddy برسد. گواهی فعلی تا تمدید بعدی می‌ماند.',
+  confirm_use_http:'برای {0} به بررسی عادی HTTP برگردیم؟\n\nدر این صورت Let\'s Encrypt برای هر تمدید باید از پورت ۸۰ یا ۴۴۳ به Caddy برسد.',
+  cf_title:'گواهی از راه DNS کلودفلر',
+  cf_d:'برای دامنه‌هایی که Let\'s Encrypt از پورت ۸۰/۴۴۳ به آن‌ها نمی‌رسد - پروکسی جلویی که دامنه را به Xray می‌دهد، فایروال، یا فقط CDN. با توکن API کلودفلر، Caddy مالکیت دامنه را با یک رکورد DNS ثابت می‌کند. روش را برای هر سایت در فرم انتخاب کنید یا در صفحهٔ «گواهی‌ها» عوض کنید؛ اگر بررسی عادی HTTP شکست بخورد، Smart Caddy خودش هم به این روش می‌رود.',
+  cf_token:'توکن API', cf_save:'بررسی و ذخیره', cf_module:'افزودن ماژول به Caddy', cf_clear:'حذف توکن',
+  cf_token_h:'Cloudflare -> My Profile -> API Tokens -> Create Token -> قالب <b>Edit zone DNS</b> و دامنه‌های لازم. فقط روی همین سرور و فقط برای root ذخیره می‌شود و دیگر نمایش داده نمی‌شود.',
+  cf_has_token:'توکن ذخیره شده {0}', cf_no_token:'هنوز توکنی نیست', cf_has_module:'Caddy ماژول کلودفلر را دارد', cf_no_module:'Caddy هنوز ماژول کلودفلر ندارد',
+  cf_saved:'توکن کار می‌کند و ذخیره شد. دامنه‌هایی که می‌تواند ویرایش کند: {0}\n\nCaddy یک بار restart می‌شود تا توکن را بخواند. اگر Caddy هنوز ماژول کلودفلر ندارد، با دکمهٔ زیر توکن اضافه‌اش کنید.',
+  confirm_cf_module:'ماژول DNS کلودفلر به Caddy اضافه شود؟\n\nسرور یک نسخهٔ Caddy همراه این ماژول را از caddyserver.com دانلود می‌کند (حدود ۴۰ مگابایت)، نسخهٔ قبلی را نگه می‌دارد و Caddy را restart می‌کند - سایت‌ها یک ثانیه قطع می‌شوند. بستهٔ caddy قفل می‌شود تا apt آن را برنگرداند.',
+  cf_module_started:'در حال افزودن ماژول - تا دو دقیقه طول می‌کشد. در پایان Caddy restart می‌شود؛ نتیجه در گزارش تغییرات می‌آید و این صفحه خودش به‌روز می‌شود.',
+  confirm_cf_clear:'توکن کلودفلر از این سرور حذف شود؟', done_ok:'انجام شد',
   tab_overview_d:'وضعیت Caddy، سایت‌ها و گواهی‌هایشان در یک نگاه. این صفحه هر ۲۰ ثانیه خودش به‌روز می‌شود.',
   tab_sites_d:'همهٔ دامنه‌هایی که Caddy روی این سرور سرویس می‌دهد. «ویرایش» آن را در فرم باز می‌کند و «کانفیگ» متن خام Caddyfile را؛ Caddy قبل از اعمال، آن را بررسی می‌کند.',
   tab_add_d:'یک دامنه را در چهار قدم کوتاه آنلاین کنید. فقط دامنه و مقصد اصلی لازم است؛ بقیه را می‌توانید همان‌طور که هست بگذارید.',
@@ -4713,6 +5095,7 @@ function render(d){
   renderTiles(d);
   renderCaddyfile(d.caddyfile || []);
   renderCerts(d.sites);
+  renderCf(d.cloudflare);
 
   SITES = d.sites;
   $('#b-sites').textContent = d.sites.length;
@@ -4778,20 +5161,80 @@ function renderCerts(sites){
     + '<code class="ltr">' + esc(path) + '</code>'
     + '<button type="button" class="link go" data-copy="' + esc(path) + '">' + esc(t('copy')) + '</button></div>';
   let h = '<div class="note info">' + t('certs_note') + '</div><div class="slist">';
+  const cf = (STATE && STATE.cloudflare) || {};
+  const cfReady = cf.token;
+  // how Caddy proves the domain, and a button to switch it
+  const via = s => {
+    if (s.cert === 'certbot') return '';
+    const on = s.cert_via === 'cloudflare';
+    let x = '<span class="tag' + (on ? ' cdn' : '') + '">' + esc(t(on ? 'via_cf' : 'via_http')) + '</span>';
+    if (on) x += '<button type="button" class="link go" data-via="http" data-dom="' + esc(s.domain) + '">' + esc(t('use_http')) + '</button>';
+    else if (cfReady) x += '<button type="button" class="link go" data-via="cloudflare" data-dom="' + esc(s.domain) + '">' + esc(t('use_cf')) + '</button>';
+    return '<div class="acts2">' + x + '</div>';
+  };
   for (const s of withFile)
     h += '<div class="cert-card glass">'
       +  '<div class="chead"><span class="dom ltr">' + esc(s.domain) + '</span>' + certTag(s) + '</div>'
       +  row(t('cert_file'), s.cert_file) + row(t('key_file'), s.key_file)
-      +  '</div>';
+      +  via(s) + '</div>';
   for (const s of rest)
     h += '<div class="cert-card glass"><div class="chead"><span class="dom ltr">' + esc(s.domain) + '</span>'
       +  '<span class="tag warn">' + esc(t('tag_pending')) + '</span></div>'
-      +  '<p class="sec-d">' + esc(t('certs_pending')) + '</p></div>';
+      +  '<p class="sec-d">' + esc(t(s.cert_via === 'cloudflare' ? 'certs_pending_cf' : cfReady ? 'certs_pending' : 'certs_pending_nocf')) + '</p>'
+      +  via(s) + '</div>';
   $('#certs').innerHTML = h + '</div>';
   document.querySelectorAll('#certs [data-copy]').forEach(b => b.onclick = () => copyText(b.dataset.copy));
   document.querySelectorAll('#certs [data-renew]').forEach(b => b.onclick = () => renewCert(b.dataset.renew));
   document.querySelectorAll('#certs [data-cert]').forEach(b => b.onclick = () => toCaddy(b.dataset.cert));
+  document.querySelectorAll('#certs [data-via]').forEach(b => b.onclick = () => certVia(b.dataset.dom, b.dataset.via));
 }
+
+async function certVia(domain, to){
+  if (busy) return;
+  if (!confirm(t(to === 'cloudflare' ? 'confirm_use_cf' : 'confirm_use_http', domain))) return;
+  busy = true;
+  toast(t('working'));
+  const r = await api('/api/cert', {domain, to});
+  busy = false;
+  toast(r.ok ? t('done_ok') : t('toast_failed'), !r.ok);
+  show('SSL ' + domain, r.out, !r.ok);
+  refresh();
+}
+
+// ---------------------------------------------------------------- Cloudflare settings
+function renderCf(cf){
+  cf = cf || {};
+  const tag = (good, txt) => '<span class="tag ' + (good ? 'ok' : 'warn') + '">' + esc(txt) + '</span>';
+  $('#cf-state').innerHTML = tag(cf.token, cf.token ? t('cf_has_token', cf.hint) : t('cf_no_token'))
+                           + tag(cf.module, t(cf.module ? 'cf_has_module' : 'cf_no_module'));
+  $('#cf-module').hidden = !cf.token || !!cf.module;
+  $('#cf-clear').hidden = !cf.token;
+}
+$('#cf-save').onclick = async () => {
+  const token = $('#cf-token').value.trim();
+  if (!token){ $('#cf-token').focus(); return; }
+  if (busy) return;
+  busy = true; toast(t('working'));
+  const r = await api('/api/cloudflare', {action: 'token', token});
+  busy = false;
+  if (!r.ok){ toast(r.out || t('toast_failed'), true); show(t('cf_title'), r.out, true); return; }
+  $('#cf-token').value = '';
+  show(t('cf_title'), t('cf_saved', (r.zones || []).join(', ') || '-'));
+  [3, 8, 15].forEach(sec => setTimeout(refresh, sec * 1000));
+};
+$('#cf-module').onclick = async () => {
+  if (busy || !confirm(t('confirm_cf_module'))) return;
+  const r = await api('/api/cloudflare', {action: 'module'});
+  if (!r.ok){ toast(r.out || t('toast_failed'), true); return; }
+  show(t('cf_title'), t('cf_module_started'));
+  [20, 45, 75, 110, 160].forEach(sec => setTimeout(refresh, sec * 1000));
+};
+$('#cf-clear').onclick = async () => {
+  if (busy || !confirm(t('confirm_cf_clear'))) return;
+  const r = await api('/api/cloudflare', {action: 'clear'});
+  show(t('cf_title'), r.out, !r.ok);
+  refresh();
+};
 
 async function copyText(s){
   try { await navigator.clipboard.writeText(s); }
@@ -4971,7 +5414,8 @@ function startEdit(s){
   $('#f-panel').checked = !!(s.insecure || s.nobuffer);
   $('#f-notls').checked = !!s.no_tls;
   $('#f-xray').checked  = !!s.behind_xray;
-  $('#f-cert').value    = (s.cert === 'certbot' || s.cert === 'internal') ? s.cert : 'caddy';
+  $('#f-cert').value    = s.cert_via === 'cloudflare' ? 'cloudflare'
+                        : (s.cert === 'certbot' || s.cert === 'internal') ? s.cert : 'caddy';
   syncCert();
   XRAY_TOUCHED = true;
   $('#routes').innerHTML = '';
@@ -5732,7 +6176,7 @@ cmd_uninstall() {
 	local tmp; tmp=$(mktemp)
 	grep -v -e "^import ${SITES_DIR}/\*\.caddy" -e "^# --- sites managed by" "$CADDYFILE" > "$tmp"
 	write_inplace "$CADDYFILE" "$tmp"
-	caddy validate --config "$CADDYFILE" >/dev/null 2>&1 && systemctl reload caddy 2>/dev/null || true
+	caddy_validate >/dev/null 2>&1 && systemctl reload caddy 2>/dev/null || true
 	ok "import line removed, backup: $bak"
 	dim "site files kept in $SITES_DIR"
 	rm -f "/usr/local/bin/$SELF_NAME" "$CONF_FILE"
@@ -5759,6 +6203,11 @@ ${C_B}COMMANDS${C_OFF}
                                            certificate instead of certbot
   renew <domain>                           get a fresh certificate right now
                                            (the old one returns if it fails)
+  cert <domain> cloudflare|http           how Caddy proves the domain: a DNS
+                                           record via Cloudflare (no :80/:443
+                                           needed) or the normal HTTP check
+  cloudflare token|module|status|clear     Cloudflare API token and Caddy's
+                                           DNS module for those certificates
   list                                     list domains and certificates
   import [domain...] [--all|--list]        move sites already in the Caddyfile
          <domain> --replace                ... over a managed copy of the same domain
@@ -5797,6 +6246,10 @@ ${C_B}ADD OPTIONS${C_OFF}
   --host-header <v>    force the Host header sent upstream (routers want 127.0.0.1)
   --auto-cert          Caddy issues and renews the certificate itself, even
                        if certbot already has one (recommended)
+  --dns-cloudflare     get the certificate through Cloudflare DNS - for names
+                       Let's Encrypt cannot reach on :80/:443. Without it, a
+                       failed HTTP check falls back to this by itself when a
+                       Cloudflare token is set
   --certbot            use the existing certbot certificate
   --self-signed        use Caddy's internal CA (testing only)
   --no-tls             plain HTTP, no certificate
@@ -5840,6 +6293,9 @@ main() {
 			activity_begin "$cmd" "$@" ;;
 		import|adopt)
 			[[ " $* " == *" --list "* || " $* " == *" --json "* ]] || activity_begin "$cmd" "$@" ;;
+		cloudflare)
+			# never the token itself - only which action it was
+			[[ "${1:-status}" == status ]] || activity_begin "$cmd" "${1:-}" ;;
 	esac
 	case "$cmd" in
 		setup)             cmd_setup "$@" ;;
@@ -5851,7 +6307,8 @@ main() {
 		import|adopt)      cmd_import "$@" ;;
 		cert)              cmd_cert "$@" ;;
 		renew)             cmd_renew "$@" ;;
-		put)               cmd_put "$@" ;;
+		cloudflare|cf)     cmd_cloudflare "$@" ;;
+		put)             cmd_put "$@" ;;
 		doctor|check)      cmd_doctor ;;
 		panel)             cmd_panel "$@" ;;
 		passwd|password)   cmd_passwd "$@" ;;
