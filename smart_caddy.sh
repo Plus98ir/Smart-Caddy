@@ -1479,7 +1479,9 @@ cmd_add() {
 				printf '%sfile_server\n' "$ind"
 				;;
 			redirect)
-				printf '%sredir %s{uri} permanent\n' "$ind" "${target%/}"
+				# temporary (302): browsers cache a 301 for good, so a later
+				# change of the target would never reach anyone who saw the old one
+				printf '%sredir %s{uri}\n' "$ind" "${target%/}"
 				;;
 			*) render_proxy "$ind" "$target" ;;
 		esac
