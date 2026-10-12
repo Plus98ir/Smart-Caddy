@@ -4575,6 +4575,14 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
   </div>
 </dialog>
 
+<!-- the site form moves in here while a site is edited -->
+<dialog id="edit-dlg">
+  <div class="h2row" style="margin-bottom:14px">
+    <h3 id="edit-title" style="font-size:16px;text-transform:none;letter-spacing:0;color:var(--ink)">Edit</h3><span class="grow"></span>
+    <button type="button" class="link" id="edit-close" data-t="close">Close</button>
+  </div>
+</dialog>
+
 <script>
 const $ = s => document.querySelector(s);
 
@@ -5398,9 +5406,9 @@ function readRoutes(){
 
 // ---------------------------------------------------------------- form
 function formTexts(){
-  $('#form-title').textContent = EDITING ? t('form_edit', EDITING.domain) : t('form_add');
+  $('#form-title').textContent = t('form_add');
+  if (EDITING) $('#edit-title').textContent = t('form_edit', EDITING.domain);
   $('#btn-add').textContent = t(EDITING ? 'btn_save' : 'btn_add');
-  $('#tab-add-label').textContent = t(EDITING ? 'tab_edit' : 'tab_add');
   document.querySelectorAll('#routes .route').forEach(routeTexts);
   if (EDITING && EDITING.imported) $('#edit-note').innerHTML = t('note_imported');
 }
@@ -5427,12 +5435,16 @@ function startEdit(s){
   $('#btn-cancel').hidden = false;
   $('#form-out-card').hidden = true;
   formTexts();
-  setTab('add');
+  // edit in a window over the current page, like Config, instead of jumping to the Add tab
+  $('#edit-dlg').appendChild($('#form-card'));
+  if (!$('#edit-dlg').open) $('#edit-dlg').showModal();
   $('#f-target').focus({preventScroll:true});
 }
 
 function stopEdit(){
   EDITING = null;
+  $('#tab-add').appendChild($('#form-card'));
+  if ($('#edit-dlg').open) $('#edit-dlg').close();
   $('#add').reset();
   $('#routes').innerHTML = '';
   syncRoutes();
@@ -5452,6 +5464,10 @@ function syncCert(){ $('#f-cert').disabled = $('#f-notls').checked || $('#f-xray
 $('#f-xray').onchange = () => { XRAY_TOUCHED = true; syncCert(); };
 $('#f-notls').onchange = syncCert;
 $('#btn-cancel').onclick = stopEdit;
+$('#edit-close').onclick = () => { if (!busy) stopEdit(); };
+// Esc closes the window too, but not while a save is running
+$('#edit-dlg').addEventListener('cancel', e => { if (busy) e.preventDefault(); });
+$('#edit-dlg').addEventListener('close', () => { if (EDITING) stopEdit(); });
 
 $('#add').onsubmit = async e => {
   e.preventDefault();
@@ -5482,7 +5498,9 @@ $('#add').onsubmit = async e => {
   $('#form-out').innerHTML = r.out ? paint(r.out) : esc(t('no_output'));
   $('#form-out-card').hidden = false;
   if (r.ok) stopEdit(); else formTexts();
-  $('#form-out-card').scrollIntoView({behavior:'smooth', block:'nearest'});
+  // a saved edit closes its window; the output is still under Diagnostics
+  if (editing && r.ok) $('#form-out-card').hidden = true;
+  else $('#form-out-card').scrollIntoView({behavior:'smooth', block:'nearest'});
   refresh();
 };
 
@@ -5654,7 +5672,7 @@ stopEdit();
   setTab(first || 'overview', !!first);
 }
 refresh();
-setInterval(() => { if (!busy && !$('#raw').open) refresh(); }, 20000);
+setInterval(() => { if (!busy && !$('#raw').open && !$('#edit-dlg').open) refresh(); }, 20000);
 </script>
 </body>
 </html>
