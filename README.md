@@ -4,6 +4,8 @@
 
 **English** · [فارسی](README.fa.md)
 
+<a href="https://hits.sh/github.com/Plus98ir/Smart-Caddy/"><img src="https://hits.sh/github.com/Plus98ir/Smart-Caddy.svg?style=for-the-badge&label=views&color=2563eb" alt="Views"></a>
+
 Smart reverse proxy management for [Caddy](https://caddyserver.com), in one script.
 
 </div>
