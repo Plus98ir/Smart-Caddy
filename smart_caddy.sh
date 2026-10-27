@@ -3335,6 +3335,29 @@ UPDATE_URL = os.environ.get("SMART_CADDY_URL",
 INSTALLED = "/usr/local/bin/smart-caddy"
 
 
+def reality_state():
+    r = run_cli(["reality", "status"], timeout=30)
+    try:
+        return json.loads(r.get("out", "").strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {"xui": os.path.isfile(XUI_DB), "error": r.get("out", "")}
+
+
+def reality_watch():
+    """Keep DNSGuard's SNI_PASS in step with x-ui: a Reality made, renamed or
+    deleted in x-ui is on (or off) :443 within a minute, with no hand edits."""
+    while True:
+        time.sleep(60)
+        try:
+            if not (os.path.isfile(XUI_DB) and os.path.isfile("/opt/dnsguard/.env")):
+                continue
+            chk = subprocess.run([CLI, "reality", "sync", "--check"], capture_output=True, timeout=60)
+            if chk.returncode == 3:
+                run_cli(["reality", "sync"], timeout=120, actor="auto")
+        except Exception:
+            pass
+
+
 def update_check():
     """Is the published build different from the installed one? Content, not
     the version string - a fixed build is often re-published under the same one."""
@@ -3802,6 +3825,8 @@ class Handler(BaseHTTPRequestHandler):
                 "cloudflare": cf_state(),
                 "xui": os.path.isfile(XUI_DB),
             })
+        if path == "/api/reality":
+            return self.send_json(reality_state())
         if path == "/api/update-check":
             return self.send_json(update_check())
         if path == "/api/xui":
@@ -4017,6 +4042,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(self.cli(["put", domain, tmp]))
             finally:
                 os.unlink(tmp)
+
+        if path == "/api/reality":
+            action = str(data.get("action", ""))
+            if action == "sync":
+                return self.send_json(self.cli(["reality", "sync"], timeout=120))
+            if action == "on443" and str(data.get("id", "")).isdigit():
+                return self.send_json(self.cli(["reality", "on443", str(data["id"])], timeout=120))
+            return self.send_json({"ok": False, "out": "unknown action"}, 400)
 
         if path == "/api/update":
             err = start_update(self.actor())
@@ -4378,8 +4411,10 @@ nav.tabs #btn-pin{align-self:flex-start;width:auto;padding:8px 13px}
 #btn-pin svg{transition:transform .15s}
 html:not(.pin) #btn-pin svg{transform:rotate(35deg)}
 html.pin #btn-pin{color:var(--acc)}
-/* the page always keeps the open menu's width free, so pinning never moves the content */
-body{padding-inline-start:calc(var(--side) + var(--gap))}
+/* closed: the content sits right next to the icon rail and the menu opens over
+   it on hover; pinned: the content makes room for the open menu */
+body{padding-inline-start:calc(var(--rail) + var(--gap));transition:padding-inline-start .18s}
+html.pin body{padding-inline-start:calc(var(--side) + var(--gap))}
 @media(min-width:901px){
   html.pin nav.tabs,html:not(.pin):not(.navshut) nav.tabs:hover,html:not(.pin) nav.tabs:focus-within{width:var(--side)}
   html:not(.pin):not(.navshut) nav.tabs:hover,html:not(.pin) nav.tabs:focus-within{box-shadow:0 0 50px -6px rgba(0,0,0,.75)}
@@ -4681,6 +4716,9 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
   <button type="button" data-tab="certs" role="tab">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/><circle cx="12" cy="15.5" r="1.5"/></svg>
     <span data-t="tab_certs">Certificates</span></button>
+  <button type="button" data-tab="reality" role="tab" id="tab-btn-reality" hidden>
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.5-3 8.3-7 10-4-1.7-7-5.5-7-10V6l7-3z"/><path d="M9 12l2 2 4-4"/></svg>
+    <span data-t="tab_reality">Reality</span></button>
   <button type="button" data-tab="caddyfile" role="tab" id="tab-btn-caddyfile" hidden>
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M12 12v6M9 15l3 3 3-3"/></svg>
     <span data-t="tab_caddyfile">Import</span><span class="badge warn" id="b-cf">0</span></button>
@@ -4737,6 +4775,14 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
 </section>
 
 <!-- ============================================================ certificates -->
+<section class="tab" id="tab-reality">
+  <div class="tab-head"><div class="txt"><h2 data-t="tab_reality">Reality</h2><p data-t="rl_d"></p></div>
+    <button type="button" id="rl-sync" data-t="rl_sync">Sync now</button></div>
+  <div class="note" id="rl-note" hidden></div>
+  <div id="reality"><div class="empty glass card" data-t="loading">Loading…</div></div>
+  <div class="card glass" style="margin-top:16px"><h3 data-t="rl_how">How it works</h3><div class="hint" data-th="rl_how_d"></div></div>
+</section>
+
 <section class="tab" id="tab-certs">
   <div class="tab-head"><div class="txt"><h2 data-t="tab_certs">Certificates</h2><p data-t="tab_certs_d"></p></div></div>
   <div id="certs"><div class="empty glass card" data-t="loading">Loading…</div></div>
@@ -5157,6 +5203,16 @@ en: {
   sec_extra_d:'Advanced and usually empty. These lines go into the site exactly as written, e.g. <code>header -Server</code> or an <code>import</code>. When a site already has lines like that, they show up here and are kept when you save.',
   note_drop:'Saving from the form drops these parts, which it cannot show: {0}. To keep them, edit this site as code.',
   open_code:'Edit as code',
+  tab_reality:'Reality', rl_sync:'Sync now',
+  rl_d:'x-ui Reality configs on port 443 next to the sites - set up and kept in step by themselves.',
+  rl_none:'No Reality inbound in x-ui on this server.', rl_noxui:'No x-ui on this server.',
+  rl_nofront:'Reality on :443 needs a program on :443 that routes by name (DNSGuard). This server has none, so Reality stays on its own port here.',
+  rl_on:'on :443', rl_off:'not on :443', rl_wait:'waiting for sync', rl_public:'listens on all addresses',
+  rl_port:'internal port', rl_links:'share links', rl_nolinks:'none - x-ui uses the sub address',
+  rl_put:'Put on :443', rl_confirm:'Move inbound {0} to 127.0.0.1 and serve it on :443? x-ui and DNSGuard restart for a few seconds; clients update their subscription afterwards.',
+  rl_synced:'In step with x-ui.', rl_pending:'x-ui changed - the next automatic sync (within a minute) applies it, or press Sync now.',
+  rl_how:'How it works',
+  rl_how_d:'<ol><li>In x-ui make a Reality inbound with <b>Listen IP</b> <code>127.0.0.1</code>, any free port, and a <b>target / SNI</b> such as <code>www.cloudflare.com</code>.</li><li>Within a minute DNSGuard sends that SNI on :443 straight to it, and its share link says port <code>443</code>.</li><li>Change the SNI or delete the inbound - this follows by itself. Each Reality needs its own SNI.</li><li>An inbound that listens on all addresses keeps its own port; <b>Put on :443</b> moves it.</li></ol>',
   up_title:'Update', up_d:'Installs the latest published Smart-Caddy on this server - no SSH needed. Sites stay up; the panel restarts for a few seconds.',
   up_check:'Check for an update', up_go:'Update now', up_checking:'Checking…',
   up_none:'Up to date: v{0} (build {1}).', up_avail:'A new build is available: v{0} → v{1} (build {2} → {3}).',
@@ -5316,6 +5372,16 @@ fa: {
   sec_extra_d:'پیشرفته و معمولاً خالی. این خطوط دقیقاً همان‌طور که نوشته شده‌اند داخل سایت قرار می‌گیرند، مثلاً <code>header -Server</code> یا یک <code>import</code>. اگر سایتی از قبل چنین خطوطی دارد اینجا نشان داده می‌شوند و موقع ذخیره حفظ می‌شوند.',
   note_drop:'ذخیره از فرم این بخش‌ها را که فرم نمی‌تواند نشان دهد حذف می‌کند: {0}. برای حفظ آن‌ها، این سایت را به‌صورت کد ویرایش کنید.',
   open_code:'ویرایش به‌صورت کد',
+  tab_reality:'ریالیتی', rl_sync:'همگام‌سازی',
+  rl_d:'کانفیگ‌های ریالیتی x-ui روی پورت 443 کنار سایت‌ها؛ خودکار تنظیم و همگام می‌شوند.',
+  rl_none:'روی این سرور اینباند ریالیتی در x-ui نیست.', rl_noxui:'روی این سرور x-ui نیست.',
+  rl_nofront:'ریالیتی روی 443 به برنامه‌ای روی 443 نیاز دارد که از روی اسم پخش کند (دیگارد). این سرور ندارد، پس ریالیتی اینجا روی پورت خودش می‌ماند.',
+  rl_on:'روی 443', rl_off:'روی 443 نیست', rl_wait:'منتظر همگام‌سازی', rl_public:'روی همهٔ آدرس‌ها گوش می‌دهد',
+  rl_port:'پورت داخلی', rl_links:'لینک‌های اشتراک', rl_nolinks:'ندارد - x-ui آدرس ساب را می‌گذارد',
+  rl_put:'ببر روی 443', rl_confirm:'اینباند {0} روی 127.0.0.1 برود و روی 443 سرویس بدهد؟ x-ui و دیگارد چند ثانیه ری‌استارت می‌شوند؛ بعدش کاربرها ساب را آپدیت کنند.',
+  rl_synced:'با x-ui همگام است.', rl_pending:'x-ui تغییر کرده - همگام‌سازی خودکار بعدی (حداکثر یک دقیقه) اعمالش می‌کند، یا «همگام‌سازی» را بزنید.',
+  rl_how:'چطور کار می‌کند',
+  rl_how_d:'<ol><li>در x-ui یک اینباند ریالیتی بسازید با <b>Listen IP</b> <code>127.0.0.1</code>، یک پورت آزاد دلخواه و یک <b>target / SNI</b> مثل <code>www.cloudflare.com</code>.</li><li>حداکثر یک دقیقه بعد، دیگارد آن SNI را روی 443 مستقیم به آن می‌دهد و لینک اشتراکش پورت <code>443</code> می‌شود.</li><li>SNI را عوض کنید یا اینباند را پاک کنید - خودش دنبال می‌کند. هر ریالیتی یک SNI جدا لازم دارد.</li><li>اینباندی که روی همهٔ آدرس‌ها گوش می‌دهد روی پورت خودش می‌ماند؛ دکمهٔ <b>ببر روی 443</b> منتقلش می‌کند.</li></ol>',
   up_title:'به‌روزرسانی', up_d:'آخرین نسخهٔ منتشرشدهٔ Smart-Caddy را روی همین سرور نصب می‌کند؛ SSH لازم نیست. سایت‌ها روشن می‌مانند و فقط پنل چند ثانیه ری‌استارت می‌شود.',
   up_check:'بررسی به‌روزرسانی', up_go:'به‌روزرسانی کن', up_checking:'در حال بررسی…',
   up_none:'به‌روز است: v{0} (بیلد {1}).', up_avail:'نسخهٔ جدید آماده است: v{0} ← v{1} (بیلد {2} ← {3}).',
@@ -5380,6 +5446,7 @@ function applyLang(){
   renderPreview(DRAFT || BRAND);
   if (STATE) render(STATE);
   if (LOG) renderLog(LOG);
+  if (RL) renderReality();
 }
 
 document.querySelectorAll('[data-lang]').forEach(b => b.onclick = () => {
@@ -5394,7 +5461,7 @@ let EDITING = null;          // the site object being edited, null while adding
 let XRAY_TOUCHED = false;    // once the user sets it themselves, stop guessing
 
 // ---------------------------------------------------------------- tabs
-const TABS = ['overview', 'sites', 'add', 'certs', 'caddyfile', 'guide', 'diag', 'log', 'settings'];
+const TABS = ['overview', 'sites', 'add', 'certs', 'reality', 'caddyfile', 'guide', 'diag', 'log', 'settings'];
 let TAB = 'overview';
 
 function setTab(name, push){
@@ -5409,6 +5476,7 @@ function setTab(name, push){
   });
   document.querySelectorAll('main > .tab').forEach(s => s.classList.toggle('on', s.id === 'tab-' + name));
   if (name === 'diag') $('#b-diag').hidden = true;
+  if (name === 'reality') loadReality();
   try { localStorage.setItem('sc-tab', name); } catch(_) {}
   if (push !== false && location.hash !== '#' + name) history.replaceState(null, '', '#' + name);
   if (moved) window.scrollTo({top: 0, behavior: 'smooth'});
@@ -5575,6 +5643,7 @@ function render(d){
   renderCf(d.cloudflare);
 
   SITES = d.sites;
+  $('#tab-btn-reality').hidden = !d.xui;
   kindTexts();      // the x-ui button needs to know whether x-ui is here
   $('#b-sites').textContent = d.sites.length;
   if (!d.sites.length){
@@ -5815,6 +5884,63 @@ async function toCaddy(domain){
   show('SSL ' + domain, r.out, !r.ok);
   refresh();
 }
+
+// ---------------------------------------------------------------- reality
+var RL = null;   // var: applyLang() may run before this line
+async function loadReality(){
+  RL = await api('/api/reality');
+  renderReality();
+}
+function renderReality(){
+  const d = RL;
+  if (!d) return;
+  $('#rl-sync').hidden = !(d.xui && d.front);
+  const note = $('#rl-note');
+  if (!d.xui){ $('#reality').innerHTML = '<div class="empty glass card">' + esc(t('rl_noxui')) + '</div>'; note.hidden = true; return; }
+  if (!d.front){ note.innerHTML = esc(t('rl_nofront')); note.hidden = false; }
+  else { note.innerHTML = esc(t(d.in_sync ? 'rl_synced' : 'rl_pending')); note.hidden = false; }
+  if (!d.inbounds || !d.inbounds.length){
+    $('#reality').innerHTML = '<div class="empty glass card">' + esc(t('rl_none')) + '</div>';
+    return;
+  }
+  let h = '<div class="slist">';
+  for (const ib of d.inbounds){
+    let st;
+    if (!d.front)        st = '<span class="tag">' + esc(t('rl_off')) + '</span>';
+    else if (ib.on443)   st = '<span class="tag ok">' + esc(t('rl_on')) + '</span>';
+    else if (ib.local)   st = '<span class="tag warn">' + esc(t('rl_wait')) + '</span>';
+    else                 st = '<span class="tag warn">' + esc(t('rl_off')) + '</span> <span class="tag">' + esc(t('rl_public')) + '</span>';
+    if (!ib.enable) st += ' <span class="tag">off</span>';
+    const links = ib.links.length ? ib.links.map(l => '<code>' + esc(l) + '</code>').join(' ') : esc(t('rl_nolinks'));
+    h += '<div class="site glass">'
+      +  '<div><span class="lbl">#' + ib.id + '</span><div class="dom">' + esc(ib.remark) + '</div>'
+      +  '<div class="rt">' + ib.names.map(n => '<code>' + esc(n) + '</code>').join(' ') + '</div></div>'
+      +  '<div><span class="lbl">' + esc(t('rl_port')) + '</span><code>' + esc((ib.listen || '*') + ':' + ib.port) + '</code></div>'
+      +  '<div><span class="lbl">' + esc(t('rl_links')) + '</span>' + links + '<div style="margin-top:6px">' + st + '</div></div>'
+      +  '<div class="acts">' + (d.front && !ib.local && ib.names.length
+           ? '<button class="link go" data-rl="' + ib.id + '">' + esc(t('rl_put')) + '</button>' : '') + '</div>'
+      +  '</div>';
+  }
+  $('#reality').innerHTML = h + '</div>';
+  document.querySelectorAll('[data-rl]').forEach(b => b.onclick = async () => {
+    if (busy || !confirm(t('rl_confirm', b.dataset.rl))) return;
+    busy = true;
+    const r = await api('/api/reality', {action: 'on443', id: +b.dataset.rl});
+    busy = false;
+    toast(r.ok ? t('rl_on') : t('toast_failed'), !r.ok);
+    show(t('rl_put') + ' #' + b.dataset.rl, r.out);
+    loadReality();
+  });
+}
+$('#rl-sync').onclick = async () => {
+  if (busy) return;
+  busy = true; $('#rl-sync').disabled = true;
+  const r = await api('/api/reality', {action: 'sync'});
+  busy = false; $('#rl-sync').disabled = false;
+  toast(r.ok ? t('rl_synced') : t('toast_failed'), !r.ok);
+  show(t('rl_sync'), r.out);
+  loadReality();
+};
 
 // ---------------------------------------------------------------- update
 $('#up-check').onclick = async () => {
@@ -6302,6 +6428,7 @@ def main():
         sys.stderr.write(
             f"WARNING: binding to {HOST}. The panel authenticates, but it speaks\n"
             f"plain HTTP - put Caddy in front of it rather than exposing it.\n")
+    threading.Thread(target=reality_watch, daemon=True).start()
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     sys.stderr.write(f"smart-caddy panel listening on http://{HOST}:{PORT}\n")
     try:
@@ -6383,6 +6510,278 @@ find_ui_source() {
 	# Nothing else worked: fall back to whatever is already installed.
 	[[ -f "$UI_PY" ]] && ui_is_valid "$UI_PY" && { readlink -f "$UI_PY"; return 0; }
 	return 1
+}
+
+# =============================================================================
+#  Reality on :443
+#
+#  A program on :443 that routes by name (DNSGuard) can hand an x-ui Reality
+#  inbound its own SNI untouched (SNI_PASS), so Reality shares :443 with the
+#  sites. An inbound that listens on loopback is taken as meant for this:
+#  'sync' gives each of its server names a line, drops lines whose inbound is
+#  gone or changed its name, and points its share links at port 443.
+# =============================================================================
+
+XUI_DB="/etc/x-ui/x-ui.db"
+REALITY_BACKUPS="/var/backups/smart-caddy"
+
+# reality_py <status|check|sync|on443> [inbound id]
+# status prints JSON; check exits 3 when sync has work to do; sync/on443 print
+# what they changed plus "RESTART <unit>" lines for the caller.
+reality_py() {
+	python3 - "$XUI_DB" "$DNSGUARD_ENV" "$REALITY_BACKUPS" "$@" <<'PY'
+import json, os, random, re, shutil, sqlite3, string, subprocess, sys, time
+db, envp, bdir, action = sys.argv[1:5]
+arg = sys.argv[5] if len(sys.argv) > 5 else ""
+LOOP = ("127.0.0.1", "localhost", "::1")
+
+
+def inbounds(c):
+    out = []
+    for i, remark, port, listen, enable, ss in c.execute(
+            "select id, remark, port, listen, enable, stream_settings from inbounds order by id"):
+        try:
+            s = json.loads(ss or "{}")
+        except ValueError:
+            continue
+        rs = s.get("realitySettings") or {}
+        out.append({"id": i, "remark": remark or "", "port": int(port or 0), "listen": listen or "",
+                    "enable": bool(enable), "reality": s.get("security") == "reality",
+                    "names": [n.lower() for n in (rs.get("serverNames") or []) if n]})
+    return out
+
+
+def managed(ibs):
+    return {ib["port"]: ib for ib in ibs
+            if ib["reality"] and ib["enable"] and ib["listen"] in LOOP and ib["names"]}
+
+
+def has_hosts(c):
+    return bool(c.execute("select 1 from sqlite_master where type='table' and name='hosts'").fetchone())
+
+
+def rows(c, ib):
+    if not has_hosts(c):
+        return []
+    return [{"id": r[0], "address": r[1], "port": int(r[2] or 0)}
+            for r in c.execute("select id, address, port from hosts where inbound_id=? and is_disabled=0", (ib,))]
+
+
+def read_pass():
+    try:
+        txt = open(envp).read()
+    except OSError:
+        return None, []
+    m = re.search(r"^SNI_PASS=(.*)$", txt, re.M)
+    pairs = []
+    for part in (m.group(1) if m else "").replace(" ", "").split(","):
+        n, _, t = part.partition("=")
+        if n and t:
+            pairs.append((n.lower(), t))
+    return txt, pairs
+
+
+def listening(port):
+    r = subprocess.run(["ss", "-Htln", f"sport = :{port}"], capture_output=True, text=True)
+    return bool(r.stdout.strip())
+
+
+def want_pass(ibs, pairs):
+    """SNI_PASS as it should be, and why it differs."""
+    man, ports = managed(ibs), {ib["port"] for ib in ibs}
+    new, notes = [], []
+    for n, t in pairs:
+        h, _, p = t.rpartition(":")
+        p = int(p) if p.isdigit() else -1
+        if h in LOOP and p in man and n not in man[p]["names"]:
+            notes.append(f"removed {n} -> {t} (inbound {man[p]['id']} now uses {', '.join(man[p]['names'])})")
+            continue
+        if h in LOOP and p > 0 and p not in ports and not listening(p):
+            notes.append(f"removed {n} -> {t} (nothing listens there any more)")
+            continue
+        new.append((n, t))
+    taken = dict(new)
+    for p, ib in sorted(man.items()):
+        for n in ib["names"]:
+            t = f"127.0.0.1:{p}"
+            if n in taken and taken[n] != t:
+                notes.append(f"conflict: {n} already goes to {taken[n]} - inbound {ib['id']} left as it is")
+            elif n not in taken:
+                new.append((n, t))
+                taken[n] = t
+                notes.append(f"added {n} -> {t} (inbound {ib['id']} {ib['remark']})")
+    return new, notes
+
+
+def public_ip():
+    r = subprocess.run(["ip", "-4", "route", "get", "1.1.1.1"], capture_output=True, text=True)
+    m = re.search(r"\bsrc\s+(\S+)", r.stdout)
+    return m.group(1) if m else ""
+
+
+def want_rows(c, ibs):
+    """Share links of loopback Reality inbounds must say port 443: their own
+    port only exists on loopback. Returns [(sql, params, note)]."""
+    if not has_hosts(c):
+        return []
+    todo = []
+    tpl = c.execute("select * from hosts limit 1").fetchone()
+    cols = [r[1] for r in c.execute("pragma table_info(hosts)")]
+    for ib in managed(ibs).values():
+        rs = rows(c, ib["id"])
+        for r in rs:
+            if r["port"] == ib["port"]:
+                todo.append(("update hosts set port=443 where id=?", (r["id"],),
+                             f"link {r['address']}:{r['port']} -> {r['address']}:443 (inbound {ib['id']})"))
+        if not rs and tpl:
+            ip = public_ip()
+            if not ip:
+                continue
+            row = {}
+            for k, v in zip(cols, tpl):
+                if k == "id":
+                    continue
+                row[k] = ("[]" if str(v).startswith("[") else "") if isinstance(v, str) else (0 if isinstance(v, int) else v)
+            now = int(time.time() * 1000)
+            row.update(inbound_id=ib["id"], remark=ib["remark"], address=ip, port=443, security="same",
+                       fingerprint="chrome", created_at=now, updated_at=now,
+                       group_id="".join(random.choices(string.ascii_lowercase + string.digits, k=16)))
+            row = {k: v for k, v in row.items() if k in cols}
+            todo.append(("insert into hosts (%s) values (%s)" % (",".join(row), ",".join("?" * len(row))),
+                         tuple(row.values()), f"link added: {ip}:443 (inbound {ib['id']} had none)"))
+    return todo
+
+
+def backup(path, tag):
+    os.makedirs(bdir, exist_ok=True)
+    dst = os.path.join(bdir, f"{tag}.{time.strftime('%Y%m%d-%H%M%S')}")
+    shutil.copy2(path, dst)
+    return dst
+
+
+try:
+    c = sqlite3.connect(db, timeout=10)
+    ibs = inbounds(c)
+except Exception as exc:
+    print(f"cannot read {db}: {exc}")
+    sys.exit(1)
+txt, pairs = read_pass()
+
+if action == "status":
+    if os.environ.get("REALITY_FRONT") != "1":
+        txt = None          # DNSGuard may exist here, but it is not in front of Caddy
+    new, notes = want_pass(ibs, pairs) if txt is not None else (pairs, [])
+    on = dict(pairs)
+    out = []
+    for ib in ibs:
+        if not ib["reality"]:
+            continue
+        out.append(dict(ib, local=ib["listen"] in LOOP,
+                        on443=bool(ib["names"]) and all(on.get(n) == f"127.0.0.1:{ib['port']}" for n in ib["names"]),
+                        links=[f"{r['address']}:{r['port']}" for r in rows(c, ib["id"])]))
+    print(json.dumps({"xui": True, "front": txt is not None, "inbounds": out, "pass": pairs if txt is not None else [],
+                      "in_sync": txt is None or (new == pairs and not want_rows(c, ibs)), "notes": notes}))
+    sys.exit(0)
+
+if txt is None:
+    print("no DNSGuard here - Reality on :443 needs a program on :443 that routes by name")
+    sys.exit(1)
+
+restart = set()
+if action == "on443":
+    ib = next((x for x in ibs if str(x["id"]) == arg), None)
+    if not ib or not ib["reality"]:
+        print(f"inbound {arg} is not a Reality inbound")
+        sys.exit(1)
+    if not ib["names"]:
+        print(f"inbound {arg} has no server name (SNI)")
+        sys.exit(1)
+    if ib["listen"] not in LOOP:
+        print(f"backup: {backup(db, 'x-ui.db')}")
+        c.execute("update inbounds set listen='127.0.0.1' where id=?", (ib["id"],))
+        c.commit()
+        print(f"inbound {ib['id']} {ib['remark']}: listens on 127.0.0.1:{ib['port']} now (only :443 reaches it)")
+        restart.add("x-ui")
+        ibs = inbounds(c)
+elif action not in ("sync", "check"):
+    print(f"unknown action: {action}")
+    sys.exit(1)
+
+new, notes = want_pass(ibs, pairs)
+todo = want_rows(c, ibs)
+if action == "check":
+    sys.exit(3 if (new != pairs or todo) else 0)
+
+if new != pairs:
+    print(f"backup: {backup(envp, 'dnsguard.env')}")
+    line = "SNI_PASS=" + ",".join(f"{n}={t}" for n, t in new)
+    txt = re.sub(r"^SNI_PASS=.*$", line, txt, flags=re.M) if re.search(r"^SNI_PASS=", txt, re.M) \
+        else txt.rstrip("\n") + "\n" + line + "\n"
+    with open(envp, "w") as fh:
+        fh.write(txt)
+    restart.add("dnsguard")
+for n in notes:
+    print(n)
+if todo:
+    if "x-ui" not in restart:
+        print(f"backup: {backup(db, 'x-ui.db')}")
+    for sql, params, note in todo:
+        c.execute(sql, params)
+        print(note)
+    c.commit()
+if not notes and not todo and not restart:
+    print("nothing to do - every Reality on loopback is on :443")
+for u in sorted(restart):
+    print(f"RESTART {u}")
+PY
+}
+
+cmd_reality() {
+	local action="${1:-status}"; [[ $# -gt 0 ]] && shift
+	if [[ ! -r "$XUI_DB" ]]; then
+		[[ "$action" == status ]] && { echo '{"xui": false}'; return 0; }
+		die "no x-ui database at $XUI_DB"
+	fi
+	# only where DNSGuard owns :443 and hands Caddy its names (Caddy behind it)
+	local front=0
+	if dnsguard_present && [[ -n "$(caddy_front_port)" ]]; then front=1; fi
+	case "$action" in
+		status)
+			REALITY_FRONT=$front reality_py status ;;
+		sync|on443)
+			need_root reality
+			local id="" check=0 out line rc=0
+			if [[ "$action" == on443 ]]; then
+				id="${1:-}"
+				[[ "$id" =~ ^[0-9]+$ ]] || die "usage: $SELF_NAME reality on443 <inbound id>"
+			fi
+			[[ " $* " == *" --check "* ]] && check=1
+			[[ $front -eq 1 ]] || die "Reality on :443 needs DNSGuard on :443 in front of Caddy - not the case on this server"
+			if [[ $check -eq 1 ]]; then
+				reality_py check || return $?
+				return 0
+			fi
+			out="$(reality_py "$action" $id)" || rc=$?
+			[[ $rc -eq 0 ]] || die "$out"
+			while IFS= read -r line; do
+				case "$line" in
+					"RESTART "*) ;;
+					backup:*)    dim "$line" ;;
+					conflict:*)  warn "$line" ;;
+					*)           ok "$line" ;;
+				esac
+			done <<<"$out"
+			while IFS= read -r line; do
+				[[ "$line" == "RESTART "* ]] || continue
+				if systemctl restart "${line#RESTART }" 2>/dev/null; then
+					ok "restarted ${line#RESTART }"
+				else
+					warn "could not restart ${line#RESTART } - restart it by hand"
+				fi
+			done <<<"$out"
+			;;
+		*) die "usage: $SELF_NAME reality [status|sync|on443 <inbound id>]" ;;
+	esac
 }
 
 cmd_update() {
@@ -6823,6 +7222,11 @@ ${C_B}COMMANDS${C_OFF}
   add <domain> <port|host:port> [opts]     add a domain (automatic TLS)
   del <domain> [--keep-cert|--purge-cert]  remove a domain
   del-cert <domain>                        remove only the certificate
+  reality [status]                         x-ui Reality inbounds and whether
+                                           they share :443 (needs DNSGuard)
+  reality sync                             give every Reality on loopback its
+                                           SNI_PASS line and :443 share links
+  reality on443 <inbound id>               move one Reality to loopback + sync
   cert <domain> caddy                      let Caddy issue and renew the
                                            certificate instead of certbot
   renew <domain>                           get a fresh certificate right now
@@ -6921,6 +7325,8 @@ main() {
 		cloudflare)
 			# never the token itself - only which action it was
 			[[ "${1:-status}" == status ]] || activity_begin "$cmd" "${1:-}" ;;
+		reality)
+			if [[ "${1:-status}" != status && " $* " != *" --check "* ]]; then activity_begin "$cmd" "$@"; fi ;;
 	esac
 	case "$cmd" in
 		setup)             cmd_setup "$@" ;;
@@ -6933,6 +7339,7 @@ main() {
 		cert)              cmd_cert "$@" ;;
 		renew)             cmd_renew "$@" ;;
 		cloudflare|cf)     cmd_cloudflare "$@" ;;
+		reality)           cmd_reality "$@" ;;
 		put)             cmd_put "$@" ;;
 		doctor|check)      cmd_doctor ;;
 		panel)             cmd_panel "$@" ;;
