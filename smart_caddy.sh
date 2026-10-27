@@ -3338,13 +3338,16 @@ INSTALLED = "/usr/local/bin/smart-caddy"
 def update_check():
     """Is the published build different from the installed one? Content, not
     the version string - a fixed build is often re-published under the same one."""
-    import hashlib, urllib.request
+    # curl, like 'smart-caddy update' itself: urllib was handed a stale copy
+    # by GitHub's asset CDN while curl got the current one
     try:
-        req = urllib.request.Request(UPDATE_URL, headers={"User-Agent": "smart-caddy-panel"})
-        with urllib.request.urlopen(req, timeout=25) as r:
-            new = r.read(4_000_000)
+        r = subprocess.run(["curl", "-fsSL", "--max-time", "30", UPDATE_URL],
+                           capture_output=True, timeout=40)
     except Exception as exc:
         return {"ok": False, "out": f"could not reach the release: {exc}"}
+    if r.returncode != 0:
+        return {"ok": False, "out": "could not reach the release: " + r.stderr.decode(errors="replace").strip()}
+    new = r.stdout
     if b"smart-caddy" not in new or not new.startswith(b"#!"):
         return {"ok": False, "out": "what came back is not a smart-caddy script"}
     try:
