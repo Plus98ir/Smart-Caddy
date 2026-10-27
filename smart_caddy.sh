@@ -1344,7 +1344,7 @@ cmd_add() {
 	local domain="${1:-}" target="${2:-}"
 	local host_header="" cert_mode="auto" dns_check=1
 	local paths="" insecure=0 nobuffer=0 preset="" wizard=0 strict_path=0
-	local behind_xray=0 listen_port="" replace=0 routes=() extra_file=""
+	local behind_xray=0 listen_port="" replace=0 routes=() extra_file="" site_name=""
 
 	# No arguments at all -> walk the user through it.
 	if [[ -z "$domain" ]]; then
@@ -1389,6 +1389,7 @@ cmd_add() {
 			--strict-path)  strict_path=1;         shift ;;
 			--route)        routes+=("${2:?}");    shift 2 ;;
 			--extra-file)   extra_file="${2:?}";   shift 2 ;;
+			--name)         site_name="${2-}";     shift 2 ;;
 			--replace)      replace=1;             shift ;;
 			--behind-xray)  behind_xray=1;         shift ;;
 			--listen-port)  listen_port="${2:?}";  shift 2 ;;
@@ -1415,6 +1416,8 @@ cmd_add() {
 
 	valid_domain "$domain" || die "invalid domain: $domain"
 	[[ -z "$extra_file" || -r "$extra_file" ]] || die "cannot read $extra_file"
+	# a label for people (panel link, sub, modem...): one line (the panel keeps it to 60 characters)
+	site_name="$(printf '%s' "$site_name" | tr -d '\000-\037')"
 	local tinfo tkind
 	# "none": no main backend - the extra lines (--extra-file) serve the site
 	if [[ "$target" == none ]]; then
@@ -1427,6 +1430,9 @@ cmd_add() {
        another domain, or redirect:<url>"
 	fi
 	tkind="${tinfo%% *}"; target="${tinfo#* }"
+	# a panel's base path typed as its backend would serve an empty folder
+	[[ "$preset" == panel && "$tkind" == files ]] && die "an admin panel needs its port as the backend (e.g. 2053), not '$target'
+       the panel's base path goes in --path"
 	if [[ -f "$(site_file "$domain")" && $replace -eq 0 ]]; then
 		die "$domain already exists. Remove it first: $SELF_NAME del $domain  (or pass --replace)"
 	fi
@@ -1647,6 +1653,7 @@ cmd_add() {
 	# rolls back to exactly what was there, with no moment of downtime.
 	if [[ -f "$f" ]]; then stage_edit "$f"; else stage_new "$f"; fi
 	{
+		[[ -n "$site_name" ]] && echo "# name: $site_name"
 		if [[ $behind_xray -eq 1 ]]; then
 			echo "# behind an Xray fallback: Xray terminates TLS on :443 and forwards"
 			echo "# the decrypted stream here, so this listener is plain HTTP on"
@@ -3322,6 +3329,51 @@ def parse_site(text):
     return info
 
 
+XUI_DB = "/etc/x-ui/x-ui.db"
+
+
+def xui_settings():
+    """x-ui / 3x-ui on this server, turned into what the add form needs.
+    Read-only; None when there is no x-ui here."""
+    if not os.path.isfile(XUI_DB):
+        return None
+    try:
+        import sqlite3
+        con = sqlite3.connect(f"file:{XUI_DB}?mode=ro", uri=True, timeout=3)
+        rows = dict(con.execute("select key, value from settings").fetchall())
+        con.close()
+    except Exception:
+        return None
+
+    def g(k, d=""):
+        return str(rows.get(k) or d).strip()
+
+    def backend(port, cert):
+        # x-ui with its own certificate speaks HTTPS on that port
+        return f"https://127.0.0.1:{port}" if cert else port
+
+    def slash(v, d):
+        v = "/" + (v or d).strip("/")
+        return v if v == "/" else v + "/"
+
+    web_port, web_cert = g("webPort", "2053"), g("webCertFile")
+    base = slash(g("webBasePath"), "/")
+    out = {"target": backend(web_port, web_cert), "path": base.rstrip("/"),
+           "web_port": web_port, "web_cert": bool(web_cert), "web_listen": g("webListen"),
+           "routes": [], "sub": None}
+    if g("subEnable", "true") == "true":
+        sub_port, sub_cert = g("subPort", "2096"), g("subCertFile")
+        paths = [slash(g("subPath"), "/sub/")]
+        if g("subJsonEnable") == "true":
+            paths.append(slash(g("subJsonPath"), "/json/"))
+        if sub_port != web_port:
+            out["routes"] = [{"path": sp + "*", "target": backend(sub_port, sub_cert), "kind": "web"}
+                             for sp in paths]
+        out["sub"] = {"port": sub_port, "path": paths[0], "cert": bool(sub_cert),
+                      "listen": g("subListen"), "uri": g("subURI")}
+    return out
+
+
 def read_sites():
     sites = []
     try:
@@ -3370,6 +3422,7 @@ def read_sites():
             "key_file": key_file,
             "cert_via": "cloudflare" if re.search(r"^\s*dns\s+cloudflare", text, re.M) else "",
             "imported": bool(re.search(r"^# (imported by|custom config)", text, re.M)),
+            "name": (re.search(r"^# name: (.+)$", text, re.M) or [None, ""])[1].strip(),
         })
         sites.append(info)
     return sites
@@ -3703,7 +3756,11 @@ class Handler(BaseHTTPRequestHandler):
                 "caddyfile": caddyfile_blocks(),
                 "brand": load_brand(),
                 "cloudflare": cf_state(),
+                "xui": os.path.isfile(XUI_DB),
             })
+        if path == "/api/xui":
+            x = xui_settings()
+            return self.send_json({"ok": bool(x), "xui": x})
         if path == "/api/config":
             domain = (parse_qs(urlparse(self.path).query).get("domain") or [""])[0].lower()
             if not RE_DOMAIN.match(domain):
@@ -3776,6 +3833,9 @@ class Handler(BaseHTTPRequestHandler):
         args = ["add", domain, target, "--yes", "--no-dns-check"]
         if replace:
             args.append("--replace")
+        name = re.sub(r"[\x00-\x1f\x7f]", "", str(data.get("name", ""))).strip()[:60]
+        if name:
+            args += ["--name", name]
 
         for r in (data.get("routes") or []):
             rp = str((r or {}).get("path", "")).strip()
@@ -4327,6 +4387,7 @@ html[lang=fa] .card h3{letter-spacing:0}
   gap:16px;align-items:start;padding:16px 18px}
 .site .lbl{display:block;font-size:11.5px;color:var(--dim);margin-bottom:4px}
 .dom{font-weight:600;font-size:15px;overflow-wrap:anywhere}
+.sname{font-size:12.5px;font-weight:600;color:var(--acc);margin-bottom:3px;overflow-wrap:anywhere}
 .dom a{color:inherit;text-decoration:none;border-bottom:1px solid var(--stroke-2)}
 .dom a:hover{border-color:var(--acc)}
 .cf-state{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 16px}
@@ -4415,6 +4476,7 @@ html[dir=rtl] .route .arr{transform:scaleX(-1)}
 .checks b{display:block;font-weight:600;font-size:14px}
 .checks .hint{margin:4px 0 0;font-weight:400}
 .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:18px}
+.row[hidden]{display:none}
 
 /* ---- buttons ---- */
 button{font:inherit;font-size:14px;padding:10px 18px;border-radius:var(--r-sm);border:1px solid var(--stroke);
@@ -4643,6 +4705,11 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
         <label><input type="radio" name="fkind" value="panel"><span data-t="k_panel">x-ui panel</span></label>
         <label><input type="radio" name="fkind" value="inbound"><span data-t="k_inbound">Xray config</span></label>
       </div>
+      <div class="row" id="xui-row" hidden>
+        <button type="button" class="primary" id="btn-xui" data-t="xui_fill">Fill in from x-ui on this server</button>
+        <span class="hint" style="margin:0" data-t="xui_fill_h"></span>
+      </div>
+      <div class="note" id="xui-note" hidden style="margin:14px 0 0"></div>
       <details class="howto" id="howto" open><summary data-t="howto_t">How to fill this in</summary><div id="howto-body"></div></details>
     </div>
 
@@ -4656,9 +4723,20 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
           <div class="hint" data-th="f_domain_h"></div>
         </div>
         <div>
+          <label for="f-name"><span data-t="f_name">Name</span> <span class="opt" data-t="optional">(optional)</span></label>
+          <input type="text" id="f-name" maxlength="60" list="name-list" autocomplete="off">
+          <datalist id="name-list"></datalist>
+          <div class="hint" data-t="f_name_h"></div>
+        </div>
+        <div>
           <label for="f-target" data-t="f_target">Main backend</label>
           <input type="text" id="f-target" placeholder="8088" required>
           <div class="hint" data-th="f_target_h"></div>
+        </div>
+        <div>
+          <label for="f-path"><span data-t="f_path">Path prefix</span> <span class="opt" data-t="optional">(optional)</span></label>
+          <input type="text" id="f-path" placeholder="/5wSobQvUFuNy4zBUcc">
+          <div class="hint" data-t="f_path_h"></div>
         </div>
       </div>
     </fieldset>
@@ -4685,11 +4763,6 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
             <option value="internal" data-t="cert_internal">Self-signed</option>
           </select>
           <div class="hint" data-t="f_cert_h"></div>
-        </div>
-        <div>
-          <label for="f-path"><span data-t="f_path">Path prefix</span> <span class="opt" data-t="optional">(optional)</span></label>
-          <input type="text" id="f-path" placeholder="/5wSobQvUFuNy4zBUcc">
-          <div class="hint" data-t="f_path_h"></div>
         </div>
         <div>
           <label for="f-host"><span data-t="f_host">Host header</span> <span class="opt" data-t="optional">(optional)</span></label>
@@ -4920,6 +4993,8 @@ en: {
   output:'Output',
   form_add:'Add a site', form_edit:'Edit {0}',
   f_domain:'Domain',
+  f_name:'Name', f_name_h:'A label for you, shown above the domain in the list - e.g. main panel link, subscription, modem, camera.',
+  name_ideas:'Main panel link|Subscription|Modem|Camera|Website|CDN config|DNS server',
   f_domain_h:'The address visitors type. Its A record must point at this server. Behind Cloudflare, keep the cloud <b>grey</b> until the certificate is issued, then turn it orange.',
   f_target:'Main backend',
   f_target_h:'Where requests go when no route below matches: <code>8088</code> a port on this server · <code>https://127.0.0.1:27389</code> an app that speaks HTTPS itself · <code>/var/www/site</code> serve files from a folder · <code>example.com</code> proxy another website · <code>redirect:https://x.com</code> send visitors elsewhere.',
@@ -5008,7 +5083,7 @@ en: {
   k_web:'Website or app', k_panel:'x-ui / 3x-ui panel', k_inbound:'Xray config through CDN',
   howto_t:'How to fill this in',
   howto_web:'<ol><li><b>Domain</b>: the address visitors open, e.g. <code>app.example.com</code>. Its A record points at this server.</li><li><b>Main backend</b>: the app\'s port on this server, e.g. <code>8088</code> - or a folder (<code>/var/www/site</code>), another site (<code>example.com</code>) or <code>redirect:https://x.com</code>.</li><li><b>Routes</b> only when one path has to go somewhere else, e.g. <code>/dns-query/</code> → <code>8000</code>.</li><li>Save. Caddy gets the certificate by itself.</li></ol>',
-  howto_panel:'<ol><li><b>In x-ui first</b> (Panel Settings): Listen IP <code>127.0.0.1</code>, and leave the panel\'s certificate and key fields <b>empty</b> - Caddy does HTTPS. The same on the Subscription tab.</li><li><b>Domain</b>: the panel\'s address, e.g. <code>panel.example.com</code>.</li><li><b>Main backend</b>: just the panel port, e.g. <code>2053</code>. If x-ui still has its own certificate, write <code>https://127.0.0.1:2053</code>.</li><li><b>Path prefix</b> (section 3): the panel\'s <i>Web Base Path</i>, e.g. <code>/5wSobQvUFuNy4zBUcc</code>.</li><li><b>Subscription</b>: add a route of type <b>Web / Sub</b>: path = x-ui\'s <i>Sub Path</i> (e.g. <code>/sub/</code>), backend = the sub port (e.g. <code>2096</code>). In x-ui set <i>Sub URI</i> to <code>https://panel.example.com/sub/</code>.</li><li><b>Admin panel</b> (section 4) is ticked for you. Save, then open <code>https://panel.example.com/&lt;base path&gt;/</code>.</li></ol>',
+  howto_panel:'<ol><li><b>Easiest</b>: put in the domain and press <b>Fill in from x-ui on this server</b> above - port, base path and subscription are filled in for you. The steps below are what it does.</li><li><b>In x-ui first</b> (Panel Settings): Listen IP <code>127.0.0.1</code>, and leave the panel\'s certificate and key fields <b>empty</b> - Caddy does HTTPS. The same on the Subscription tab.</li><li><b>Domain</b>: the panel\'s address, e.g. <code>panel.example.com</code>.</li><li><b>Panel port</b>: just the number, e.g. <code>2053</code> - never a path. If x-ui still has its own certificate, write <code>https://127.0.0.1:2053</code>.</li><li><b>Panel base path</b> (next to the port): the panel\'s <i>Web Base Path</i>, e.g. <code>/5wSobQvUFuNy4zBUcc</code>.</li><li><b>Subscription</b>: add a route of type <b>Web / Sub</b>: path = x-ui\'s <i>Sub Path</i> (e.g. <code>/sub/</code>), backend = the sub port (e.g. <code>2096</code>). In x-ui set <i>Sub URI</i> to <code>https://panel.example.com/sub/</code>.</li><li><b>Admin panel</b> (section 4) is ticked for you. Save, then open <code>https://panel.example.com/&lt;base path&gt;/</code>.</li></ol>',
   howto_inbound:'<ol><li><b>In x-ui</b>: an inbound with transport <b>WebSocket</b>, <b>HTTPUpgrade</b>, <b>XHTTP</b> or <b>gRPC</b>; Listen IP <code>127.0.0.1</code>; Security <code>none</code> (Caddy does TLS); a long random path, e.g. <code>/k8Jq2xVt</code> (gRPC: a service name).</li><li><b>Domain</b>: the name clients connect to. In Cloudflare its cloud is orange (grey until the certificate is issued).</li><li><b>Main backend</b>: what an ordinary visitor sees, e.g. <code>redirect:https://github.com</code> or a website port.</li><li><b>Route</b>: path = the inbound\'s path, tick the inbound\'s transport, backend = the inbound\'s port. The <code>*</code> is added for you.</li><li>In the x-ui share link: address = the domain (or a clean Cloudflare IP), port <code>443</code>, TLS on, SNI and Host = the domain.</li></ol>',
   rk_web:'Web / Sub', rk_ws:'WebSocket / HTTPUpgrade', rk_h2c:'XHTTP / gRPC',
   rh_web:'A website, an API or the x-ui subscription: path e.g. <code>/sub/</code>, backend = its port, e.g. <code>2096</code>.',
@@ -5019,6 +5094,15 @@ en: {
   sec_extra_d:'Advanced and usually empty. These lines go into the site exactly as written, e.g. <code>header -Server</code> or an <code>import</code>. When a site already has lines like that, they show up here and are kept when you save.',
   note_drop:'Saving from the form drops these parts, which it cannot show: {0}. To keep them, edit this site as code.',
   open_code:'Edit as code',
+  xui_fill:'Fill in from x-ui on this server', xui_fill_h:'Reads the panel port, base path and subscription from x-ui - nothing to type.',
+  xui_none:'No x-ui found on this server (/etc/x-ui/x-ui.db).',
+  xui_done:'Filled in from x-ui: panel on port <b>{0}</b>, base path <code>{1}</code>{2}. Check the domain and save.',
+  xui_done_sub:', subscription <code>{0}</code> → port <b>{1}</b>',
+  xui_uri:'In x-ui → Settings → Subscription, set <b>Sub URI</b> to <code>{0}</code> (now: <code>{1}</code>) - otherwise the links x-ui hands out point to the wrong place.',
+  xui_listen:'Tip: in x-ui set <b>Listen IP</b> to <code>127.0.0.1</code> for the panel and the subscription, so they are reachable only through this domain.',
+  t_panel:'Panel port', t_inbound:'What an ordinary visitor sees',
+  p_panel:'Panel base path (Web Base Path)',
+  err_panel_path:'The main backend of a panel is its port, e.g. 2053 - a path like {0} goes in the base path field. It was moved there; enter the port.',
   f_routes_types:'Route type: <b>HTTP / WS / HTTPUpgrade</b> for websites, WebSocket and HTTPUpgrade inbounds · <b>XHTTP / gRPC (h2c)</b> for Xray XHTTP and gRPC inbounds - Caddy talks cleartext HTTP/2 to them and streams without buffering. The inbound itself listens on <code>127.0.0.1</code> with security <code>none</code>; Caddy does the TLS.',
   diag_empty:'Nothing yet. Run diagnostics, or take an action anywhere in the panel - its output lands here.',
   g_title:'Hide your server behind Cloudflare',
@@ -5063,6 +5147,8 @@ fa: {
   output:'خروجی',
   form_add:'افزودن سایت', form_edit:'ویرایش {0}',
   f_domain:'دامنه',
+  f_name:'نام', f_name_h:'یک اسم برای خودتان که در لیست بالای دامنه نشان داده می‌شود؛ مثلاً لینک اصلی پنل، ساب، مودم، دوربین.',
+  name_ideas:'لینک اصلی پنل|ساب|مودم|دوربین|سایت|کانفیگ CDN|سرور DNS',
   f_domain_h:'آدرسی که کاربر در مرورگر می‌زند. رکورد A آن باید به IP همین سرور اشاره کند. اگر پشت Cloudflare است، تا وقتی گواهی صادر نشده ابر را <b>خاکستری</b> نگه دارید و بعد نارنجی کنید.',
   f_target:'مقصد اصلی',
   f_target_h:'درخواست‌هایی که با هیچ‌کدام از مسیرهای پایین جور نیستند به اینجا می‌روند: <code>8088</code> یک پورت روی همین سرور · <code>https://127.0.0.1:27389</code> برنامه‌ای که خودش HTTPS دارد · <code>/var/www/site</code> نمایش فایل‌های یک پوشه · <code>example.com</code> پروکسی به یک سایت دیگر · <code>redirect:https://x.com</code> فرستادن بازدیدکننده به جای دیگر.',
@@ -5151,7 +5237,7 @@ fa: {
   k_web:'سایت یا برنامه', k_panel:'پنل x-ui / 3x-ui', k_inbound:'کانفیگ Xray از طریق CDN',
   howto_t:'راهنمای پر کردن فرم',
   howto_web:'<ol><li><b>دامنه</b>: آدرسی که کاربر باز می‌کند، مثلاً <code>app.example.com</code>. رکورد A آن باید به IP همین سرور اشاره کند.</li><li><b>مقصد اصلی</b>: پورت برنامه روی همین سرور، مثلاً <code>8088</code>؛ یا یک پوشه (<code>/var/www/site</code>)، یک سایت دیگر (<code>example.com</code>) یا <code>redirect:https://x.com</code>.</li><li><b>مسیرها</b> فقط وقتی لازم است که یک مسیر باید جای دیگری برود، مثلاً <code>/dns-query/</code> ← <code>8000</code>.</li><li>ذخیره کنید. گواهی را Caddy خودش می‌گیرد.</li></ol>',
-  howto_panel:'<ol><li><b>اول در x-ui</b> (تنظیمات پنل): Listen IP را <code>127.0.0.1</code> بگذارید و فیلدهای مسیر گواهی و کلید پنل را <b>خالی</b> کنید؛ HTTPS را Caddy می‌دهد. در تب Subscription هم همین کار را بکنید.</li><li><b>دامنه</b>: آدرس پنل، مثلاً <code>panel.example.com</code>.</li><li><b>مقصد اصلی</b>: فقط پورت پنل، مثلاً <code>2053</code>. اگر x-ui هنوز گواهی خودش را دارد بنویسید <code>https://127.0.0.1:2053</code>.</li><li><b>پیشوند مسیر</b> (بخش ۳): همان <i>Web Base Path</i> پنل، مثلاً <code>/5wSobQvUFuNy4zBUcc</code>.</li><li><b>ساب</b>: یک مسیر با نوع <b>وب / ساب</b> اضافه کنید: مسیر = <i>Sub Path</i> در x-ui (مثلاً <code>/sub/</code>)، مقصد = پورت ساب (مثلاً <code>2096</code>). در x-ui مقدار <i>Sub URI</i> را <code>https://panel.example.com/sub/</code> بگذارید.</li><li>تیک <b>پنل مدیریتی</b> (بخش ۴) خودکار زده شده است. ذخیره کنید و <code>https://panel.example.com/&lt;مسیر پایه&gt;/</code> را باز کنید.</li></ol>',
+  howto_panel:'<ol><li><b>ساده‌ترین راه</b>: دامنه را بنویسید و دکمهٔ <b>پر کردن خودکار از x-ui همین سرور</b> را بالا بزنید؛ پورت، مسیر پایه و ساب خودکار پر می‌شوند. قدم‌های زیر همان کاری است که این دکمه انجام می‌دهد.</li><li><b>اول در x-ui</b> (تنظیمات پنل): Listen IP را <code>127.0.0.1</code> بگذارید و فیلدهای مسیر گواهی و کلید پنل را <b>خالی</b> کنید؛ HTTPS را Caddy می‌دهد. در تب Subscription هم همین کار را بکنید.</li><li><b>دامنه</b>: آدرس پنل، مثلاً <code>panel.example.com</code>.</li><li><b>پورت پنل</b>: فقط عدد، مثلاً <code>2053</code>؛ هیچ‌وقت مسیر ننویسید. اگر x-ui هنوز گواهی خودش را دارد بنویسید <code>https://127.0.0.1:2053</code>.</li><li><b>مسیر پایهٔ پنل</b> (کنار پورت): همان <i>Web Base Path</i> پنل، مثلاً <code>/5wSobQvUFuNy4zBUcc</code>.</li><li><b>ساب</b>: یک مسیر با نوع <b>وب / ساب</b> اضافه کنید: مسیر = <i>Sub Path</i> در x-ui (مثلاً <code>/sub/</code>)، مقصد = پورت ساب (مثلاً <code>2096</code>). در x-ui مقدار <i>Sub URI</i> را <code>https://panel.example.com/sub/</code> بگذارید.</li><li>تیک <b>پنل مدیریتی</b> (بخش ۴) خودکار زده شده است. ذخیره کنید و <code>https://panel.example.com/&lt;مسیر پایه&gt;/</code> را باز کنید.</li></ol>',
   howto_inbound:'<ol><li><b>در x-ui</b>: یک اینباند با transport <b>WebSocket</b>، <b>HTTPUpgrade</b>، <b>XHTTP</b> یا <b>gRPC</b> بسازید؛ Listen IP <code>127.0.0.1</code>؛ Security <code>none</code> (TLS را Caddy انجام می‌دهد)؛ یک path طولانی و تصادفی مثل <code>/k8Jq2xVt</code> (در gRPC: یک service name).</li><li><b>دامنه</b>: اسمی که کلاینت به آن وصل می‌شود. در Cloudflare ابرش نارنجی باشد (تا صدور گواهی خاکستری).</li><li><b>مقصد اصلی</b>: چیزی که بازدیدکنندهٔ معمولی می‌بیند، مثلاً <code>redirect:https://github.com</code> یا پورت یک سایت.</li><li><b>مسیر</b>: مسیر = path اینباند، تیک نوع transport اینباند را بزنید، مقصد = پورت اینباند. علامت <code>*</code> خودکار اضافه می‌شود.</li><li>در لینک اشتراک x-ui: address = دامنه (یا یک IP تمیز Cloudflare)، پورت <code>443</code>، TLS روشن، SNI و Host = دامنه.</li></ol>',
   rk_web:'وب / ساب', rk_ws:'WebSocket / HTTPUpgrade', rk_h2c:'XHTTP / gRPC',
   rh_web:'سایت، API یا ساب x-ui: مسیر مثلاً <code>/sub/</code>، مقصد = پورت آن، مثلاً <code>2096</code>.',
@@ -5162,6 +5248,15 @@ fa: {
   sec_extra_d:'پیشرفته و معمولاً خالی. این خطوط دقیقاً همان‌طور که نوشته شده‌اند داخل سایت قرار می‌گیرند، مثلاً <code>header -Server</code> یا یک <code>import</code>. اگر سایتی از قبل چنین خطوطی دارد اینجا نشان داده می‌شوند و موقع ذخیره حفظ می‌شوند.',
   note_drop:'ذخیره از فرم این بخش‌ها را که فرم نمی‌تواند نشان دهد حذف می‌کند: {0}. برای حفظ آن‌ها، این سایت را به‌صورت کد ویرایش کنید.',
   open_code:'ویرایش به‌صورت کد',
+  xui_fill:'پر کردن خودکار از x-ui همین سرور', xui_fill_h:'پورت پنل، مسیر پایه و ساب را از x-ui می‌خواند؛ لازم نیست چیزی تایپ کنید.',
+  xui_none:'روی این سرور x-ui پیدا نشد (/etc/x-ui/x-ui.db).',
+  xui_done:'از x-ui پر شد: پنل روی پورت <b>{0}</b>، مسیر پایه <code>{1}</code>{2}. دامنه را چک کنید و ذخیره بزنید.',
+  xui_done_sub:'، ساب <code>{0}</code> ← پورت <b>{1}</b>',
+  xui_uri:'در x-ui ← تنظیمات ← Subscription مقدار <b>Sub URI</b> را <code>{0}</code> بگذارید (الان: <code>{1}</code>)؛ وگرنه لینک‌هایی که x-ui می‌دهد به جای اشتباه می‌روند.',
+  xui_listen:'پیشنهاد: در x-ui مقدار <b>Listen IP</b> پنل و ساب را <code>127.0.0.1</code> بگذارید تا فقط از طریق همین دامنه در دسترس باشند.',
+  t_panel:'پورت پنل', t_inbound:'چیزی که بازدیدکنندهٔ معمولی می‌بیند',
+  p_panel:'مسیر پایهٔ پنل (Web Base Path)',
+  err_panel_path:'مقصد اصلی پنل، پورت آن است (مثلاً 2053)؛ مسیری مثل {0} باید در فیلد مسیر پایه باشد. به آنجا منتقل شد؛ پورت را وارد کنید.',
   f_routes_types:'نوع مسیر: <b>HTTP / WS / HTTPUpgrade</b> برای سایت‌ها و اینباندهای WebSocket و HTTPUpgrade · <b>XHTTP / gRPC (h2c)</b> برای اینباندهای XHTTP و gRPC در Xray؛ Caddy با HTTP/2 بدون رمز به آن‌ها وصل می‌شود و بدون بافر استریم می‌کند. خود اینباند روی <code>127.0.0.1</code> با security <code>none</code> گوش می‌دهد و TLS را Caddy انجام می‌دهد.',
   diag_empty:'هنوز چیزی نیست. عیب‌یابی را اجرا کنید یا هر کاری در پنل انجام دهید؛ خروجی‌اش اینجا می‌آید.',
   g_title:'سرور را پشت Cloudflare مخفی کنید',
@@ -5407,6 +5502,7 @@ function render(d){
   renderCf(d.cloudflare);
 
   SITES = d.sites;
+  kindTexts();      // the x-ui button needs to know whether x-ui is here
   $('#b-sites').textContent = d.sites.length;
   if (!d.sites.length){
     const any = (d.caddyfile || []).some(b => b.importable);
@@ -5428,12 +5524,13 @@ function render(d){
     if (!s.form_ok)      notes += '<span class="tag warn">' + esc(t('tag_custom')) + '</span>';
     else if (s.custom)   notes += '<span class="tag">' + esc(t('tag_custom')) + '</span>';
     else if (s.imported) notes += '<span class="tag">' + esc(t('tag_imported')) + '</span>';
-    let backend = '<code>' + esc(s.target) + '</code>';
+    let backend = s.target ? '<code>' + esc(s.target) + '</code>' : '<span class="tag">' + esc(t('sec_extra')) + '</span>';
     for (const r of s.routes)
       backend += '<div class="rt ltr"><code>' + esc(r.path) + '</code> → <code>' + esc(r.target) + '</code>'
               +  (/^h2c:\/\//.test(r.target) ? ' <span class="tag cdn">XHTTP / gRPC</span>' : '') + '</div>';
     h += '<div class="site glass">'
       +  '<div><span class="lbl">' + esc(t('th_domain')) + '</span>'
+      +  (s.name ? '<div class="sname">' + esc(s.name) + '</div>' : '')
       +  '<div class="dom"><a class="ltr" href="' + esc(url) + '" target="_blank" rel="noopener">' + esc(s.domain) + '</a></div></div>'
       +  '<div><span class="lbl">' + esc(t('th_backend')) + '</span>' + backend + '</div>'
       +  '<div><span class="lbl">' + esc(t('th_notes')) + '</span>' + notes + '</div>'
@@ -5729,6 +5826,11 @@ function siteKind(){ return ($('#f-kind input:checked') || {}).value || 'web'; }
 function kindTexts(){
   const k = siteKind();
   $('#howto-body').innerHTML = t('howto_' + k);
+  // the field names say what goes in them for this kind of site
+  $('label[for="f-target"]').textContent = t({panel: 't_panel', inbound: 't_inbound'}[k] || 'f_target');
+  $('label[for="f-path"] span[data-t]').textContent = t(k === 'panel' ? 'p_panel' : 'f_path');
+  $('#xui-row').hidden = !(k === 'panel' && STATE && STATE.xui);
+  if (k !== 'panel') $('#xui-note').hidden = true;
   $('#f-target').placeholder = {web: '8088', panel: '2053', inbound: 'redirect:https://github.com'}[k];
 }
 function setKind(k, apply){
@@ -5740,6 +5842,33 @@ function setKind(k, apply){
   kindTexts();
 }
 document.querySelectorAll('#f-kind input').forEach(i => i.onchange = () => setKind(i.value, true));
+
+// x-ui's own settings -> panel port, base path and subscription route(s)
+$('#btn-xui').onclick = async () => {
+  const r = await api('/api/xui');
+  if (!r.ok){ toast(t('xui_none'), true); return; }
+  const x = r.xui;
+  $('#f-target').value = x.target;
+  $('#f-path').value = x.path;
+  $('#f-panel').checked = true;
+  const want = new Set(x.routes.map(r => r.path));
+  document.querySelectorAll('#routes .route').forEach(row => {
+    if (want.has(normPath(row.querySelector('.r-path').value))) row.remove();
+  });
+  for (const rt of x.routes) addRouteRow(rt.path, rt.target, 'web');
+  syncRoutes();
+  const dom = $('#f-domain').value.trim() || 'your-domain';
+  let h = t('xui_done', esc(x.web_port), esc(x.path || '/'),
+            x.sub && x.routes.length ? t('xui_done_sub', esc(x.sub.path), esc(x.sub.port)) : '');
+  if (x.sub){
+    const uri = 'https://' + dom + x.sub.path;
+    if (x.sub.uri.replace(/\/?$/, '/') !== uri) h += '<br>' + t('xui_uri', esc(uri), esc(x.sub.uri || '-'));
+  }
+  if ((x.web_listen || '') !== '127.0.0.1' || (x.sub && (x.sub.listen || '') !== '127.0.0.1')) h += '<br>' + t('xui_listen');
+  $('#xui-note').innerHTML = h;
+  $('#xui-note').hidden = false;
+  $('#f-domain').readOnly ? $('#f-target').focus() : $('#f-domain').focus();
+};
 
 // with extra lines the site may do without a main backend
 function syncExtra(){ $('#f-target').required = !$('#f-extra').value.trim(); }
@@ -5753,6 +5882,7 @@ function formTexts(){
   $('#btn-add').textContent = t(EDITING ? 'btn_save' : 'btn_add');
   document.querySelectorAll('#routes .route').forEach(routeTexts);
   if (EDITING && EDITING.imported) $('#edit-note').innerHTML = t('note_imported');
+  $('#name-list').innerHTML = t('name_ideas').split('|').map(n => '<option value="' + esc(n) + '">').join('');
   if (EDITING && EDITING.unknown && EDITING.unknown.length)
     $('#drop-text').innerHTML = t('note_drop', EDITING.unknown.map(u => '<code>' + esc(u) + '</code>').join(', '));
   kindTexts();
@@ -5761,6 +5891,7 @@ function formTexts(){
 function startEdit(s){
   EDITING = s;
   $('#f-domain').value  = s.domain;
+  $('#f-name').value    = s.name || '';
   $('#f-target').value  = s.target;
   $('#f-path').value    = s.paths.length ? s.paths[0] : '';
   $('#f-host').value    = s.host_header || '';
@@ -5828,8 +5959,18 @@ $('#edit-dlg').addEventListener('close', () => { if (EDITING) stopEdit(); });
 $('#add').onsubmit = async e => {
   e.preventDefault();
   if (busy) return;
+  // the commonest slip: the panel's base path typed as its backend
+  const tv = $('#f-target').value.trim();
+  if ($('#f-panel').checked && tv.startsWith('/')){
+    if (!$('#f-path').value.trim()) $('#f-path').value = tv;
+    $('#f-target').value = '';
+    toast(t('err_panel_path', tv), true);
+    $('#f-target').focus();
+    return;
+  }
   const body = {
     domain: $('#f-domain').value.trim(),
+    name: $('#f-name').value.trim(),
     target: $('#f-target').value.trim(),
     routes: readRoutes(),
     paths: $('#f-path').value.trim() ? [$('#f-path').value.trim()] : [],
@@ -6603,6 +6744,7 @@ ${C_B}COMMANDS${C_OFF}
   uninstall                                remove integration (certs kept)
 
 ${C_B}ADD OPTIONS${C_OFF}
+  --name <text>        a label shown in the panel, e.g. "Main panel" or "Modem"
   --path <prefix>      record the app's base path (shown in 'list'); repeatable
   --route <p>=<backend> send one path to another backend, e.g.
                        --route '/dns-query/*=8000'; repeatable. The main
