@@ -410,6 +410,7 @@ apply() {
 
 	# a new bind address needs HTTP/3 off too when UDP 443 is taken
 	ensure_h3_off
+	ensure_real_ip quiet
 
 	# the running Caddy gets the Cloudflare token from systemd; validate needs it too
 	if ! caddy_validate >"$log" 2>&1; then
@@ -791,6 +792,7 @@ cmd_install() {
 		ACME_EMAIL=$(grep -oP '^\s*email\s+\K\S+' "$CADDYFILE" | head -1 || true)
 	fi
 	ensure_h3_off
+	ensure_real_ip
 
 	hdr "5/9  File permissions"
 	fix_perms
@@ -1223,6 +1225,120 @@ ensure_h3_off() {
 	return 0
 }
 
+# =============================================================================
+#  Real visitor IP behind Cloudflare
+#
+#  For CDN traffic {remote_host} is a Cloudflare edge, and Xray's gRPC
+#  transport (it trusts X-Real-IP) logged those as client IPs. Every public
+#  listener trusts Cloudflare's ranges and reads CF-Connecting-IP from them
+#  only, so {client_ip} is the visitor and a direct client cannot spoof it.
+#  Site files from older versions are brought up to date here as well.
+# =============================================================================
+
+CF_RANGES="173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32"
+
+# real_ip_fix <global|site> <file> - print the updated text (unchanged if nothing to do)
+real_ip_fix() {
+	python3 - "$1" "$2" "$CF_RANGES" <<'PY'
+import re, sys
+kind, path, cf = sys.argv[1], sys.argv[2], sys.argv[3]
+lines = open(path).read().split("\n")
+CF = ["# Cloudflare edges: take the real visitor IP from CF-Connecting-IP",
+      "trusted_proxies static " + cf, "client_ip_headers CF-Connecting-IP"]
+
+def depth(s):
+    s = re.sub(r'"[^"]*"', "", s.split("#", 1)[0])
+    return s.count("{") - s.count("}")
+
+if kind == "global":
+    # the global options block is the first top-level "{" line
+    start = next((i for i, l in enumerate(lines) if l.strip() == "{"), None)
+    if start is None or any(l.strip() and not l.lstrip().startswith("#") for l in lines[:start]):
+        lines = ["{", "}", ""] + lines
+        start = 0
+    d, end, blocks = 1, None, []
+    i = start + 1
+    while i < len(lines):
+        m = re.match(r"\s*servers(\s+(\S+))?\s*\{\s*$", lines[i])
+        if d == 1 and m:
+            bd, j = 1, i + 1
+            while j < len(lines) and bd > 0:
+                bd += depth(lines[j]); j += 1
+            blocks.append((i, j - 1, m.group(2) or ""))
+            i = j; continue
+        d += depth(lines[i])
+        if d <= 0:
+            end = i; break
+        i += 1
+    if end is None:
+        print("\n".join(lines), end=""); sys.exit(0)
+    # bottom-up, so earlier indexes stay valid
+    if not any(addr == "" for _, _, addr in blocks):
+        # catch-all for every other listener; it has to be the last servers block
+        lines[end:end] = ["\tservers {"] + ["\t\t" + c for c in CF] + ["\t}"]
+    for a, b, addr in reversed(blocks):
+        if addr.startswith(("127.", "localhost", "[::1]")):
+            continue          # loopback (behind Xray): the visitor comes in via PROXY protocol
+        body = "\n".join(lines[a:b])
+        if "trusted_proxies" in body or "client_ip_headers" in body:
+            continue          # someone decided already
+        lines[b:b] = ["\t\t" + c for c in CF]
+    print("\n".join(lines), end="")
+    sys.exit(0)
+
+# site file
+out = []
+for l in lines:
+    if re.match(r"\s*header_up\s+X-Forwarded-Port\s+\{server_port\}\s*$", l):
+        continue              # not a Caddy placeholder - it went out literally
+    out.append(l.replace("header_up X-Real-IP {remote_host}", "header_up X-Real-IP {client_ip}"))
+lines, out = out, []
+for i, l in enumerate(lines):
+    out.append(l)
+    m = re.match(r"(\s*)header_up\s+X-Real-IP\s+\{client_ip\}\s*$", l)
+    if not m:
+        continue
+    # same reverse_proxy block: up to its closing brace
+    j, d, has = i + 1, 1, False
+    while j < len(lines) and d > 0:
+        if re.match(r"\s*header_up\s+X-Forwarded-For\b", lines[j]): has = True
+        d += depth(lines[j]); j += 1
+    k = i - 1
+    while k >= 0 and not re.match(r"\s*reverse_proxy\b", lines[k]):
+        if re.match(r"\s*header_up\s+X-Forwarded-For\b", lines[k]): has = True
+        k -= 1
+    if not has:
+        out.append(m.group(1) + "header_up X-Forwarded-For {client_ip}")
+print("\n".join(out), end="")
+PY
+}
+
+# ensure_real_ip [quiet] - sets REALIP_CHANGED=1 when a file was edited
+REALIP_CHANGED=0
+ensure_real_ip() {
+	REALIP_CHANGED=0
+	[[ -f "$CADDYFILE" ]] && have python3 || return 0
+	local quiet="${1:-}" f kind tmp n=0
+	for f in "$CADDYFILE" "$SITES_DIR"/*.caddy; do
+		[[ -f "$f" ]] || continue
+		kind=site; [[ "$f" == "$CADDYFILE" ]] && kind=global
+		tmp="$(mktemp)"
+		# split/join keeps the text byte for byte when nothing needs changing
+		if ! real_ip_fix "$kind" "$f" > "$tmp" 2>/dev/null || [[ ! -s "$tmp" ]] \
+		   || cmp -s "$f" "$tmp"; then
+			rm -f "$tmp"; continue
+		fi
+		[[ " ${_rb_old[*]:-} " == *" $f|"* ]] || stage_edit "$f"
+		write_inplace "$f" "$tmp"
+		n=$((n+1))
+	done
+	if [[ $n -gt 0 ]]; then
+		REALIP_CHANGED=1
+		[[ -n "$quiet" ]] || ok "real visitor IP behind Cloudflare: $n file(s) updated"
+	fi
+	return 0
+}
+
 cmd_add() {
 	need_root add
 	local domain="${1:-}" target="${2:-}"
@@ -1453,9 +1569,11 @@ cmd_add() {
 			printf '%s\t}\n'               "$ind"
 		fi
 		printf '%s\theader_up Host %s\n'               "$ind" "$hh"
-		printf '%s\theader_up X-Real-IP {remote_host}\n'      "$ind"
+		# {client_ip} = the visitor, also behind Cloudflare (see ensure_real_ip).
+		# Both headers carry it: 3x-ui ignores them when they disagree.
+		printf '%s\theader_up X-Real-IP {client_ip}\n'        "$ind"
+		printf '%s\theader_up X-Forwarded-For {client_ip}\n'  "$ind"
 		printf '%s\theader_up X-Forwarded-Proto {scheme}\n'   "$ind"
-		printf '%s\theader_up X-Forwarded-Port {server_port}\n' "$ind"
 		if [[ "$target" == h2c://* ]]; then
 			# Xray XHTTP/gRPC: a long-lived stream, never hold it in a buffer
 			printf '%s\tflush_interval -1\n' "$ind"
@@ -2158,6 +2276,18 @@ cmd_repair() {
 	elif h3_must_be_off; then
 		ok "HTTP/3 already off - UDP 443 stays free for other programs"
 	fi
+	ensure_real_ip
+	if [[ $REALIP_CHANGED -eq 1 ]]; then
+		if caddy_validate >/dev/null 2>&1; then
+			clear_stage
+			systemctl reload caddy 2>/dev/null && ok "Caddy reloaded" \
+				|| { warn "Caddy did not reload:"; last_caddy_error | sed 's/^/       /'; }
+		else
+			rollback; warn "Caddy rejected the real-IP change - files restored"
+		fi
+	else
+		ok "real visitor IP behind Cloudflare already set up"
+	fi
 
 	hdr "Repairing the panel service"
 	if [[ -f "$UI_UNIT" && ! -f /etc/smart-caddy-panel.json ]]; then
@@ -2338,6 +2468,20 @@ cmd_doctor() {
 		[[ $need -eq 0 ]] || dim "fix: $SELF_NAME repair   (Caddy may fail to start after a reboot)"
 	else
 		ok "no other program on UDP 443 - Caddy may serve HTTP/3"
+	fi
+
+	hdr "5c Real visitor IP behind Cloudflare"
+	local rip_old
+	rip_old="$(grep -lE 'X-Real-IP \{remote_host\}|X-Forwarded-Port \{server_port\}' "$SITES_DIR"/*.caddy 2>/dev/null \
+		| xargs -r -n1 basename | tr '\n' ' ' || true)"
+	if ! grep -q 'client_ip_headers' "$CADDYFILE" 2>/dev/null; then
+		warn "Caddy does not read CF-Connecting-IP - CDN traffic shows Cloudflare's IPs"
+		dim "fix: $SELF_NAME repair"
+	elif [[ -n "$rip_old" ]]; then
+		warn "old proxy headers in: $rip_old"
+		dim "fix: $SELF_NAME repair"
+	else
+		ok "Cloudflare edges trusted, sites send {client_ip}"
 	fi
 
 	local cfs; cfs="$(cf_sites | tr '\n' ' ')"
@@ -6082,7 +6226,8 @@ cmd_panel() {
 			echo -e "\t# The panel handles its own login and sessions."
 			echo -e "\treverse_proxy 127.0.0.1:${port} {"
 			echo -e "\t\theader_up Host {host}"
-			echo -e "\t\theader_up X-Real-IP {remote_host}"
+			echo -e "\t\theader_up X-Real-IP {client_ip}"
+			echo -e "\t\theader_up X-Forwarded-For {client_ip}"
 			echo -e "\t\theader_up X-Forwarded-Proto https"
 			echo -e "\t}"
 			echo "}"
@@ -6119,7 +6264,8 @@ cmd_panel() {
 		echo -e "\t# The panel handles its own login and sessions."
 		echo -e "\treverse_proxy 127.0.0.1:${port} {"
 		echo -e "\t\theader_up Host {host}"
-		echo -e "\t\theader_up X-Real-IP {remote_host}"
+		echo -e "\t\theader_up X-Real-IP {client_ip}"
+		echo -e "\t\theader_up X-Forwarded-For {client_ip}"
 		echo -e "\t\theader_up X-Forwarded-Proto {scheme}"
 		echo -e "\t}"
 		echo "}"
