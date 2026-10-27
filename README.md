@@ -103,6 +103,9 @@ sudo smart-caddy update
 | **Certificates on autopilot** | Caddy issues and renews every certificate itself; the panel shows days left and has a one-click **Renew** that puts the old cert back if anything fails |
 | **Adopts your existing Caddy** | finds sites you wrote straight into the Caddyfile and imports them unchanged, so they show up in the panel |
 | **Path routes** | send `/dns-query/*` or `/api/*` to a different backend than the rest of the site |
+| **Reality on `:443`** | x-ui Reality inbounds share `:443` with your sites and are kept in step every minute - through DNSGuard, or **Caddy's own SNI router** (caddy-l4) on servers without it |
+| **Real visitor IP behind Cloudflare** | Cloudflare's edges are trusted and `CF-Connecting-IP` is read from them only, so apps and Xray log the visitor, not Cloudflare |
+| **Updates from the panel** | Settings → Update checks the latest release by content and installs it; sites stay up |
 | **Xray configs behind Cloudflare** | route a secret path to an XHTTP / gRPC (`h2c://`) or WebSocket / HTTPUpgrade inbound, so the orange cloud hides the server's IP; the panel has a step-by-step guide |
 | **Server identity** | give each server a name, an icon (flags work) and a colour: shown in the browser tab, favicon, header and sign-in page, so several panels never get mixed up |
 | **Activity log** | every change, from the panel or the terminal: who, when, the output, and a diff of exactly which config lines changed |
@@ -133,9 +136,12 @@ organised in tabs, each with a title and a short explanation:
   actions.
 - **Sites** — every site with its backend, routes, and **how many days of SSL are
   left**, coloured as expiry gets close, with a **Renew** button.
-- **Add / Edit site** — one form in four numbered steps, with an explanation under
-  every field: main backend, **path routes** (each with a type:
-  *HTTP / WS / HTTPUpgrade* or *XHTTP / gRPC (h2c)*), SSL certificate (Caddy,
+- **Add / Edit site** — first *what are you putting online?* (a website, an x-ui
+  panel, an Xray config through a CDN) with a step-by-step guide and **Fill in from
+  x-ui** (panel port, base path and subscription read from x-ui); then one form with
+  an explanation under every field: a **name** for the site, main backend, **path
+  routes** (each with a ticked type: *Web / Sub*, *WebSocket / HTTPUpgrade* or
+  *XHTTP / gRPC*; the leading `/` and trailing `*` are added for you), SSL certificate (Caddy,
   existing certbot, or self-signed), path prefix, Host header, admin-panel preset,
   plain HTTP, behind Xray.
 - **Config** — edit any site's raw Caddyfile text. It is validated first and rolled
@@ -146,7 +152,11 @@ organised in tabs, each with a title and a short explanation:
   steps in x-ui, here and in Cloudflare.
 - **Diagnostics** and **Activity** — the full check, the output of every action,
   and each change with a coloured diff of the config files it touched.
-- **Settings** — the server's identity: a name, an icon and an accent colour, shown
+- **Reality** — every x-ui Reality inbound, whether it is on `:443`, its share links,
+  **Put on :443**, and on a server without DNSGuard the switch for Caddy's own SNI
+  router. See [Reality on :443](#reality-on-443).
+- **Settings** — **Update** (check the latest release and install it from the page)
+  and the server's identity: a name, an icon and an accent colour, shown
   in the browser tab, favicon, header and sign-in page. Stored in
   `/etc/smart-caddy-brand.json`, untouched by updates.
 
@@ -194,6 +204,9 @@ passwd [user] [--password <p>]           change the panel password
 doctor                                   full diagnostic
 fixbind                                  add 'bind' to blocks missing it
 repair                                   fix permissions and known upgrade issues
+update [--force]                         install the latest release (also in the panel)
+reality [status|sync|on443 <id>]         x-ui Reality inbounds on :443
+sni [status|enable|disable]              Caddy's own SNI router (caddy-l4)
 uninstall                                remove integration (certs kept)
 ```
 
@@ -461,11 +474,46 @@ pauses for a few seconds); for anything else it tells you which name to forward.
 
 ### What does not work
 
-Putting a stock Caddy in front of Xray on `:443`. Caddy is an HTTP server: it
-terminates TLS and expects HTTP, and VLESS/Reality is neither. (A WebSocket or
-xHTTP inbound *is* HTTP, so Caddy can front those.) For real SNI routing with Caddy
-in front you need the `caddy-l4` plugin and an `xcaddy` build; Xray already does it
-with nothing extra.
+Putting a *stock* Caddy in front of Reality on `:443`: an HTTP server terminates TLS
+and expects HTTP, and VLESS/Reality is neither. With the caddy-l4 module it works -
+see [Reality on :443](#reality-on-443).
+
+## Reality on :443
+
+An x-ui Reality inbound normally needs a port of its own, because Caddy holds
+`:443`. Smart Caddy can put it on `:443` next to your sites: something on `:443`
+reads only the SNI (the name in the TLS hello, without decrypting anything) and
+hands a Reality name, untouched, to the inbound on loopback, and every other name
+to Caddy.
+
+That "something" is one of two routers:
+
+- **DNSGuard**, when it already owns `:443` in front of Caddy - the names go into
+  its `SNI_PASS`.
+- **Caddy's own SNI router**, on any other server: `smart-caddy sni enable` (or the
+  **Turn it on** button on the panel's Reality tab) adds the
+  [caddy-l4](https://github.com/mholt/caddy-l4) module, moves the sites to
+  `127.0.0.1:8444` / `:8081` and lets Caddy route `:443` and `:80` by name. The
+  sites keep their addresses and certificates, and still see the visitor's IP
+  (PROXY protocol). One process, nothing else to install; the `caddy` package is
+  held so an apt upgrade cannot drop the module.
+
+Then it keeps itself in step: in x-ui make a Reality inbound with **Listen IP**
+`127.0.0.1`, any free port, and its own **SNI**. Within a minute the panel gives that
+SNI its route and points the share link at port `443`; change the SNI or delete the
+inbound and the route follows. Several Realities work side by side, one SNI each.
+
+```bash
+sudo smart-caddy sni enable        # only where Caddy holds :443 itself
+sudo smart-caddy reality           # every Reality inbound, on :443 or not
+sudo smart-caddy reality on443 8   # move inbound 8 to 127.0.0.1 and onto :443
+sudo smart-caddy reality sync      # what the panel does every minute
+```
+
+Pick an SNI that is not one of your own sites, not blocked where your users are,
+and not used by another Reality. A big foreign site on your own IP is a known
+detection signal; a subdomain of your own (with Reality's target pointing at Caddy)
+avoids it.
 
 ## DNS
 
