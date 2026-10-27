@@ -20,7 +20,7 @@
 # =============================================================================
 set -euo pipefail
 
-VERSION="1.6.1"
+VERSION="1.7.0"
 SELF_NAME="smart-caddy"
 CONF_FILE="/etc/smart-caddy.conf"
 
@@ -268,6 +268,7 @@ dnsguard_add_name() {
 front_register() {
 	local d="$1" fp; fp="$(caddy_front_port)"
 	[[ -n "$fp" ]] || return 0
+	if sni_mode_on; then ok "Caddy's SNI router hands $d to the site"; return 0; fi
 	if dnsguard_present; then
 		dnsguard_covers "$d" && { ok "DNSGuard already hands $d to Caddy"; return 0; }
 		info "DNSGuard owns :80/:443 and only hands over the names it knows"
@@ -2502,6 +2503,12 @@ cmd_doctor() {
 		ok "no other program on UDP 443 - Caddy may serve HTTP/3"
 	fi
 
+	if sni_mode_on; then
+		hdr "5d Caddy's SNI router"
+		if l4_module_ok; then ok "on - Caddy routes :443/:80 by name (layer4 module present)"
+		else warn "on, but Caddy lost its layer4 module (a package upgrade?) - Caddy cannot start"; dim "fix: $SELF_NAME sni enable"; fi
+	fi
+
 	hdr "5c Real visitor IP behind Cloudflare"
 	local rip_old
 	rip_old="$(grep -lE 'X-Real-IP \{remote_host\}|X-Forwarded-Port \{server_port\}' "$SITES_DIR"/*.caddy 2>/dev/null \
@@ -3054,7 +3061,7 @@ CLI = shutil.which("smart-caddy") or "/usr/local/bin/smart-caddy"
 CONF = "/etc/smart-caddy.conf"
 AUTH_FILE = os.environ.get("SMART_CADDY_PANEL_AUTH", "/etc/smart-caddy-panel.json")
 ACTIVITY_LOG = os.environ.get("SMART_CADDY_ACTIVITY", "/var/log/smart-caddy/activity.jsonl")
-VERSION = "1.6.1"
+VERSION = "1.7.0"
 
 COOKIE = "sc_session"
 SESSION_HOURS = 12
@@ -3349,7 +3356,7 @@ def reality_watch():
     while True:
         time.sleep(60)
         try:
-            if not (os.path.isfile(XUI_DB) and os.path.isfile("/opt/dnsguard/.env")):
+            if not os.path.isfile(XUI_DB):
                 continue
             chk = subprocess.run([CLI, "reality", "sync", "--check"], capture_output=True, timeout=60)
             if chk.returncode == 3:
@@ -3385,13 +3392,14 @@ def update_check():
             "latest_build": hashlib.sha256(new).hexdigest()[:12]}
 
 
-def start_update(actor):
-    """Run 'smart-caddy update' in its own systemd unit: it restarts this very
-    panel, and a child of the panel's service would be killed with it."""
-    unit = f"smart-caddy-update-{int(time.time())}"
+def start_update(actor, args=("update",)):
+    """Run the CLI in its own systemd unit: 'update' restarts this very panel
+    and 'sni enable' restarts Caddy, which this request travels through - a
+    child of the panel's service would be killed with it."""
+    unit = f"smart-caddy-{args[0]}-{int(time.time())}"
     cmd = ["systemd-run", "--unit", unit, "--collect", "--quiet",
            "--setenv=SMART_CADDY_SOURCE=panel", f"--setenv=SMART_CADDY_ACTOR={actor}",
-           CLI, "update"]
+           CLI] + list(args)
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
     except Exception as exc:
@@ -4042,6 +4050,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(self.cli(["put", domain, tmp]))
             finally:
                 os.unlink(tmp)
+
+        if path == "/api/sni":
+            action = str(data.get("action", ""))
+            if action not in ("enable", "disable"):
+                return self.send_json({"ok": False, "out": "unknown action"}, 400)
+            err = start_update(self.actor(), ("sni", action, "--yes"))
+            if err:
+                return self.send_json({"ok": False, "out": err})
+            return self.send_json({"ok": True, "started": True})
 
         if path == "/api/reality":
             action = str(data.get("action", ""))
@@ -4779,8 +4796,15 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
   <div class="tab-head"><div class="txt"><h2 data-t="tab_reality">Reality</h2><p data-t="rl_d"></p></div>
     <button type="button" id="rl-sync" data-t="rl_sync">Sync now</button></div>
   <div class="note" id="rl-note" hidden></div>
+  <div class="card glass" id="rl-sni" hidden style="margin-bottom:16px">
+    <h3 data-t="rl_sni_t">Caddy's SNI router</h3>
+    <div class="hint" data-th="rl_sni_d"></div>
+    <div class="row"><button type="button" class="primary" id="rl-sni-on" data-t="rl_sni_on">Turn it on</button>
+      <span class="hint" id="rl-sni-state" style="margin:0"></span></div>
+  </div>
   <div id="reality"><div class="empty glass card" data-t="loading">Loading…</div></div>
-  <div class="card glass" style="margin-top:16px"><h3 data-t="rl_how">How it works</h3><div class="hint" data-th="rl_how_d"></div></div>
+  <div class="card glass" style="margin-top:16px"><h3 data-t="rl_how">How it works</h3><div class="hint" data-th="rl_how_d"></div>
+    <div class="row" id="rl-off-row" hidden><button type="button" class="link" id="rl-sni-off" data-t="rl_sni_off">Turn Caddy's SNI router off</button></div></div>
 </section>
 
 <section class="tab" id="tab-certs">
@@ -5206,13 +5230,19 @@ en: {
   tab_reality:'Reality', rl_sync:'Sync now',
   rl_d:'x-ui Reality configs on port 443 next to the sites - set up and kept in step by themselves.',
   rl_none:'No Reality inbound in x-ui on this server.', rl_noxui:'No x-ui on this server.',
-  rl_nofront:'Reality on :443 needs a program on :443 that routes by name (DNSGuard). This server has none, so Reality stays on its own port here.',
+  rl_nofront:'Reality on :443 needs a program on :443 that routes by name. Another program holds :443 here, so Reality stays on its own port.',
   rl_on:'on :443', rl_off:'not on :443', rl_wait:'waiting for sync', rl_public:'listens on all addresses',
   rl_port:'internal port', rl_links:'share links', rl_nolinks:'none - x-ui uses the sub address',
   rl_put:'Put on :443', rl_confirm:'Move inbound {0} to 127.0.0.1 and serve it on :443? x-ui and DNSGuard restart for a few seconds; clients update their subscription afterwards.',
   rl_synced:'In step with x-ui.', rl_pending:'x-ui changed - the next automatic sync (within a minute) applies it, or press Sync now.',
+  rl_sni_t:'Caddy\'s SNI router',
+  rl_sni_d:'This server has no DNSGuard, and Caddy holds :443 itself. Turned on, Caddy routes :443 and :80 by name (the caddy-l4 module): a Reality SNI goes straight to its inbound, everything else to your sites as before. Caddy downloads the module once (~40 MB) and restarts for a few seconds.',
+  rl_sni_on:'Turn it on', rl_sni_off:'Turn Caddy\'s SNI router off', rl_sni_working:'Working… Caddy restarts; this page updates by itself.',
+  rl_sni_confirm:'Turn on Caddy\'s SNI router? Caddy restarts for a few seconds.',
+  rl_sni_offconfirm:'Turn the router off? Reality configs on :443 stop working until they get their own port again.',
+  rl_router_caddy:'Router: Caddy (caddy-l4).', rl_router_dnsguard:'Router: DNSGuard.',
   rl_how:'How it works',
-  rl_how_d:'<ol><li>In x-ui make a Reality inbound with <b>Listen IP</b> <code>127.0.0.1</code>, any free port, and a <b>target / SNI</b> such as <code>www.cloudflare.com</code>.</li><li>Within a minute DNSGuard sends that SNI on :443 straight to it, and its share link says port <code>443</code>.</li><li>Change the SNI or delete the inbound - this follows by itself. Each Reality needs its own SNI.</li><li>An inbound that listens on all addresses keeps its own port; <b>Put on :443</b> moves it.</li></ol>',
+  rl_how_d:'<ol><li>In x-ui make a Reality inbound with <b>Listen IP</b> <code>127.0.0.1</code>, any free port, and a <b>target / SNI</b> such as <code>www.cloudflare.com</code>.</li><li>Within a minute the router (DNSGuard or Caddy) sends that SNI on :443 straight to it, and its share link says port <code>443</code>.</li><li>Change the SNI or delete the inbound - this follows by itself. Each Reality needs its own SNI.</li><li>An inbound that listens on all addresses keeps its own port; <b>Put on :443</b> moves it.</li></ol>',
   up_title:'Update', up_d:'Installs the latest published Smart-Caddy on this server - no SSH needed. Sites stay up; the panel restarts for a few seconds.',
   up_check:'Check for an update', up_go:'Update now', up_checking:'Checking…',
   up_none:'Up to date: v{0} (build {1}).', up_avail:'A new build is available: v{0} → v{1} (build {2} → {3}).',
@@ -5375,13 +5405,19 @@ fa: {
   tab_reality:'ریالیتی', rl_sync:'همگام‌سازی',
   rl_d:'کانفیگ‌های ریالیتی x-ui روی پورت 443 کنار سایت‌ها؛ خودکار تنظیم و همگام می‌شوند.',
   rl_none:'روی این سرور اینباند ریالیتی در x-ui نیست.', rl_noxui:'روی این سرور x-ui نیست.',
-  rl_nofront:'ریالیتی روی 443 به برنامه‌ای روی 443 نیاز دارد که از روی اسم پخش کند (دیگارد). این سرور ندارد، پس ریالیتی اینجا روی پورت خودش می‌ماند.',
+  rl_nofront:'ریالیتی روی 443 به برنامه‌ای روی 443 نیاز دارد که از روی اسم پخش کند. اینجا برنامهٔ دیگری 443 را گرفته، پس ریالیتی روی پورت خودش می‌ماند.',
   rl_on:'روی 443', rl_off:'روی 443 نیست', rl_wait:'منتظر همگام‌سازی', rl_public:'روی همهٔ آدرس‌ها گوش می‌دهد',
   rl_port:'پورت داخلی', rl_links:'لینک‌های اشتراک', rl_nolinks:'ندارد - x-ui آدرس ساب را می‌گذارد',
   rl_put:'ببر روی 443', rl_confirm:'اینباند {0} روی 127.0.0.1 برود و روی 443 سرویس بدهد؟ x-ui و دیگارد چند ثانیه ری‌استارت می‌شوند؛ بعدش کاربرها ساب را آپدیت کنند.',
   rl_synced:'با x-ui همگام است.', rl_pending:'x-ui تغییر کرده - همگام‌سازی خودکار بعدی (حداکثر یک دقیقه) اعمالش می‌کند، یا «همگام‌سازی» را بزنید.',
+  rl_sni_t:'مسیریاب SNI خود Caddy',
+  rl_sni_d:'این سرور DNSGuard ندارد و خود Caddy پورت 443 را گرفته. با روشن کردن این گزینه، Caddy پورت‌های 443 و 80 را از روی اسم دامنه پخش می‌کند (ماژول caddy-l4): SNI ریالیتی مستقیم به اینباندش می‌رود و بقیه مثل قبل به سایت‌ها. Caddy یک بار ماژول را دانلود می‌کند (حدود 40 مگ) و چند ثانیه ری‌استارت می‌شود.',
+  rl_sni_on:'روشن کن', rl_sni_off:'خاموش کردن مسیریاب SNI خود Caddy', rl_sni_working:'در حال انجام… Caddy ری‌استارت می‌شود؛ این صفحه خودش به‌روز می‌شود.',
+  rl_sni_confirm:'مسیریاب SNI خود Caddy روشن شود؟ Caddy چند ثانیه ری‌استارت می‌شود.',
+  rl_sni_offconfirm:'مسیریاب خاموش شود؟ کانفیگ‌های ریالیتی روی 443 تا وقتی پورت جدا نگیرند کار نمی‌کنند.',
+  rl_router_caddy:'مسیریاب: خود Caddy (caddy-l4).', rl_router_dnsguard:'مسیریاب: DNSGuard.',
   rl_how:'چطور کار می‌کند',
-  rl_how_d:'<ol><li>در x-ui یک اینباند ریالیتی بسازید با <b>Listen IP</b> <code>127.0.0.1</code>، یک پورت آزاد دلخواه و یک <b>target / SNI</b> مثل <code>www.cloudflare.com</code>.</li><li>حداکثر یک دقیقه بعد، دیگارد آن SNI را روی 443 مستقیم به آن می‌دهد و لینک اشتراکش پورت <code>443</code> می‌شود.</li><li>SNI را عوض کنید یا اینباند را پاک کنید - خودش دنبال می‌کند. هر ریالیتی یک SNI جدا لازم دارد.</li><li>اینباندی که روی همهٔ آدرس‌ها گوش می‌دهد روی پورت خودش می‌ماند؛ دکمهٔ <b>ببر روی 443</b> منتقلش می‌کند.</li></ol>',
+  rl_how_d:'<ol><li>در x-ui یک اینباند ریالیتی بسازید با <b>Listen IP</b> <code>127.0.0.1</code>، یک پورت آزاد دلخواه و یک <b>target / SNI</b> مثل <code>www.cloudflare.com</code>.</li><li>حداکثر یک دقیقه بعد، مسیریاب (DNSGuard یا Caddy) آن SNI را روی 443 مستقیم به آن می‌دهد و لینک اشتراکش پورت <code>443</code> می‌شود.</li><li>SNI را عوض کنید یا اینباند را پاک کنید - خودش دنبال می‌کند. هر ریالیتی یک SNI جدا لازم دارد.</li><li>اینباندی که روی همهٔ آدرس‌ها گوش می‌دهد روی پورت خودش می‌ماند؛ دکمهٔ <b>ببر روی 443</b> منتقلش می‌کند.</li></ol>',
   up_title:'به‌روزرسانی', up_d:'آخرین نسخهٔ منتشرشدهٔ Smart-Caddy را روی همین سرور نصب می‌کند؛ SSH لازم نیست. سایت‌ها روشن می‌مانند و فقط پنل چند ثانیه ری‌استارت می‌شود.',
   up_check:'بررسی به‌روزرسانی', up_go:'به‌روزرسانی کن', up_checking:'در حال بررسی…',
   up_none:'به‌روز است: v{0} (بیلد {1}).', up_avail:'نسخهٔ جدید آماده است: v{0} ← v{1} (بیلد {2} ← {3}).',
@@ -5895,10 +5931,16 @@ function renderReality(){
   const d = RL;
   if (!d) return;
   $('#rl-sync').hidden = !(d.xui && d.front);
+  $('#rl-sni').hidden = !(d.xui && !d.front && d.can_enable);
+  $('#rl-off-row').hidden = d.router !== 'caddy';
   const note = $('#rl-note');
   if (!d.xui){ $('#reality').innerHTML = '<div class="empty glass card">' + esc(t('rl_noxui')) + '</div>'; note.hidden = true; return; }
-  if (!d.front){ note.innerHTML = esc(t('rl_nofront')); note.hidden = false; }
-  else { note.innerHTML = esc(t(d.in_sync ? 'rl_synced' : 'rl_pending')); note.hidden = false; }
+  if (!d.front){ note.innerHTML = esc(t('rl_nofront')); note.hidden = !!d.can_enable; }
+  else {
+    note.innerHTML = esc(t(d.in_sync ? 'rl_synced' : 'rl_pending')) + ' '
+                   + esc(t(d.router === 'caddy' ? 'rl_router_caddy' : 'rl_router_dnsguard'));
+    note.hidden = false;
+  }
   if (!d.inbounds || !d.inbounds.length){
     $('#reality').innerHTML = '<div class="empty glass card">' + esc(t('rl_none')) + '</div>';
     return;
@@ -5932,6 +5974,27 @@ function renderReality(){
     loadReality();
   });
 }
+// Caddy restarts in the middle, so this runs detached; poll until it reports
+async function sniSwitch(action){
+  if (busy || !confirm(t(action === 'enable' ? 'rl_sni_confirm' : 'rl_sni_offconfirm'))) return;
+  busy = true;
+  const r = await api('/api/sni', {action});
+  if (!r.ok){ busy = false; toast(r.out || t('toast_failed'), true); return; }
+  $('#rl-sni-state').textContent = t('rl_sni_working');
+  toast(t('rl_sni_working'));
+  let n = 0;
+  const poll = async () => {
+    n++;
+    try { RL = await api('/api/reality'); } catch (_) {}
+    const done = RL && (action === 'enable' ? RL.router === 'caddy' : RL.router !== 'caddy');
+    if (done || n > 40){ busy = false; $('#rl-sni-state').textContent = ''; renderReality(); refresh(); return; }
+    setTimeout(poll, 5000);
+  };
+  setTimeout(poll, 8000);
+}
+$('#rl-sni-on').onclick = () => sniSwitch('enable');
+$('#rl-sni-off').onclick = () => sniSwitch('disable');
+
 $('#rl-sync').onclick = async () => {
   if (busy) return;
   busy = true; $('#rl-sync').disabled = true;
@@ -6513,11 +6576,335 @@ find_ui_source() {
 }
 
 # =============================================================================
+#  Caddy's own SNI router (no DNSGuard needed)
+#
+#  The caddy-l4 module lets Caddy itself sit on :443/:80 as a name router,
+#  the job DNSGuard does on servers that have it: a Reality SNI goes untouched
+#  to its x-ui inbound on loopback, everything else to Caddy's sites on
+#  127.0.0.1:8444 (:80 -> 127.0.0.1:8081) with a PROXY header, so the sites
+#  still see the visitor's address. One process, nothing else to install.
+# =============================================================================
+
+SNI_PASS_FILE="/etc/smart-caddy-sni.conf"     # name=127.0.0.1:port, one per line
+L4_PKG="github.com/mholt/caddy-l4"
+SNI_HTTPS_PORT=8444
+SNI_HTTP_PORT=8081
+
+l4_module_ok() { have caddy && caddy list-modules 2>/dev/null | grep -qx layer4; }
+sni_mode_on()  { grep -q '# --- smart-caddy SNI router' "$CADDYFILE" 2>/dev/null; }
+
+# Could this server switch the router on? Caddy holds :443 itself (or nothing
+# does) and no other program fronts it.
+sni_can_enable() {
+	sni_mode_on && return 1
+	[[ -n "$(caddy_front_port)" ]] && return 1
+	local o; o="$(port_owner 443)"
+	[[ -z "$o" || "$o" == caddy ]]
+}
+
+l4_install_module() {
+	l4_module_ok && { ok "Caddy already has the layer4 module"; return 0; }
+	have caddy || die "caddy is not installed"
+	local bin log; bin="$(readlink -f "$(command -v caddy)")"; log="$(mktemp)"
+	info "adding $L4_PKG to Caddy - downloads a Caddy build from caddyserver.com (~40 MB)"
+	cp -p "$bin" "$bin.smart-caddy.bak"
+	# add-package keeps the modules this build already has (e.g. Cloudflare DNS)
+	if ! caddy add-package "$L4_PKG" >"$log" 2>&1 || ! l4_module_ok; then
+		tail -n 5 "$log" | sed 's/^/       /' >&2; rm -f "$log"
+		cp -p "$bin.smart-caddy.bak" "$bin"
+		dim "caddyserver.com must be reachable; behind a filter set https_proxy and run it again"
+		die "could not add the module - Caddy is unchanged"
+	fi
+	rm -f "$log"
+	if have apt-mark && apt-mark hold caddy >/dev/null 2>&1; then
+		ok "caddy package held - apt upgrades will not replace this build"
+	fi
+	ok "Caddy now has the layer4 module"
+}
+
+# sni_conf <on|off|render> - rewrite the Caddyfile (and with on/off the site
+# files) for the router. Prints the files it changed, one per line.
+sni_conf() {
+	python3 - "$1" "$CADDYFILE" "$SITES_DIR" "$SNI_PASS_FILE" "${FRONT_IP:-}" \
+		"$SNI_HTTPS_PORT" "$SNI_HTTP_PORT" <<'PY'
+import glob, os, re, sys
+mode, cfile, sdir, passf, front, hport, pport = sys.argv[1:8]
+BEGIN, END = "\t# --- smart-caddy SNI router (managed by 'smart-caddy sni') ---", "\t# --- end of SNI router ---"
+RCOMMENT = "# http -> https (Caddy's automatic redirect is off on this server)"
+
+
+def depth(s):
+    s = re.sub(r'"[^"]*"', "", s.split("#", 1)[0])
+    return s.count("{") - s.count("}")
+
+
+def global_span(lines):
+    """(start, end) line indexes of the global options block, or None."""
+    for i, l in enumerate(lines):
+        if not l.strip() or l.lstrip().startswith("#"):
+            continue
+        if l.strip() != "{":
+            return None
+        d = 1
+        for j in range(i + 1, len(lines)):
+            d += depth(lines[j])
+            if d <= 0:
+                return i, j
+        return None
+    return None
+
+
+def sub_blocks(lines, a, b, pat):
+    """Blocks directly inside lines[a+1:b] whose opening line matches pat."""
+    out, d, i = [], 0, a + 1
+    while i < b:
+        if d == 0 and re.match(pat, lines[i]):
+            bd, j = depth(lines[i]), i + 1
+            while j < b and bd > 0:
+                bd += depth(lines[j])
+                j += 1
+            out.append((i, j - 1))
+            i = j
+            continue
+        d += depth(lines[i])
+        i += 1
+    return out
+
+
+def routes():
+    by_port = {}
+    try:
+        for l in open(passf):
+            l = l.strip()
+            n, _, t = l.partition("=")
+            if n and re.fullmatch(r"[A-Za-z0-9.-]{1,253}", n) and re.fullmatch(r"127\.0\.0\.1:\d{1,5}", t):
+                by_port.setdefault(t, []).append(n.lower())
+    except OSError:
+        pass
+    return by_port
+
+
+def l4_block():
+    lis = (front or "") + ":"
+    out = [BEGIN, "\tlayer4 {", f"\t\t{lis}443 {{"]
+    for k, (t, names) in enumerate(sorted(routes().items()), 1):
+        out += [f"\t\t\t@reality{k} tls sni {' '.join(sorted(names))}",
+                f"\t\t\troute @reality{k} {{", f"\t\t\t\tproxy {t}", "\t\t\t}"]
+    for port, up in (("443", hport), ("80", pport)):
+        if port == "80":
+            out += ["\t\t}", f"\t\t{lis}80 {{"]
+        out += ["\t\t\troute {", "\t\t\t\tproxy {", "\t\t\t\t\tproxy_protocol v2",
+                f"\t\t\t\t\tupstream 127.0.0.1:{up}", "\t\t\t\t}", "\t\t\t}"]
+    out += ["\t\t}", "\t}", END]
+    return out
+
+
+def strip_l4(lines):
+    if BEGIN in lines and END in lines:
+        a, b = lines.index(BEGIN), lines.index(END)
+        del lines[a:b + 1]
+    return lines
+
+
+changed = []
+src = open(cfile).read()
+lines = src.split("\n")
+gs = global_span(lines)
+if gs is None:
+    lines = ["{", "}", ""] + lines
+    gs = (0, 1)
+
+if mode in ("on", "render"):
+    lines = strip_l4(lines)
+    gs = global_span(lines)
+    if mode == "on":
+        a, b = gs
+        body = "\n".join(lines[a + 1:b])
+        add = []
+        for k, v in (("http_port", pport), ("https_port", hport), ("auto_https", "disable_redirects")):
+            if not re.search(rf"^\s*{k}\s", body, re.M):
+                add.append(f"\t{k} {v}")
+        lines[a + 1:a + 1] = add
+        gs = global_span(lines)
+        # no HTTP server on :443 any more - "servers <ip>:443" blocks (HTTP/3 off) would point at nothing
+        for x, y in reversed(sub_blocks(lines, *gs, r"\s*servers\s+\S*:443\s*\{")):
+            del lines[x:y + 1]
+            if x > 0 and "no HTTP/3" in lines[x - 1]:
+                del lines[x - 1]
+        gs = global_span(lines)
+        cats = sub_blocks(lines, *gs, r"\s*servers\s*\{\s*$")
+        wrap = ["\t\tlistener_wrappers {", "\t\t\tproxy_protocol {", "\t\t\t\tallow 127.0.0.1/32",
+                "\t\t\t}", "\t\t\ttls", "\t\t}"]
+        if cats:
+            x, y = cats[0]
+            block = "\n".join(lines[x:y])
+            ins = ([] if "listener_wrappers" in block else wrap) + \
+                  ([] if re.search(r"^\s*protocols\s", block, re.M) else ["\t\tprotocols h1 h2"])
+            lines[x + 1:x + 1] = ins
+        else:
+            lines[gs[1]:gs[1]] = ["\tservers {"] + wrap + ["\t\tprotocols h1 h2", "\t}"]
+        gs = global_span(lines)
+    lines[gs[1]:gs[1]] = l4_block()
+else:  # off
+    lines = strip_l4(lines)
+    gs = global_span(lines)
+    a, b = gs
+    keep = []
+    for i, l in enumerate(lines):
+        if a < i < b and re.match(rf"^\s*(http_port\s+{pport}|https_port\s+{hport}|auto_https\s+disable_redirects)\s*$", l):
+            continue
+        keep.append(l)
+    lines = keep
+    gs = global_span(lines)
+    for x, y in reversed(sub_blocks(lines, *gs, r"\s*servers\s*\{\s*$")):
+        for p, q in reversed(sub_blocks(lines, x, y, r"\s*listener_wrappers\s*\{")):
+            if "allow 127.0.0.1/32" in "\n".join(lines[p:q + 1]):
+                del lines[p:q + 1]
+
+new = "\n".join(lines)
+if new != src:
+    open(cfile + ".sni-new", "w").write(new)
+    changed.append(cfile)
+
+if mode in ("on", "off"):
+    for f in sorted(glob.glob(os.path.join(sdir, "*.caddy"))):
+        t = open(f).read()
+        if "behind an Xray fallback" in t:
+            continue
+        ls = t.split("\n")
+        if mode == "on":
+            # every block on loopback; the router is the only way in
+            i, out, blocks = 0, [], []
+            while i < len(ls):
+                l = ls[i]
+                if l.strip() and not l.startswith(("\t", " ", "#", "}")) and l.rstrip().endswith("{"):
+                    head = l.rstrip()[:-1].strip()
+                    out.append(l)
+                    j, d, had = i + 1, 1, False
+                    while j < len(ls) and d > 0:
+                        x = ls[j]
+                        if d == 1 and re.match(r"^\s*bind\s", x):
+                            x = "\tbind 127.0.0.1"
+                            had = True
+                        d += depth(x)
+                        out.append(x)
+                        j += 1
+                    if not had:
+                        out.insert(len(out) - (j - i - 1), "\tbind 127.0.0.1")
+                    blocks.append(head)
+                    i = j
+                    continue
+                out.append(l)
+                i += 1
+            have_http = {re.sub(r"^http://", "", h).split(":")[0] for h in blocks if h.startswith("http://")}
+            for h in blocks:
+                if h.startswith("http://"):
+                    continue
+                for name in [x.strip(",") for x in h.split() if x.strip(",")]:
+                    if name not in have_http and re.fullmatch(r"[A-Za-z0-9.*-]+", name):
+                        while out and not out[-1].strip():
+                            out.pop()
+                        out += ["", RCOMMENT, f"http://{name} {{", "\tbind 127.0.0.1",
+                                "\tredir https://{host}{uri} permanent", "}", ""]
+            nt = "\n".join(out)
+        else:
+            nt = re.sub(r"\n?" + re.escape(RCOMMENT) + r"\nhttp://\S+ \{\n\tbind 127\.0\.0\.1\n\tredir https://\{host\}\{uri\} permanent\n\}\n?", "\n", t)
+            nt = re.sub(r"^\tbind 127\.0\.0\.1$", f"\tbind {front}" if front else "\x00", nt, flags=re.M)
+            nt = nt.replace("\x00\n", "")
+            nt = nt.rstrip("\n") + "\n" if t.endswith("\n") else nt.rstrip("\n")
+        if nt != t:
+            open(f + ".sni-new", "w").write(nt)
+            changed.append(f)
+print("\n".join(changed))
+PY
+}
+
+# sni_write <on|off|render> - stage, write and validate; returns 1 (rolled back) on a bad config
+sni_write() {
+	local f list
+	list="$(sni_conf "$1")" || { warn "could not rewrite the config"; return 1; }
+	while IFS= read -r f; do
+		[[ -n "$f" && -f "$f.sni-new" ]] || continue
+		[[ " ${_rb_old[*]:-} " == *" $f|"* ]] || stage_edit "$f"
+		write_inplace "$f" "$f.sni-new"
+		rm -f "$f.sni-new"
+	done <<<"$list"
+	if ! caddy_validate >/dev/null 2>&1; then
+		caddy_validate 2>&1 | grep -iE 'error|invalid' | head -5 | sed 's/^/       /' >&2
+		rollback
+		return 1
+	fi
+	return 0
+}
+
+cmd_sni() {
+	local action="${1:-status}"
+	[[ " $* " == *" --yes "* || " $* " == *" -y "* ]] && ASSUME_YES=1
+	case "$action" in
+		status)
+			if sni_mode_on; then
+				ok "Caddy's SNI router is on (:443 -> sites on 127.0.0.1:$SNI_HTTPS_PORT)"
+				l4_module_ok || warn "but Caddy has lost its layer4 module - Caddy cannot start; fix: $SELF_NAME sni enable"
+				if [[ -s "$SNI_PASS_FILE" ]]; then sed 's/^/       /' "$SNI_PASS_FILE"; else dim "no Reality routes yet"; fi
+			elif sni_can_enable; then
+				info "off - Caddy holds :443 itself; '$SELF_NAME sni enable' lets Reality share it"
+			else
+				info "off - another program fronts :443 here (DNSGuard?), so Caddy's router is not needed"
+			fi ;;
+		enable)
+			need_root sni
+			sni_mode_on && { ok "already on"; return 0; }
+			sni_can_enable || die "Caddy does not hold :443 on this server (another program fronts it) - not needed here"
+			hdr "Caddy's SNI router"
+			info "Caddy moves its sites to 127.0.0.1:$SNI_HTTPS_PORT/$SNI_HTTP_PORT and routes :443/:80 by name"
+			dim "sites stay at the same addresses; Caddy restarts once (a few seconds)"
+			ask "Switch it on?" y || die "cancelled"
+			l4_install_module
+			has_stock_default_site && { remove_stock_default_site; ok "removed the caddy package's placeholder :80 site"; }
+			touch "$SNI_PASS_FILE"
+			sni_write on || die "Caddy rejected the new config - everything was rolled back, Caddy untouched"
+			if systemctl restart caddy; then
+				clear_stage
+				ok "Caddy restarted - it now routes :443 and :80 by name"
+			else
+				warn "Caddy did not start:"; last_caddy_error | sed 's/^/       /'
+				rollback; systemctl restart caddy || true
+				die "rolled back - Caddy is as it was"
+			fi
+			if [[ -r "$XUI_DB" ]]; then
+				dim "Reality inbounds on 127.0.0.1 are routed from now on; 'Put on :443' (or '$SELF_NAME reality on443 <id>') moves one there"
+				cmd_reality sync || true
+			fi ;;
+		disable)
+			need_root sni
+			sni_mode_on || { ok "already off"; return 0; }
+			ask "Switch Caddy's SNI router off? Reality configs on :443 stop working until they get their own port again." n || die "cancelled"
+			sni_write off || die "Caddy rejected the config - nothing changed"
+			if systemctl restart caddy; then
+				clear_stage
+				ok "off - Caddy serves :443/:80 itself again"
+			else
+				warn "Caddy did not start:"; last_caddy_error | sed 's/^/       /'
+				rollback; systemctl restart caddy || true
+				die "rolled back - the router is still on"
+			fi ;;
+		render)
+			# new Reality routes: only the layer4 block changes, a reload is enough
+			need_root sni
+			sni_mode_on || die "Caddy's SNI router is off"
+			sni_write render || die "Caddy rejected the new routes - rolled back"
+			if systemctl reload caddy 2>/dev/null; then clear_stage; ok "routes applied (Caddy reloaded)"
+			else rollback; systemctl reload caddy || true; die "reload failed - rolled back"; fi ;;
+		*) die "usage: $SELF_NAME sni [status|enable|disable]" ;;
+	esac
+}
+
+# =============================================================================
 #  Reality on :443
 #
-#  A program on :443 that routes by name (DNSGuard) can hand an x-ui Reality
-#  inbound its own SNI untouched (SNI_PASS), so Reality shares :443 with the
-#  sites. An inbound that listens on loopback is taken as meant for this:
+#  A program on :443 that routes by name - DNSGuard (SNI_PASS) or Caddy's own
+#  SNI router (SNI_PASS_FILE) - can hand an x-ui Reality inbound its own SNI
+#  untouched, so Reality shares :443 with the sites. An inbound that listens on loopback is taken as meant for this:
 #  'sync' gives each of its server names a line, drops lines whose inbound is
 #  gone or changed its name, and points its share links at port 443.
 # =============================================================================
@@ -6567,14 +6954,21 @@ def rows(c, ib):
             for r in c.execute("select id, address, port from hosts where inbound_id=? and is_disabled=0", (ib,))]
 
 
+ROUTER = os.environ.get("REALITY_ROUTER", "dnsguard")
+
+
 def read_pass():
     try:
         txt = open(envp).read()
     except OSError:
-        return None, []
-    m = re.search(r"^SNI_PASS=(.*)$", txt, re.M)
+        return (None, []) if ROUTER != "caddy" else ("", [])
+    if ROUTER == "caddy":
+        raw = ",".join(l.strip() for l in txt.splitlines() if l.strip())
+    else:
+        m = re.search(r"^SNI_PASS=(.*)$", txt, re.M)
+        raw = m.group(1) if m else ""
     pairs = []
-    for part in (m.group(1) if m else "").replace(" ", "").split(","):
+    for part in raw.replace(" ", "").split(","):
         n, _, t = part.partition("=")
         if n and t:
             pairs.append((n.lower(), t))
@@ -6679,12 +7073,14 @@ if action == "status":
         out.append(dict(ib, local=ib["listen"] in LOOP,
                         on443=bool(ib["names"]) and all(on.get(n) == f"127.0.0.1:{ib['port']}" for n in ib["names"]),
                         links=[f"{r['address']}:{r['port']}" for r in rows(c, ib["id"])]))
-    print(json.dumps({"xui": True, "front": txt is not None, "inbounds": out, "pass": pairs if txt is not None else [],
+    print(json.dumps({"xui": True, "front": txt is not None, "router": ROUTER if txt is not None else "",
+                      "can_enable": os.environ.get("REALITY_CAN_SNI") == "1",
+                      "inbounds": out, "pass": pairs if txt is not None else [],
                       "in_sync": txt is None or (new == pairs and not want_rows(c, ibs)), "notes": notes}))
     sys.exit(0)
 
 if txt is None:
-    print("no DNSGuard here - Reality on :443 needs a program on :443 that routes by name")
+    print("no router here - Reality on :443 needs DNSGuard or Caddy's SNI router (smart-caddy sni enable)")
     sys.exit(1)
 
 restart = set()
@@ -6713,13 +7109,19 @@ if action == "check":
     sys.exit(3 if (new != pairs or todo) else 0)
 
 if new != pairs:
-    print(f"backup: {backup(envp, 'dnsguard.env')}")
-    line = "SNI_PASS=" + ",".join(f"{n}={t}" for n, t in new)
-    txt = re.sub(r"^SNI_PASS=.*$", line, txt, flags=re.M) if re.search(r"^SNI_PASS=", txt, re.M) \
-        else txt.rstrip("\n") + "\n" + line + "\n"
+    if ROUTER == "caddy":
+        if os.path.exists(envp):
+            print(f"backup: {backup(envp, 'sni.conf')}")
+        txt = "".join(f"{n}={t}\n" for n, t in new)
+        restart.add("sni-routes")
+    else:
+        print(f"backup: {backup(envp, 'dnsguard.env')}")
+        line = "SNI_PASS=" + ",".join(f"{n}={t}" for n, t in new)
+        txt = re.sub(r"^SNI_PASS=.*$", line, txt, flags=re.M) if re.search(r"^SNI_PASS=", txt, re.M) \
+            else txt.rstrip("\n") + "\n" + line + "\n"
+        restart.add("dnsguard")
     with open(envp, "w") as fh:
         fh.write(txt)
-    restart.add("dnsguard")
 for n in notes:
     print(n)
 if todo:
@@ -6742,12 +7144,16 @@ cmd_reality() {
 		[[ "$action" == status ]] && { echo '{"xui": false}'; return 0; }
 		die "no x-ui database at $XUI_DB"
 	fi
-	# only where DNSGuard owns :443 and hands Caddy its names (Caddy behind it)
-	local front=0
-	if dnsguard_present && [[ -n "$(caddy_front_port)" ]]; then front=1; fi
+	# DNSGuard owning :443 in front of Caddy, or Caddy's own SNI router
+	local front=0 router="" store="$DNSGUARD_ENV" can=0
+	if sni_mode_on; then front=1; router=caddy; store="$SNI_PASS_FILE"
+	elif dnsguard_present && [[ -n "$(caddy_front_port)" ]]; then front=1; router=dnsguard
+	elif sni_can_enable; then can=1; fi
+	export REALITY_ROUTER="${router:-dnsguard}"
+	local DNSGUARD_ENV="$store"     # reality_py reads the route store from here
 	case "$action" in
 		status)
-			REALITY_FRONT=$front reality_py status ;;
+			REALITY_FRONT=$front REALITY_CAN_SNI=$can reality_py status ;;
 		sync|on443)
 			need_root reality
 			local id="" check=0 out line rc=0
@@ -6756,7 +7162,7 @@ cmd_reality() {
 				[[ "$id" =~ ^[0-9]+$ ]] || die "usage: $SELF_NAME reality on443 <inbound id>"
 			fi
 			[[ " $* " == *" --check "* ]] && check=1
-			[[ $front -eq 1 ]] || die "Reality on :443 needs DNSGuard on :443 in front of Caddy - not the case on this server"
+			[[ $front -eq 1 ]] || die "Reality on :443 needs DNSGuard in front of Caddy or Caddy's own SNI router ($SELF_NAME sni enable)"
 			if [[ $check -eq 1 ]]; then
 				reality_py check || return $?
 				return 0
@@ -6773,6 +7179,10 @@ cmd_reality() {
 			done <<<"$out"
 			while IFS= read -r line; do
 				[[ "$line" == "RESTART "* ]] || continue
+				if [[ "$line" == "RESTART sni-routes" ]]; then
+					cmd_sni render || true
+					continue
+				fi
 				if systemctl restart "${line#RESTART }" 2>/dev/null; then
 					ok "restarted ${line#RESTART }"
 				else
@@ -7222,8 +7632,11 @@ ${C_B}COMMANDS${C_OFF}
   add <domain> <port|host:port> [opts]     add a domain (automatic TLS)
   del <domain> [--keep-cert|--purge-cert]  remove a domain
   del-cert <domain>                        remove only the certificate
+  sni [status|enable|disable]              Caddy's own SNI router on :443/:80
+                                           (caddy-l4), for servers without
+                                           DNSGuard: lets Reality share :443
   reality [status]                         x-ui Reality inbounds and whether
-                                           they share :443 (needs DNSGuard)
+                                           they share :443
   reality sync                             give every Reality on loopback its
                                            SNI_PASS line and :443 share links
   reality on443 <inbound id>               move one Reality to loopback + sync
@@ -7327,6 +7740,8 @@ main() {
 			[[ "${1:-status}" == status ]] || activity_begin "$cmd" "${1:-}" ;;
 		reality)
 			if [[ "${1:-status}" != status && " $* " != *" --check "* ]]; then activity_begin "$cmd" "$@"; fi ;;
+		sni)
+			if [[ "${1:-status}" != status && "${1:-}" != render ]]; then activity_begin "$cmd" "$@"; fi ;;
 	esac
 	case "$cmd" in
 		setup)             cmd_setup "$@" ;;
@@ -7340,6 +7755,7 @@ main() {
 		renew)             cmd_renew "$@" ;;
 		cloudflare|cf)     cmd_cloudflare "$@" ;;
 		reality)           cmd_reality "$@" ;;
+		sni)               cmd_sni "$@" ;;
 		put)             cmd_put "$@" ;;
 		doctor|check)      cmd_doctor ;;
 		panel)             cmd_panel "$@" ;;
