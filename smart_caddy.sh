@@ -3330,6 +3330,47 @@ def parse_site(text):
 
 
 XUI_DB = "/etc/x-ui/x-ui.db"
+UPDATE_URL = os.environ.get("SMART_CADDY_URL",
+    "https://github.com/Plus98ir/Smart-Caddy/releases/latest/download/smart_caddy.sh")
+INSTALLED = "/usr/local/bin/smart-caddy"
+
+
+def update_check():
+    """Is the published build different from the installed one? Content, not
+    the version string - a fixed build is often re-published under the same one."""
+    import hashlib, urllib.request
+    try:
+        req = urllib.request.Request(UPDATE_URL, headers={"User-Agent": "smart-caddy-panel"})
+        with urllib.request.urlopen(req, timeout=25) as r:
+            new = r.read(4_000_000)
+    except Exception as exc:
+        return {"ok": False, "out": f"could not reach the release: {exc}"}
+    if b"smart-caddy" not in new or not new.startswith(b"#!"):
+        return {"ok": False, "out": "what came back is not a smart-caddy script"}
+    try:
+        with open(INSTALLED, "rb") as fh:
+            cur = fh.read()
+    except OSError:
+        cur = b""
+    m = re.search(rb'^VERSION="([^"]+)"', new, re.M)
+    return {"ok": True, "available": new != cur, "installed": VERSION,
+            "latest": m.group(1).decode() if m else "?",
+            "installed_build": hashlib.sha256(cur).hexdigest()[:12],
+            "latest_build": hashlib.sha256(new).hexdigest()[:12]}
+
+
+def start_update(actor):
+    """Run 'smart-caddy update' in its own systemd unit: it restarts this very
+    panel, and a child of the panel's service would be killed with it."""
+    unit = f"smart-caddy-update-{int(time.time())}"
+    cmd = ["systemd-run", "--unit", unit, "--collect", "--quiet",
+           "--setenv=SMART_CADDY_SOURCE=panel", f"--setenv=SMART_CADDY_ACTOR={actor}",
+           CLI, "update"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    except Exception as exc:
+        return str(exc)
+    return "" if r.returncode == 0 else (r.stderr or r.stdout or "systemd-run failed").strip()
 
 
 def xui_settings():
@@ -3758,6 +3799,8 @@ class Handler(BaseHTTPRequestHandler):
                 "cloudflare": cf_state(),
                 "xui": os.path.isfile(XUI_DB),
             })
+        if path == "/api/update-check":
+            return self.send_json(update_check())
         if path == "/api/xui":
             x = xui_settings()
             return self.send_json({"ok": bool(x), "xui": x})
@@ -3971,6 +4014,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(self.cli(["put", domain, tmp]))
             finally:
                 os.unlink(tmp)
+
+        if path == "/api/update":
+            err = start_update(self.actor())
+            if err:
+                return self.send_json({"ok": False, "out": err})
+            return self.send_json({"ok": True, "started": True,
+                                   "out": "updating - the panel restarts in a moment; the result is in the activity log"})
 
         if path == "/api/renew":
             # Restarts Caddy - and this very request travels through Caddy -
@@ -4887,6 +4937,16 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
     </div>
   </div>
 
+  <div class="card glass" id="up-card">
+    <h3 data-t="up_title">Update</h3>
+    <p class="sec-d" data-t="up_d"></p>
+    <div class="cf-state" id="up-state"></div>
+    <div class="row">
+      <button type="button" class="primary" id="up-check" data-t="up_check">Check for an update</button>
+      <button type="button" id="up-go" data-t="up_go" hidden>Update now</button>
+    </div>
+  </div>
+
   <div class="card glass" id="cf-card">
     <h3 data-t="cf_title">Cloudflare DNS certificates</h3>
     <p class="sec-d" data-t="cf_d"></p>
@@ -5094,6 +5154,11 @@ en: {
   sec_extra_d:'Advanced and usually empty. These lines go into the site exactly as written, e.g. <code>header -Server</code> or an <code>import</code>. When a site already has lines like that, they show up here and are kept when you save.',
   note_drop:'Saving from the form drops these parts, which it cannot show: {0}. To keep them, edit this site as code.',
   open_code:'Edit as code',
+  up_title:'Update', up_d:'Installs the latest published Smart-Caddy on this server - no SSH needed. Sites stay up; the panel restarts for a few seconds.',
+  up_check:'Check for an update', up_go:'Update now', up_checking:'Checking…',
+  up_none:'Up to date: v{0} (build {1}).', up_avail:'A new build is available: v{0} → v{1} (build {2} → {3}).',
+  up_confirm:'Update Smart-Caddy on this server now? The panel restarts for a few seconds.',
+  up_started:'Updating… this page reloads by itself in a few seconds.',
   xui_fill:'Fill in from x-ui on this server', xui_fill_h:'Reads the panel port, base path and subscription from x-ui - nothing to type.',
   xui_none:'No x-ui found on this server (/etc/x-ui/x-ui.db).',
   xui_done:'Filled in from x-ui: panel on port <b>{0}</b>, base path <code>{1}</code>{2}. Check the domain and save.',
@@ -5248,6 +5313,11 @@ fa: {
   sec_extra_d:'پیشرفته و معمولاً خالی. این خطوط دقیقاً همان‌طور که نوشته شده‌اند داخل سایت قرار می‌گیرند، مثلاً <code>header -Server</code> یا یک <code>import</code>. اگر سایتی از قبل چنین خطوطی دارد اینجا نشان داده می‌شوند و موقع ذخیره حفظ می‌شوند.',
   note_drop:'ذخیره از فرم این بخش‌ها را که فرم نمی‌تواند نشان دهد حذف می‌کند: {0}. برای حفظ آن‌ها، این سایت را به‌صورت کد ویرایش کنید.',
   open_code:'ویرایش به‌صورت کد',
+  up_title:'به‌روزرسانی', up_d:'آخرین نسخهٔ منتشرشدهٔ Smart-Caddy را روی همین سرور نصب می‌کند؛ SSH لازم نیست. سایت‌ها روشن می‌مانند و فقط پنل چند ثانیه ری‌استارت می‌شود.',
+  up_check:'بررسی به‌روزرسانی', up_go:'به‌روزرسانی کن', up_checking:'در حال بررسی…',
+  up_none:'به‌روز است: v{0} (بیلد {1}).', up_avail:'نسخهٔ جدید آماده است: v{0} ← v{1} (بیلد {2} ← {3}).',
+  up_confirm:'Smart-Caddy روی این سرور همین الان به‌روز شود؟ پنل چند ثانیه ری‌استارت می‌شود.',
+  up_started:'در حال به‌روزرسانی… این صفحه چند ثانیه دیگر خودش دوباره باز می‌شود.',
   xui_fill:'پر کردن خودکار از x-ui همین سرور', xui_fill_h:'پورت پنل، مسیر پایه و ساب را از x-ui می‌خواند؛ لازم نیست چیزی تایپ کنید.',
   xui_none:'روی این سرور x-ui پیدا نشد (/etc/x-ui/x-ui.db).',
   xui_done:'از x-ui پر شد: پنل روی پورت <b>{0}</b>، مسیر پایه <code>{1}</code>{2}. دامنه را چک کنید و ذخیره بزنید.',
@@ -5742,6 +5812,39 @@ async function toCaddy(domain){
   show('SSL ' + domain, r.out, !r.ok);
   refresh();
 }
+
+// ---------------------------------------------------------------- update
+$('#up-check').onclick = async () => {
+  $('#up-check').disabled = true;
+  $('#up-state').textContent = t('up_checking');
+  const r = await api('/api/update-check');
+  $('#up-check').disabled = false;
+  if (!r.ok){ $('#up-state').textContent = r.out || t('toast_failed'); $('#up-go').hidden = true; return; }
+  $('#up-state').textContent = r.available
+    ? t('up_avail', r.installed, r.latest, r.installed_build, r.latest_build)
+    : t('up_none', r.installed, r.installed_build);
+  $('#up-go').hidden = !r.available;
+};
+$('#up-go').onclick = async () => {
+  if (busy || !confirm(t('up_confirm'))) return;
+  busy = true;
+  $('#up-go').disabled = $('#up-check').disabled = true;
+  const r = await api('/api/update', {});
+  if (!r.ok){
+    busy = false; $('#up-go').disabled = $('#up-check').disabled = false;
+    toast(r.out || t('toast_failed'), true); return;
+  }
+  $('#up-state').textContent = t('up_started');
+  toast(t('up_started'));
+  // the panel goes away while it is replaced; come back once it answers again
+  let tries = 0;
+  const back = async () => {
+    tries++;
+    try { const x = await fetch('/api/log', {cache: 'no-store'}); if (x.ok && tries > 2) return location.reload(); } catch (_) {}
+    if (tries < 40) setTimeout(back, 3000); else location.reload();
+  };
+  setTimeout(back, 6000);
+};
 
 async function renewCert(domain){
   if (busy) return;
