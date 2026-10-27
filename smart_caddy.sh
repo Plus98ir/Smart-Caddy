@@ -1344,7 +1344,7 @@ cmd_add() {
 	local domain="${1:-}" target="${2:-}"
 	local host_header="" cert_mode="auto" dns_check=1
 	local paths="" insecure=0 nobuffer=0 preset="" wizard=0 strict_path=0
-	local behind_xray=0 listen_port="" replace=0 routes=()
+	local behind_xray=0 listen_port="" replace=0 routes=() extra_file=""
 
 	# No arguments at all -> walk the user through it.
 	if [[ -z "$domain" ]]; then
@@ -1388,6 +1388,7 @@ cmd_add() {
 			--path)         paths="${paths:+$paths,}${2:?}"; shift 2 ;;
 			--strict-path)  strict_path=1;         shift ;;
 			--route)        routes+=("${2:?}");    shift 2 ;;
+			--extra-file)   extra_file="${2:?}";   shift 2 ;;
 			--replace)      replace=1;             shift ;;
 			--behind-xray)  behind_xray=1;         shift ;;
 			--listen-port)  listen_port="${2:?}";  shift 2 ;;
@@ -1413,11 +1414,18 @@ cmd_add() {
 	fi
 
 	valid_domain "$domain" || die "invalid domain: $domain"
+	[[ -z "$extra_file" || -r "$extra_file" ]] || die "cannot read $extra_file"
 	local tinfo tkind
+	# "none": no main backend - the extra lines (--extra-file) serve the site
+	if [[ "$target" == none ]]; then
+		[[ -n "$extra_file" ]] || die "backend 'none' needs --extra-file"
+		tinfo="none none"
+	else
 	tinfo="$(classify_target "$target")" \
 		|| die "don't know what to do with backend '$target'
        expected a port, host:port, https://host:port, a directory path,
        another domain, or redirect:<url>"
+	fi
 	tkind="${tinfo%% *}"; target="${tinfo#* }"
 	if [[ -f "$(site_file "$domain")" && $replace -eq 0 ]]; then
 		die "$domain already exists. Remove it first: $SELF_NAME del $domain  (or pass --replace)"
@@ -1428,14 +1436,18 @@ cmd_add() {
 		listen_port=$(grep -oP '^http://[^:]+:\K[0-9]+' "$(site_file "$domain")" | head -1 || true)
 	fi
 
-	# --route PATH=TARGET: send one path to a different backend
-	local r rpath rtarget rinfo route_specs=()
+	# --route [ws:|web:|h2c:]PATH=TARGET: send one path to a different backend.
+	# The optional type is only remembered (in the route comment) for the panel.
+	local r rpath rtarget rinfo rkind route_specs=() route_kinds=()
 	for r in ${routes[@]+"${routes[@]}"}; do
+		rkind=""
+		if [[ "$r" =~ ^(ws|web|h2c): ]]; then rkind="${BASH_REMATCH[1]}"; r="${r#*:}"; fi
 		rpath="${r%%=*}"; rtarget="${r#*=}"
 		[[ "$r" == *=* && "$rpath" =~ ^/[A-Za-z0-9._~/*-]*$ ]] \
 			|| die "invalid --route '$r'  (expected /path=backend, e.g. /dns-query/*=8000)"
 		rinfo="$(classify_target "$rtarget")" || die "don't know what to do with route backend '$rtarget'"
 		route_specs+=("$rpath ${rinfo}")
+		route_kinds+=("$rkind")
 	done
 	mkdir -p "$SITES_DIR"
 	grep -qF "$SITES_DIR" "$CADDYFILE" || die "import line missing. Run: $SELF_NAME install"
@@ -1457,7 +1469,9 @@ cmd_add() {
 	fi
 
 	local hp="" th="" tp=""
-	if [[ "$tkind" == files ]]; then
+	if [[ "$tkind" == none ]]; then
+		ok "no main backend - the extra lines serve the site"
+	elif [[ "$tkind" == files ]]; then
 		if [[ -d "$target" ]]; then
 			ok "serving files from $target"
 		else
@@ -1601,6 +1615,7 @@ cmd_add() {
 				# change of the target would never reach anyone who saw the old one
 				printf '%sredir %s{uri}\n' "$ind" "${target%/}"
 				;;
+			none) ;;
 			*) render_proxy "$ind" "$target" ;;
 		esac
 	}
@@ -1616,6 +1631,7 @@ cmd_add() {
 	fi
 
 	render_main() {
+		[[ "$tkind" == none ]] && return 0
 		if [[ ${#route_specs[@]} -gt 0 ]]; then
 			echo -e "\t# everything else"
 			echo -e "\thandle {"
@@ -1649,11 +1665,20 @@ cmd_add() {
 		[[ " ${route_specs[*]-} " == *" h2c://"* || "$target" == h2c://* ]] || echo -e "\tencode zstd gzip"
 		[[ -n "$tls_block" ]] && echo "$tls_block"
 
-		local rs
+		if [[ -n "$extra_file" && -s "$extra_file" ]]; then
+			# lines the form does not know, kept exactly as they were
+			echo
+			echo -e "\t# extra lines (kept as they are)"
+			sed -e 's/[[:space:]]*$//' -e '/./s/^/\t/' "$extra_file"
+			echo -e "\t# end of extra lines"
+		fi
+
+		local rs ri=0
 		for rs in ${route_specs[@]+"${route_specs[@]}"}; do
 			# "<path> <kind> <target>"
 			echo
-			echo -e "\t# route: ${rs%% *}"
+			echo -e "\t# route: ${rs%% *}${route_kinds[$ri]:+ (${route_kinds[$ri]})}"
+			ri=$((ri+1))
 			printf '\thandle %s {\n' "${rs%% *}"
 			rs="${rs#* }"
 			render_body $'\t\t' "${rs%% *}" "${rs#* }"
@@ -3130,8 +3155,8 @@ def cf_check_token(token):
     return True, [z.get("name", "") for z in js.get("result") or []]
 
 
-# Directives the form knows how to write back. A site that uses anything else
-# is edited as raw text, because the form would silently drop the rest.
+# Directives the form knows how to write back. Anything else at site level is
+# kept word for word as "extra lines"; inside a proxy block it would be lost.
 FORM_TOP = {"bind", "encode", "tls", "reverse_proxy", "handle", "root",
             "file_server", "redir", "@app", "respond"}
 FORM_PROXY = {"header_up", "transport", "tls_insecure_skip_verify", "versions",
@@ -3143,12 +3168,14 @@ def parse_site(text):
     """Turn a site file back into the fields of the add/edit form.
 
     Line based, which is how smart-caddy and nearly every hand-written
-    Caddyfile lay a site out. form_ok is False when something is present that
-    the form cannot express."""
+    Caddyfile lay a site out. Site-level directives the form does not know go
+    to "extra" (kept as they are); "unknown" lists what saving from the form
+    would drop."""
     info = {"target": "", "routes": [], "paths": [], "strict_path": False,
             "host_header": "", "insecure": False, "nobuffer": False,
             "behind_xray": "behind an Xray fallback" in text, "listen_port": "",
-            "no_tls": False, "form_ok": True, "unknown": []}
+            "no_tls": False, "form_ok": True, "unknown": [], "extra": "",
+            "custom": False}
     m = re.search(r"^\s*(?:@app path|# app base path:)\s+(.+)$", text, re.M)
     if m:
         for tok in m.group(1).split():
@@ -3163,6 +3190,12 @@ def parse_site(text):
     stack = []          # open blocks, as (directive, argument)
     handle = None       # path of the handle block we are in ("" = catch-all)
     blocks = http_blocks = 0
+    kinds = {}          # route path -> type the panel chose ("# route: /p (ws)")
+    for m in re.finditer(r"^\s*# route: (\S+) \((ws|web|h2c)\)\s*$", text, re.M):
+        kinds[m.group(1)] = m.group(2)
+    extra = []          # site-level lines the form does not know
+    cap = None          # stack depth while such a block is being copied
+    in_extra = False    # between the "# extra lines" markers the panel wrote
 
     def body_target(words):
         d = words[0]
@@ -3174,8 +3207,28 @@ def parse_site(text):
             return "redirect:" + re.sub(r"\{uri\}$", "", words[1])
         return None
 
+    def route(path, target):
+        info["routes"].append({"path": path, "target": target,
+                               "kind": "h2c" if target.startswith("h2c://")
+                               else kinds.get(path, "web")})
+
     for raw in text.splitlines():
         line = raw.strip()
+        if cap is not None:
+            # inside an unknown block: copy everything, comments included
+            extra.append(raw[1:] if raw.startswith("\t") else raw.strip())
+            if line and not line.startswith("#"):
+                if line == "}":
+                    stack.pop()
+                elif line.split()[-1] == "{":
+                    stack.append(("extra", ""))
+            if len(stack) == cap:
+                cap = None
+            continue
+        if line == "# extra lines (kept as they are)":
+            in_extra = True
+        elif line == "# end of extra lines":
+            in_extra = False
         if not line or line.startswith("#"):
             continue
         words = line.split()
@@ -3201,8 +3254,19 @@ def parse_site(text):
         d = words[0]
         parent = stack[-1][0]
         if parent in ("site", "handle"):
+            if parent == "site" and (in_extra or d not in FORM_TOP):
+                # kept word for word, with its block if it has one
+                extra.append(raw[1:] if raw.startswith("\t") else line)
+                if opens:
+                    cap = depth
+                    stack.append(("extra", ""))
+                continue
             if d not in FORM_TOP:
                 info["unknown"].append(d)
+            elif d == "reverse_proxy" and parent == "site" and len(words) > 2 \
+                    and words[1].startswith("/") and words[2] != "{":
+                # "reverse_proxy /sub/* 127.0.0.1:2096" - a route written by hand
+                route(words[1], words[2])
             elif d == "handle":
                 arg = words[1] if len(words) > 2 else ""
                 if arg.startswith("/") or arg in ("", "@app"):
@@ -3213,7 +3277,7 @@ def parse_site(text):
                 t = body_target(words)
                 if t:
                     if handle:
-                        info["routes"].append({"path": handle, "target": t})
+                        route(handle, t)
                     elif not info["target"]:
                         info["target"] = t
         elif parent == "reverse_proxy":
@@ -3247,8 +3311,14 @@ def parse_site(text):
     th = re.sub(r"^[a-z]+://", "", info["target"]).split("/")[0].rsplit(":", 1)[0]
     if info["host_header"] and info["host_header"] == th and RE_DOMAIN.match(th):
         info["host_header"] = ""
-    info["target"] = info["target"] or "?"
+    while extra and not extra[-1].strip():
+        extra.pop()
+    info["extra"] = "\n".join(extra)
+    if not info["target"]:
+        # no main backend: fine when the extra lines serve the site
+        info["target"] = "" if info["extra"] else "?"
     info["form_ok"] = not info["unknown"] and info["target"] != "?"
+    info["custom"] = bool(info["extra"] or info["unknown"])
     return info
 
 
@@ -3673,9 +3743,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_add(self, data, replace=False):
         domain = str(data.get("domain", "")).strip().lower()
         target = str(data.get("target", "")).strip()
+        extra = str(data.get("extra", "")).strip("\n")
         if not RE_DOMAIN.match(domain):
             return self.send_json({"ok": False, "out": "invalid domain"}, 400)
-        if not (RE_PORT.match(target) or RE_HOSTPORT.match(target)
+        if len(extra) > 30000:
+            return self.send_json({"ok": False, "out": "extra lines are too long"}, 400)
+        if not target and extra.strip():
+            target = "none"         # the extra lines serve the site
+        elif not (RE_PORT.match(target) or RE_HOSTPORT.match(target)
                 or RE_URL.match(target) or RE_DIR.match(target)
                 or RE_REDIR.match(target) or RE_DOMAIN.match(target)):
             return self.send_json(
@@ -3691,7 +3766,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 fresh = time.time() - os.path.getmtime(f) < 300
                 with open(f) as fh:
-                    same = parse_site(fh.read())["target"] == target
+                    same = (parse_site(fh.read())["target"] or "none") == target
             except OSError:
                 fresh = same = False
             if fresh and same:
@@ -3714,7 +3789,9 @@ class Handler(BaseHTTPRequestHandler):
             if not (RE_PORT.match(rt) or RE_HOSTPORT.match(rt) or RE_URL.match(rt)
                     or RE_DIR.match(rt) or RE_REDIR.match(rt) or RE_DOMAIN.match(rt)):
                 return self.send_json({"ok": False, "out": f"invalid route backend: {rt}"}, 400)
-            args += ["--route", f"{rp}={rt}"]
+            kind = str((r or {}).get("kind", ""))
+            kind = kind + ":" if kind in ("ws", "web", "h2c") else ""
+            args += ["--route", f"{kind}{rp}={rt}"]
 
         for p in (data.get("paths") or []):
             p = str(p).strip()
@@ -3744,7 +3821,15 @@ class Handler(BaseHTTPRequestHandler):
         if data.get("self_signed"): args.append("--self-signed")
         if data.get("no_tls"):      args.append("--no-tls")
 
-        return self.send_json(self.cli(args, timeout=240))
+        if not extra.strip():
+            return self.send_json(self.cli(args, timeout=240))
+        fd, tmp = tempfile.mkstemp(prefix="smart-caddy-extra.", suffix=".caddy")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                fh.write(extra + "\n")
+            return self.send_json(self.cli(args + ["--extra-file", tmp], timeout=240))
+        finally:
+            os.unlink(tmp)
 
     def do_POST(self):
         path = urlparse(self.path).path
@@ -4292,8 +4377,30 @@ select option{background:#16142a;color:var(--ink)}
 select:disabled{opacity:.45;cursor:default}
 .hint{font-size:12.5px;color:var(--mut);margin-top:8px;line-height:1.7}
 .hint code{font-size:11.5px}
-.route{display:grid;grid-template-columns:minmax(120px,1fr) auto minmax(170px,.9fr) minmax(120px,1fr) auto;
-  gap:8px;align-items:center;margin-bottom:10px}
+.route{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr) auto;
+  gap:10px 8px;align-items:center;margin-bottom:12px;padding:12px;border-radius:var(--r-sm);
+  border:1px solid var(--stroke);background:rgba(0,0,0,.12)}
+.route .r-kind{grid-column:1/-1}
+.route .r-help{grid-column:1/-1;margin:0}
+.pills{display:flex;flex-wrap:wrap;gap:8px}
+.pills label{display:inline-flex;align-items:center;gap:8px;margin:0;cursor:pointer;padding:9px 14px;
+  border-radius:999px;border:1px solid var(--stroke);background:rgba(0,0,0,.18);font-size:13.5px;
+  color:var(--mut);transition:border-color .15s,background .15s,color .15s}
+.pills label:hover{border-color:var(--stroke-2)}
+.pills label:has(input:checked){border-color:var(--acc);color:var(--ink);
+  background:color-mix(in srgb,var(--acc) 14%,transparent)}
+.pills input{margin:0;flex:none;accent-color:var(--acc);width:15px;height:15px}
+.pills.sm label{padding:6px 11px;font-size:12.5px}
+.kindbox .what{font-weight:600;font-size:15px;margin:0 0 12px}
+.howto{margin-top:14px}
+.howto summary{cursor:pointer;color:var(--acc);font-weight:600;font-size:13.5px}
+.howto ol{margin:10px 0 0;padding-inline-start:22px;line-height:1.9;font-size:13.5px;color:var(--mut)}
+.howto ol b{color:var(--ink)}
+.howto li{margin-bottom:4px}
+details.sec>summary{cursor:pointer;list-style:none;display:flex;align-items:center;gap:10px;font-weight:600}
+details.sec>summary::-webkit-details-marker{display:none}
+details.sec[open]>summary{margin-bottom:12px}
+#f-extra{min-height:120px;font-family:var(--mono,ui-monospace,monospace);font-size:13px}
 .route .arr{color:var(--dim)}
 html[dir=rtl] .route .arr{transform:scaleX(-1)}
 .routes-empty{font-size:13px;color:var(--dim);padding:4px 0 10px}
@@ -4410,7 +4517,7 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
   .site{grid-template-columns:1fr}
   .route{grid-template-columns:1fr auto;}
   .route .arr{display:none}
-  .route .r-path,.route .r-type,.route .r-target{grid-column:1/2}
+  .route .r-path,.route .r-target{grid-column:1/2}
   .route button{grid-column:2/3;grid-row:1/2}
   #log summary{gap:6px 10px}
   #log summary .grow{order:9;flex-basis:100%}
@@ -4526,6 +4633,18 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
   <div id="form-card">
   <form id="add" autocomplete="off">
     <div class="note" id="edit-note" hidden></div>
+    <div class="note" id="drop-note" hidden><span id="drop-text"></span>
+      <button type="button" class="link" id="drop-raw" data-t="open_code">Edit as code</button></div>
+
+    <div class="sec glass kindbox">
+      <p class="what" data-t="what_t">What are you putting online?</p>
+      <div class="pills" id="f-kind">
+        <label><input type="radio" name="fkind" value="web" checked><span data-t="k_web">Website or app</span></label>
+        <label><input type="radio" name="fkind" value="panel"><span data-t="k_panel">x-ui panel</span></label>
+        <label><input type="radio" name="fkind" value="inbound"><span data-t="k_inbound">Xray config</span></label>
+      </div>
+      <details class="howto" id="howto" open><summary data-t="howto_t">How to fill this in</summary><div id="howto-body"></div></details>
+    </div>
 
     <fieldset class="sec glass">
       <legend><span class="num">1</span><span data-t="sec_basic">Address and backend</span></legend>
@@ -4550,7 +4669,7 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
       <div id="routes"></div>
       <div class="routes-empty" id="routes-empty" data-t="routes_none">No routes - every request goes to the main backend.</div>
       <button type="button" id="btn-route" data-t="add_route">+ Add route</button>
-      <div class="hint" data-th="f_routes_types"></div>
+      <div class="hint" data-th="route_auto"></div>
     </fieldset>
 
     <fieldset class="sec glass">
@@ -4592,6 +4711,12 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
           <span><b data-t="c_xray">Behind Xray</b><div class="hint" data-t="c_xray_h"></div></span></label>
       </div>
     </fieldset>
+
+    <details class="sec glass" id="sec-extra">
+      <summary><span class="num">5</span><span data-t="sec_extra">Extra Caddy lines</span> <span class="opt sub" data-t="optional">(optional)</span></summary>
+      <p class="sec-d" data-th="sec_extra_d"></p>
+      <textarea id="f-extra" class="ltr" dir="ltr" spellcheck="false" autocomplete="off" placeholder="header -Server"></textarea>
+    </details>
 
     <div class="row">
       <button type="submit" class="primary" id="btn-add" data-t="btn_add">Add site</button>
@@ -4879,6 +5004,21 @@ en: {
   sec_mode:'Site type', sec_mode_d:'Tick what describes this site. Leave all three empty for an ordinary website or app.',
   routes_none:'No routes - every request goes to the main backend.',
   rt_http:'HTTP / WS / HTTPUpgrade', rt_h2c:'XHTTP / gRPC (h2c)',
+  what_t:'What are you putting online?',
+  k_web:'Website or app', k_panel:'x-ui / 3x-ui panel', k_inbound:'Xray config through CDN',
+  howto_t:'How to fill this in',
+  howto_web:'<ol><li><b>Domain</b>: the address visitors open, e.g. <code>app.example.com</code>. Its A record points at this server.</li><li><b>Main backend</b>: the app\'s port on this server, e.g. <code>8088</code> - or a folder (<code>/var/www/site</code>), another site (<code>example.com</code>) or <code>redirect:https://x.com</code>.</li><li><b>Routes</b> only when one path has to go somewhere else, e.g. <code>/dns-query/</code> → <code>8000</code>.</li><li>Save. Caddy gets the certificate by itself.</li></ol>',
+  howto_panel:'<ol><li><b>In x-ui first</b> (Panel Settings): Listen IP <code>127.0.0.1</code>, and leave the panel\'s certificate and key fields <b>empty</b> - Caddy does HTTPS. The same on the Subscription tab.</li><li><b>Domain</b>: the panel\'s address, e.g. <code>panel.example.com</code>.</li><li><b>Main backend</b>: just the panel port, e.g. <code>2053</code>. If x-ui still has its own certificate, write <code>https://127.0.0.1:2053</code>.</li><li><b>Path prefix</b> (section 3): the panel\'s <i>Web Base Path</i>, e.g. <code>/5wSobQvUFuNy4zBUcc</code>.</li><li><b>Subscription</b>: add a route of type <b>Web / Sub</b>: path = x-ui\'s <i>Sub Path</i> (e.g. <code>/sub/</code>), backend = the sub port (e.g. <code>2096</code>). In x-ui set <i>Sub URI</i> to <code>https://panel.example.com/sub/</code>.</li><li><b>Admin panel</b> (section 4) is ticked for you. Save, then open <code>https://panel.example.com/&lt;base path&gt;/</code>.</li></ol>',
+  howto_inbound:'<ol><li><b>In x-ui</b>: an inbound with transport <b>WebSocket</b>, <b>HTTPUpgrade</b>, <b>XHTTP</b> or <b>gRPC</b>; Listen IP <code>127.0.0.1</code>; Security <code>none</code> (Caddy does TLS); a long random path, e.g. <code>/k8Jq2xVt</code> (gRPC: a service name).</li><li><b>Domain</b>: the name clients connect to. In Cloudflare its cloud is orange (grey until the certificate is issued).</li><li><b>Main backend</b>: what an ordinary visitor sees, e.g. <code>redirect:https://github.com</code> or a website port.</li><li><b>Route</b>: path = the inbound\'s path, tick the inbound\'s transport, backend = the inbound\'s port. The <code>*</code> is added for you.</li><li>In the x-ui share link: address = the domain (or a clean Cloudflare IP), port <code>443</code>, TLS on, SNI and Host = the domain.</li></ol>',
+  rk_web:'Web / Sub', rk_ws:'WebSocket / HTTPUpgrade', rk_h2c:'XHTTP / gRPC',
+  rh_web:'A website, an API or the x-ui subscription: path e.g. <code>/sub/</code>, backend = its port, e.g. <code>2096</code>.',
+  rh_ws:'Path = the inbound\'s path in x-ui (e.g. <code>/gaming</code>), backend = the inbound\'s port.',
+  rh_h2c:'XHTTP: the inbound\'s path. gRPC: <code>/</code> + the service name. Backend = the inbound\'s port; Caddy streams it unbuffered.',
+  route_auto:'Enter the path as it is in x-ui or the app - the leading <code>/</code> and the trailing <code>*</code> (everything under it) are added automatically.',
+  sec_extra:'Extra Caddy lines',
+  sec_extra_d:'Advanced and usually empty. These lines go into the site exactly as written, e.g. <code>header -Server</code> or an <code>import</code>. When a site already has lines like that, they show up here and are kept when you save.',
+  note_drop:'Saving from the form drops these parts, which it cannot show: {0}. To keep them, edit this site as code.',
+  open_code:'Edit as code',
   f_routes_types:'Route type: <b>HTTP / WS / HTTPUpgrade</b> for websites, WebSocket and HTTPUpgrade inbounds · <b>XHTTP / gRPC (h2c)</b> for Xray XHTTP and gRPC inbounds - Caddy talks cleartext HTTP/2 to them and streams without buffering. The inbound itself listens on <code>127.0.0.1</code> with security <code>none</code>; Caddy does the TLS.',
   diag_empty:'Nothing yet. Run diagnostics, or take an action anywhere in the panel - its output lands here.',
   g_title:'Hide your server behind Cloudflare',
@@ -5007,6 +5147,21 @@ fa: {
   sec_mode:'نوع سایت', sec_mode_d:'گزینه‌ای را که این سایت را توصیف می‌کند تیک بزنید. برای سایت یا برنامهٔ معمولی هر سه را خالی بگذارید.',
   routes_none:'مسیری تعریف نشده - همهٔ درخواست‌ها به مقصد اصلی می‌روند.',
   rt_http:'HTTP / WS / HTTPUpgrade', rt_h2c:'XHTTP / gRPC (h2c)',
+  what_t:'چه چیزی را آنلاین می‌کنید؟',
+  k_web:'سایت یا برنامه', k_panel:'پنل x-ui / 3x-ui', k_inbound:'کانفیگ Xray از طریق CDN',
+  howto_t:'راهنمای پر کردن فرم',
+  howto_web:'<ol><li><b>دامنه</b>: آدرسی که کاربر باز می‌کند، مثلاً <code>app.example.com</code>. رکورد A آن باید به IP همین سرور اشاره کند.</li><li><b>مقصد اصلی</b>: پورت برنامه روی همین سرور، مثلاً <code>8088</code>؛ یا یک پوشه (<code>/var/www/site</code>)، یک سایت دیگر (<code>example.com</code>) یا <code>redirect:https://x.com</code>.</li><li><b>مسیرها</b> فقط وقتی لازم است که یک مسیر باید جای دیگری برود، مثلاً <code>/dns-query/</code> ← <code>8000</code>.</li><li>ذخیره کنید. گواهی را Caddy خودش می‌گیرد.</li></ol>',
+  howto_panel:'<ol><li><b>اول در x-ui</b> (تنظیمات پنل): Listen IP را <code>127.0.0.1</code> بگذارید و فیلدهای مسیر گواهی و کلید پنل را <b>خالی</b> کنید؛ HTTPS را Caddy می‌دهد. در تب Subscription هم همین کار را بکنید.</li><li><b>دامنه</b>: آدرس پنل، مثلاً <code>panel.example.com</code>.</li><li><b>مقصد اصلی</b>: فقط پورت پنل، مثلاً <code>2053</code>. اگر x-ui هنوز گواهی خودش را دارد بنویسید <code>https://127.0.0.1:2053</code>.</li><li><b>پیشوند مسیر</b> (بخش ۳): همان <i>Web Base Path</i> پنل، مثلاً <code>/5wSobQvUFuNy4zBUcc</code>.</li><li><b>ساب</b>: یک مسیر با نوع <b>وب / ساب</b> اضافه کنید: مسیر = <i>Sub Path</i> در x-ui (مثلاً <code>/sub/</code>)، مقصد = پورت ساب (مثلاً <code>2096</code>). در x-ui مقدار <i>Sub URI</i> را <code>https://panel.example.com/sub/</code> بگذارید.</li><li>تیک <b>پنل مدیریتی</b> (بخش ۴) خودکار زده شده است. ذخیره کنید و <code>https://panel.example.com/&lt;مسیر پایه&gt;/</code> را باز کنید.</li></ol>',
+  howto_inbound:'<ol><li><b>در x-ui</b>: یک اینباند با transport <b>WebSocket</b>، <b>HTTPUpgrade</b>، <b>XHTTP</b> یا <b>gRPC</b> بسازید؛ Listen IP <code>127.0.0.1</code>؛ Security <code>none</code> (TLS را Caddy انجام می‌دهد)؛ یک path طولانی و تصادفی مثل <code>/k8Jq2xVt</code> (در gRPC: یک service name).</li><li><b>دامنه</b>: اسمی که کلاینت به آن وصل می‌شود. در Cloudflare ابرش نارنجی باشد (تا صدور گواهی خاکستری).</li><li><b>مقصد اصلی</b>: چیزی که بازدیدکنندهٔ معمولی می‌بیند، مثلاً <code>redirect:https://github.com</code> یا پورت یک سایت.</li><li><b>مسیر</b>: مسیر = path اینباند، تیک نوع transport اینباند را بزنید، مقصد = پورت اینباند. علامت <code>*</code> خودکار اضافه می‌شود.</li><li>در لینک اشتراک x-ui: address = دامنه (یا یک IP تمیز Cloudflare)، پورت <code>443</code>، TLS روشن، SNI و Host = دامنه.</li></ol>',
+  rk_web:'وب / ساب', rk_ws:'WebSocket / HTTPUpgrade', rk_h2c:'XHTTP / gRPC',
+  rh_web:'سایت، API یا ساب x-ui: مسیر مثلاً <code>/sub/</code>، مقصد = پورت آن، مثلاً <code>2096</code>.',
+  rh_ws:'مسیر = path اینباند در x-ui (مثلاً <code>/gaming</code>)، مقصد = پورت اینباند.',
+  rh_h2c:'XHTTP: همان path اینباند. gRPC: <code>/</code> + service name. مقصد = پورت اینباند؛ Caddy بدون بافر استریم می‌کند.',
+  route_auto:'مسیر را همان‌طور که در x-ui یا برنامه است بنویسید؛ <code>/</code> اول و <code>*</code> آخر (یعنی همهٔ زیرمسیرها) خودکار اضافه می‌شوند.',
+  sec_extra:'خطوط اضافهٔ Caddy',
+  sec_extra_d:'پیشرفته و معمولاً خالی. این خطوط دقیقاً همان‌طور که نوشته شده‌اند داخل سایت قرار می‌گیرند، مثلاً <code>header -Server</code> یا یک <code>import</code>. اگر سایتی از قبل چنین خطوطی دارد اینجا نشان داده می‌شوند و موقع ذخیره حفظ می‌شوند.',
+  note_drop:'ذخیره از فرم این بخش‌ها را که فرم نمی‌تواند نشان دهد حذف می‌کند: {0}. برای حفظ آن‌ها، این سایت را به‌صورت کد ویرایش کنید.',
+  open_code:'ویرایش به‌صورت کد',
   f_routes_types:'نوع مسیر: <b>HTTP / WS / HTTPUpgrade</b> برای سایت‌ها و اینباندهای WebSocket و HTTPUpgrade · <b>XHTTP / gRPC (h2c)</b> برای اینباندهای XHTTP و gRPC در Xray؛ Caddy با HTTP/2 بدون رمز به آن‌ها وصل می‌شود و بدون بافر استریم می‌کند. خود اینباند روی <code>127.0.0.1</code> با security <code>none</code> گوش می‌دهد و TLS را Caddy انجام می‌دهد.',
   diag_empty:'هنوز چیزی نیست. عیب‌یابی را اجرا کنید یا هر کاری در پنل انجام دهید؛ خروجی‌اش اینجا می‌آید.',
   g_title:'سرور را پشت Cloudflare مخفی کنید',
@@ -5271,6 +5426,7 @@ function render(d){
     if (s.nobuffer)      notes += '<span class="tag">' + esc(t('tag_unbuffered')) + '</span>';
     if (s.insecure)      notes += '<span class="tag">' + esc(t('tag_insecure')) + '</span>';
     if (!s.form_ok)      notes += '<span class="tag warn">' + esc(t('tag_custom')) + '</span>';
+    else if (s.custom)   notes += '<span class="tag">' + esc(t('tag_custom')) + '</span>';
     else if (s.imported) notes += '<span class="tag">' + esc(t('tag_imported')) + '</span>';
     let backend = '<code>' + esc(s.target) + '</code>';
     for (const r of s.routes)
@@ -5293,12 +5449,9 @@ function render(d){
   document.querySelectorAll('[data-raw]').forEach(b => b.onclick = () => openRaw(b.dataset.raw));
   document.querySelectorAll('[data-cert]').forEach(b => b.onclick = () => toCaddy(b.dataset.cert));
   document.querySelectorAll('[data-renew]').forEach(b => b.onclick = () => renewCert(b.dataset.renew));
-  document.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => {
-    // A block the form cannot express would lose directives if saved from
-    // the form, so it goes straight to the raw editor.
-    const s = SITES[+b.dataset.edit];
-    s.form_ok ? startEdit(s) : openRaw(s.domain);
-  });
+  // Edit is always the form; what it cannot show is named in a note there,
+  // with a way to the code editor
+  document.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => startEdit(SITES[+b.dataset.edit]));
 }
 
 // Where each certificate and key sit on disk, ready to paste into x-ui, Xray
@@ -5505,50 +5658,93 @@ async function renewCert(domain){
 }
 
 // ---------------------------------------------------------------- routes
-// A route row is: path -> type -> backend. The "XHTTP / gRPC" type stores
-// the backend as h2c://host:port, which is what Caddy needs for those.
+// A route row is: path -> backend, plus a ticked type. "XHTTP / gRPC" stores
+// the backend as h2c://host:port, which is what Caddy needs for those; the
+// other two are the same proxy and only the label is remembered.
+const ROUTE_KINDS = ['web', 'ws', 'h2c'];
+let ROUTE_N = 0;
+function routeKind(row){ return (row.querySelector('.r-kind input:checked') || {}).value || 'web'; }
 function routeTexts(row){
-  const sel = row.querySelector('.r-type');
-  sel.options[0].textContent = t('rt_http');
-  sel.options[1].textContent = t('rt_h2c');
-  row.querySelector('.r-path').placeholder = sel.value === 'h2c' ? '/k8Jq2xVt*' : t('route_path');
-  row.querySelector('.r-target').placeholder = sel.value === 'h2c' ? '3103' : t('route_target');
+  const k = routeKind(row);
+  row.querySelectorAll('.r-kind span').forEach((e, i) => e.textContent = t('rk_' + ROUTE_KINDS[i]));
+  row.querySelector('.r-path').placeholder = {web: '/sub/', ws: '/gaming', h2c: '/k8Jq2xVt'}[k];
+  row.querySelector('.r-target').placeholder = {web: '2096', ws: '3305', h2c: '3103'}[k];
+  row.querySelector('.r-help').innerHTML = t('rh_' + k);
 }
 function syncRoutes(){ $('#routes-empty').hidden = !!document.querySelector('#routes .route'); }
 
-function addRouteRow(path, target){
-  let type = 'http';
+// "/gaming" -> "/gaming*", "sub/" -> "/sub/*": a route covers everything under
+// its path, which XHTTP and gRPC (sub-paths per stream) need and WS is fine with
+function normPath(p){
+  p = (p || '').trim();
+  if (!p) return '';
+  if (!p.startsWith('/')) p = '/' + p;
+  if (!p.includes('*')) p += '*';
+  return p;
+}
+
+function addRouteRow(path, target, kind){
   target = target || '';
-  if (/^h2c:\/\//.test(target)){ type = 'h2c'; target = target.slice(6).replace(/^127\.0\.0\.1:(\d+)$/, '$1'); }
+  if (/^h2c:\/\//.test(target)){ kind = 'h2c'; target = target.slice(6).replace(/^127\.0\.0\.1:(\d+)$/, '$1'); }
+  kind = ROUTE_KINDS.includes(kind) ? kind : 'web';
+  const n = ++ROUTE_N;
   const row = document.createElement('div');
   row.className = 'route';
-  row.innerHTML = '<input type="text" class="r-path"><span class="arr">→</span>'
-                + '<select class="r-type"><option value="http"></option><option value="h2c"></option></select>'
-                + '<input type="text" class="r-target">'
-                + '<button type="button" class="link" aria-label="remove">✕</button>';
+  row.innerHTML = '<input type="text" class="r-path ltr" dir="ltr"><span class="arr">→</span>'
+                + '<input type="text" class="r-target ltr" dir="ltr">'
+                + '<button type="button" class="link" aria-label="remove">✕</button>'
+                + '<div class="r-kind pills sm">'
+                + ROUTE_KINDS.map(k => '<label><input type="radio" name="rk' + n + '" value="' + k + '"><span></span></label>').join('')
+                + '</div><div class="hint r-help"></div>';
   row.querySelector('.r-path').value = path || '';
   row.querySelector('.r-target').value = target;
-  row.querySelector('.r-type').value = type;
-  row.querySelector('.r-type').onchange = () => routeTexts(row);
+  row.querySelector('.r-kind input[value="' + kind + '"]').checked = true;
+  row.querySelectorAll('.r-kind input').forEach(i => i.onchange = () => routeTexts(row));
+  row.querySelector('.r-path').onblur = e => { e.target.value = normPath(e.target.value); };
   routeTexts(row);
   row.querySelector('button').onclick = () => { row.remove(); syncRoutes(); };
   $('#routes').appendChild(row);
   syncRoutes();
   return row;
 }
-$('#btn-route').onclick = () => addRouteRow().querySelector('.r-path').focus();
+$('#btn-route').onclick = () =>
+  addRouteRow('', '', siteKind() === 'inbound' ? 'ws' : 'web').querySelector('.r-path').focus();
 
 function readRoutes(){
   return [...document.querySelectorAll('#routes .route')].map(r => {
+    const kind = routeKind(r);
     let target = r.querySelector('.r-target').value.trim();
-    if (r.querySelector('.r-type').value === 'h2c' && target){
+    if (kind === 'h2c' && target){
       target = target.replace(/^[a-z0-9]+:\/\//i, '');
       if (/^\d+$/.test(target)) target = '127.0.0.1:' + target;
       target = 'h2c://' + target;
     }
-    return {path: r.querySelector('.r-path').value.trim(), target};
+    return {path: normPath(r.querySelector('.r-path').value), target, kind};
   }).filter(r => r.path || r.target);
 }
+
+// ---------------------------------------------------------------- what is it
+// Only shapes the form (guide, ticks, examples); nothing of it is saved.
+function siteKind(){ return ($('#f-kind input:checked') || {}).value || 'web'; }
+function kindTexts(){
+  const k = siteKind();
+  $('#howto-body').innerHTML = t('howto_' + k);
+  $('#f-target').placeholder = {web: '8088', panel: '2053', inbound: 'redirect:https://github.com'}[k];
+}
+function setKind(k, apply){
+  $('#f-kind input[value="' + k + '"]').checked = true;
+  if (apply){
+    $('#f-panel').checked = k === 'panel';
+    if (k === 'inbound' && !document.querySelector('#routes .route')) addRouteRow('', '', 'ws');
+  }
+  kindTexts();
+}
+document.querySelectorAll('#f-kind input').forEach(i => i.onchange = () => setKind(i.value, true));
+
+// with extra lines the site may do without a main backend
+function syncExtra(){ $('#f-target').required = !$('#f-extra').value.trim(); }
+$('#f-extra').oninput = syncExtra;
+$('#drop-raw').onclick = () => { const d = EDITING && EDITING.domain; stopEdit(); if (d) openRaw(d); };
 
 // ---------------------------------------------------------------- form
 function formTexts(){
@@ -5557,6 +5753,9 @@ function formTexts(){
   $('#btn-add').textContent = t(EDITING ? 'btn_save' : 'btn_add');
   document.querySelectorAll('#routes .route').forEach(routeTexts);
   if (EDITING && EDITING.imported) $('#edit-note').innerHTML = t('note_imported');
+  if (EDITING && EDITING.unknown && EDITING.unknown.length)
+    $('#drop-text').innerHTML = t('note_drop', EDITING.unknown.map(u => '<code>' + esc(u) + '</code>').join(', '));
+  kindTexts();
 }
 
 function startEdit(s){
@@ -5573,10 +5772,16 @@ function startEdit(s){
   syncCert();
   XRAY_TOUCHED = true;
   $('#routes').innerHTML = '';
-  for (const r of s.routes) addRouteRow(r.path, r.target);
+  for (const r of s.routes) addRouteRow(r.path, r.target, r.kind);
   syncRoutes();
+  $('#f-extra').value = s.extra || '';
+  $('#sec-extra').open = !!s.extra;
+  syncExtra();
+  setKind(s.routes.some(r => r.kind === 'ws' || r.kind === 'h2c') ? 'inbound'
+        : (s.insecure || s.nobuffer) ? 'panel' : 'web', false);
   $('#f-domain').readOnly = true;
   $('#edit-note').hidden = !s.imported;
+  $('#drop-note').hidden = !(s.unknown && s.unknown.length);
   $('#form-card').classList.add('editing');
   $('#btn-cancel').hidden = false;
   $('#form-out-card').hidden = true;
@@ -5600,6 +5805,11 @@ function stopEdit(){
   XRAY_TOUCHED = false;
   $('#f-domain').readOnly = false;
   $('#edit-note').hidden = true;
+  $('#drop-note').hidden = true;
+  $('#f-extra').value = '';
+  $('#sec-extra').open = false;
+  syncExtra();
+  setKind('web', false);
   $('#form-card').classList.remove('editing');
   $('#btn-cancel').hidden = true;
   formTexts();
@@ -5627,7 +5837,8 @@ $('#add').onsubmit = async e => {
     panel: $('#f-panel').checked,
     no_tls: $('#f-notls').checked,
     behind_xray: $('#f-xray').checked,
-    cert: $('#f-cert').value
+    cert: $('#f-cert').value,
+    extra: $('#f-extra').value
   };
   const editing = !!EDITING;
   busy = true;
