@@ -4,7 +4,7 @@
 
 **English** · [فارسی](README.fa.md)
 
-<a href="https://hits.sh/github.com/Plus98ir/Smart-Caddy/"><img src="https://hits.sh/github.com/Plus98ir/Smart-Caddy.svg?style=for-the-badge&label=views&color=2563eb" alt="Views"></a>
+<a href="https://hits.sh/github.com/Plus98ir/Smart-Caddy/"><img src="https://hits.sh/github.com/Plus98ir/Smart-Caddy.svg?style=for-the-badge&label=views&color=2563eb" alt="Views"></a> <a href="https://corenetbase.com/#support"><img src="https://img.shields.io/badge/support-buy%20me%20a%20coffee-e11d2a?style=for-the-badge&logo=buymeacoffee&logoColor=white" alt="Support"></a>
 
 Smart reverse proxy management for [Caddy](https://caddyserver.com), in one script.
 
