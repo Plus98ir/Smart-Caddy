@@ -2,7 +2,9 @@
 
 # Smart-Caddy
 
-[English](README.md) · **فارسی**
+<div align="center">
+<table><tr><td><a href="https://github.com/Plus98ir/Smart-Caddy/blob/main/README.md">🇺🇸 English</a></td><td><b>🇮🇷 فارسی</b></td></tr></table>
+</div>
 
 مدیریت هوشمند reverse proxy روی [Caddy](https://caddyserver.com)، در یک اسکریپت.
 
