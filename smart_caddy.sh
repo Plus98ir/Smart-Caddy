@@ -782,11 +782,14 @@ cmd_install() {
 
 	hdr "4/9  Global options block"
 	if ! grep -qE '^\s*\{\s*$' "$CADDYFILE"; then
-		[[ -z "$email" ]] && email="admin@$(hostname -d 2>/dev/null || echo localhost)"
+		# no domain name on the host: Let's Encrypt refuses "admin@", so leave email out
+		local hd; hd="$(hostname -d 2>/dev/null || true)"
+		[[ -z "$email" && -n "$hd" ]] && email="admin@$hd"
 		local tmp; tmp=$(mktemp)
-		{ printf '{\n\tadmin 127.0.0.1:2019\n\temail %s\n}\n\n' "$email"; cat "$CADDYFILE"; } > "$tmp"
+		{ printf '{\n\tadmin 127.0.0.1:2019\n'; [[ -n "$email" ]] && printf '\temail %s\n' "$email"
+		  printf '}\n\n'; cat "$CADDYFILE"; } > "$tmp"
 		write_inplace "$CADDYFILE" "$tmp"     # keeps mode + ownership
-		ok "added (email: $email)"
+		ok "added (email: ${email:-none})"
 		ACME_EMAIL="$email"
 	else
 		ok "already present - left alone"
@@ -3056,6 +3059,8 @@ from urllib.parse import parse_qs, urlparse
 
 HOST = os.environ.get("SMART_CADDY_UI_HOST", "127.0.0.1")
 PORT = int(os.environ.get("SMART_CADDY_UI_PORT", "9797"))
+# "/secret" when the panel shares a site under a hidden path; Caddy passes it on
+BASE = "/" + os.environ.get("SMART_CADDY_UI_BASE", "").strip("/")
 SITES_DIR = os.environ.get("SMART_CADDY_SITES", "/etc/caddy/sites.d")
 CLI = shutil.which("smart-caddy") or "/usr/local/bin/smart-caddy"
 CONF = "/etc/smart-caddy.conf"
@@ -3772,6 +3777,27 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def route_path(self):
+        """The request path below BASE, or None when it lies outside it."""
+        path = urlparse(self.path).path
+        if BASE == "/":
+            return path
+        if path.startswith(BASE + "/"):
+            return path[len(BASE):]
+        return None
+
+    def not_found(self):
+        if urlparse(self.path).path == BASE:
+            # the page loads api/... relative to itself, so it must end in "/"
+            self.send_response(301)
+            self.send_header("Location", BASE + "/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_response(404)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def client_ip(self):
         return self.headers.get("X-Real-IP") or self.client_address[0]
 
@@ -3788,7 +3814,8 @@ class Handler(BaseHTTPRequestHandler):
             return False
 
     def set_session(self, token, clear=False):
-        bits = [f"{COOKIE}={'' if clear else token}", "Path=/", "HttpOnly",
+        bits = [f"{COOKIE}={'' if clear else token}",
+                "Path=" + BASE.rstrip("/") + "/", "HttpOnly",
                 "SameSite=Strict"]
         bits.append("Max-Age=0" if clear else f"Max-Age={SESSION_HOURS * 3600}")
         if self.is_https():
@@ -3815,7 +3842,9 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- routes -------------------------------------------------------------
     def do_GET(self):
-        path = urlparse(self.path).path
+        path = self.route_path()
+        if path is None:
+            return self.not_found()
         if path == "/":
             return self.send_html(branded(PAGE if self.authed() else LOGIN_PAGE))
         if not self.authed():
@@ -3971,7 +4000,9 @@ class Handler(BaseHTTPRequestHandler):
             os.unlink(tmp)
 
     def do_POST(self):
-        path = urlparse(self.path).path
+        path = self.route_path()
+        if path is None:
+            return self.not_found()
         data = self.read_json()
 
         if not self.same_origin():
@@ -4301,7 +4332,7 @@ f.onsubmit = async e => {
   err.textContent = '';
   b.disabled = true; b.textContent = t('signing');
   try{
-    const r = await fetch('/api/login', {
+    const r = await fetch('api/login', {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({user: u.value, password: p.value})
     });
@@ -5638,7 +5669,7 @@ function certTag(s){
 }
 
 async function load(){
-  const d = await api('/api/state');
+  const d = await api('api/state');
   if (!d || !d.sites) return;
   STATE = d;
   // another browser may have changed the identity; never clobber an unsaved draft
@@ -5776,7 +5807,7 @@ async function certVia(domain, to){
   if (!confirm(t(to === 'cloudflare' ? 'confirm_use_cf' : 'confirm_use_http', domain))) return;
   busy = true;
   toast(t('working'));
-  const r = await api('/api/cert', {domain, to});
+  const r = await api('api/cert', {domain, to});
   busy = false;
   toast(r.ok ? t('done_ok') : t('toast_failed'), !r.ok);
   show('SSL ' + domain, r.out, !r.ok);
@@ -5797,7 +5828,7 @@ $('#cf-save').onclick = async () => {
   if (!token){ $('#cf-token').focus(); return; }
   if (busy) return;
   busy = true; toast(t('working'));
-  const r = await api('/api/cloudflare', {action: 'token', token});
+  const r = await api('api/cloudflare', {action: 'token', token});
   busy = false;
   if (!r.ok){ toast(r.out || t('toast_failed'), true); show(t('cf_title'), r.out, true); return; }
   $('#cf-token').value = '';
@@ -5806,14 +5837,14 @@ $('#cf-save').onclick = async () => {
 };
 $('#cf-module').onclick = async () => {
   if (busy || !confirm(t('confirm_cf_module'))) return;
-  const r = await api('/api/cloudflare', {action: 'module'});
+  const r = await api('api/cloudflare', {action: 'module'});
   if (!r.ok){ toast(r.out || t('toast_failed'), true); return; }
   show(t('cf_title'), t('cf_module_started'));
   [20, 45, 75, 110, 160].forEach(sec => setTimeout(refresh, sec * 1000));
 };
 $('#cf-clear').onclick = async () => {
   if (busy || !confirm(t('confirm_cf_clear'))) return;
-  const r = await api('/api/cloudflare', {action: 'clear'});
+  const r = await api('api/cloudflare', {action: 'clear'});
   show(t('cf_title'), r.out, !r.ok);
   refresh();
 };
@@ -5890,7 +5921,7 @@ async function remove(domain){
   if (busy) return;
   if (!confirm(t('confirm_remove', domain))) return;
   busy = true;
-  const r = await api('/api/del', {domain, purge_cert:false});
+  const r = await api('api/del', {domain, purge_cert:false});
   busy = false;
   toast(r.ok ? t('removed', domain) : t('remove_failed', domain), !r.ok);
   show(t('remove') + ' ' + domain, r.out, !r.ok);
@@ -5902,7 +5933,7 @@ async function importSites(domains, replace){
   if (busy) return;
   if (!confirm(t(replace ? 'confirm_dup' : 'confirm_import', domains.join(', ')))) return;
   busy = true;
-  const r = await api('/api/import', {domains, replace: !!replace});
+  const r = await api('api/import', {domains, replace: !!replace});
   busy = false;
   toast(r.ok ? t('imported_n', domains.length) : t('import_failed'), !r.ok);
   show(t('import'), r.out, !r.ok);
@@ -5914,7 +5945,7 @@ async function toCaddy(domain){
   if (!confirm(t('confirm_to_caddy', domain))) return;
   busy = true;
   toast(t('working'));
-  const r = await api('/api/cert', {domain});
+  const r = await api('api/cert', {domain});
   busy = false;
   toast(r.ok ? t('to_caddy_done', domain) : t('toast_failed'), !r.ok);
   show('SSL ' + domain, r.out, !r.ok);
@@ -5924,7 +5955,7 @@ async function toCaddy(domain){
 // ---------------------------------------------------------------- reality
 var RL = null;   // var: applyLang() may run before this line
 async function loadReality(){
-  RL = await api('/api/reality');
+  RL = await api('api/reality');
   renderReality();
 }
 function renderReality(){
@@ -5967,7 +5998,7 @@ function renderReality(){
   document.querySelectorAll('[data-rl]').forEach(b => b.onclick = async () => {
     if (busy || !confirm(t('rl_confirm', b.dataset.rl))) return;
     busy = true;
-    const r = await api('/api/reality', {action: 'on443', id: +b.dataset.rl});
+    const r = await api('api/reality', {action: 'on443', id: +b.dataset.rl});
     busy = false;
     toast(r.ok ? t('rl_on') : t('toast_failed'), !r.ok);
     show(t('rl_put') + ' #' + b.dataset.rl, r.out);
@@ -5978,14 +6009,14 @@ function renderReality(){
 async function sniSwitch(action){
   if (busy || !confirm(t(action === 'enable' ? 'rl_sni_confirm' : 'rl_sni_offconfirm'))) return;
   busy = true;
-  const r = await api('/api/sni', {action});
+  const r = await api('api/sni', {action});
   if (!r.ok){ busy = false; toast(r.out || t('toast_failed'), true); return; }
   $('#rl-sni-state').textContent = t('rl_sni_working');
   toast(t('rl_sni_working'));
   let n = 0;
   const poll = async () => {
     n++;
-    try { RL = await api('/api/reality'); } catch (_) {}
+    try { RL = await api('api/reality'); } catch (_) {}
     const done = RL && (action === 'enable' ? RL.router === 'caddy' : RL.router !== 'caddy');
     if (done || n > 40){ busy = false; $('#rl-sni-state').textContent = ''; renderReality(); refresh(); return; }
     setTimeout(poll, 5000);
@@ -5998,7 +6029,7 @@ $('#rl-sni-off').onclick = () => sniSwitch('disable');
 $('#rl-sync').onclick = async () => {
   if (busy) return;
   busy = true; $('#rl-sync').disabled = true;
-  const r = await api('/api/reality', {action: 'sync'});
+  const r = await api('api/reality', {action: 'sync'});
   busy = false; $('#rl-sync').disabled = false;
   toast(r.ok ? t('rl_synced') : t('toast_failed'), !r.ok);
   show(t('rl_sync'), r.out);
@@ -6009,7 +6040,7 @@ $('#rl-sync').onclick = async () => {
 $('#up-check').onclick = async () => {
   $('#up-check').disabled = true;
   $('#up-state').textContent = t('up_checking');
-  const r = await api('/api/update-check');
+  const r = await api('api/update-check');
   $('#up-check').disabled = false;
   if (!r.ok){ $('#up-state').textContent = r.out || t('toast_failed'); $('#up-go').hidden = true; return; }
   $('#up-state').textContent = r.available
@@ -6021,7 +6052,7 @@ $('#up-go').onclick = async () => {
   if (busy || !confirm(t('up_confirm'))) return;
   busy = true;
   $('#up-go').disabled = $('#up-check').disabled = true;
-  const r = await api('/api/update', {});
+  const r = await api('api/update', {});
   if (!r.ok){
     busy = false; $('#up-go').disabled = $('#up-check').disabled = false;
     toast(r.out || t('toast_failed'), true); return;
@@ -6032,7 +6063,7 @@ $('#up-go').onclick = async () => {
   let tries = 0;
   const back = async () => {
     tries++;
-    try { const x = await fetch('/api/log', {cache: 'no-store'}); if (x.ok && tries > 2) return location.reload(); } catch (_) {}
+    try { const x = await fetch('api/log', {cache: 'no-store'}); if (x.ok && tries > 2) return location.reload(); } catch (_) {}
     if (tries < 40) setTimeout(back, 3000); else location.reload();
   };
   setTimeout(back, 6000);
@@ -6041,7 +6072,7 @@ $('#up-go').onclick = async () => {
 async function renewCert(domain){
   if (busy) return;
   if (!confirm(t('confirm_renew', domain))) return;
-  const r = await api('/api/renew', {domain});
+  const r = await api('api/renew', {domain});
   if (!r.ok){ toast(r.out || t('toast_failed'), true); return; }
   toast(t('renew_started', domain));
   show(t('renew') + ' ' + domain, t('renew_started', domain));
@@ -6140,7 +6171,7 @@ document.querySelectorAll('#f-kind input').forEach(i => i.onchange = () => setKi
 
 // x-ui's own settings -> panel port, base path and subscription route(s)
 $('#btn-xui').onclick = async () => {
-  const r = await api('/api/xui');
+  const r = await api('api/xui');
   if (!r.ok){ toast(t('xui_none'), true); return; }
   const x = r.xui;
   $('#f-target').value = x.target;
@@ -6280,7 +6311,7 @@ $('#add').onsubmit = async e => {
   busy = true;
   $('#btn-add').disabled = true;
   $('#btn-add').textContent = t('working');
-  const r = await api(editing ? '/api/edit' : '/api/add', body);
+  const r = await api(editing ? 'api/edit' : 'api/add', body);
   $('#btn-add').disabled = false;
   busy = false;
   toast(r.ok ? t(editing ? 'toast_updated' : 'toast_live', body.domain) : t('toast_failed'), !r.ok);
@@ -6298,7 +6329,7 @@ $('#add').onsubmit = async e => {
 };
 
 $('#btn-out').onclick = async () => {
-  await api('/api/logout', {});
+  await api('api/logout', {});
   location.reload();
 };
 
@@ -6308,7 +6339,7 @@ $('#btn-doctor').onclick = async () => {
   $('#btn-doctor').disabled = true;
   setTab('diag');
   show(t('diag'), t('running'));
-  const r = await api('/api/doctor');
+  const r = await api('api/doctor');
   busy = false;
   $('#btn-doctor').disabled = false;
   show(t('diag'), r.out);
@@ -6319,7 +6350,7 @@ $('#qa-doctor').onclick = () => $('#btn-doctor').click();
 let RAW = null;
 
 async function openRaw(domain){
-  const r = await api('/api/config?domain=' + encodeURIComponent(domain));
+  const r = await api('api/config?domain=' + encodeURIComponent(domain));
   if (!r.ok){ toast(r.out || t('raw_read_fail'), true); return; }
   RAW = domain;
   $('#raw-title').textContent = domain;
@@ -6345,7 +6376,7 @@ $('#raw-save').onclick = async () => {
   const domain = RAW;
   busy = true;
   $('#raw-save').disabled = true;
-  const r = await api('/api/put', {domain, config: $('#raw-text').value});
+  const r = await api('api/put', {domain, config: $('#raw-text').value});
   $('#raw-save').disabled = false;
   busy = false;
   toast(r.ok ? t('raw_saved', domain) : t('raw_rejected'), !r.ok);
@@ -6397,7 +6428,7 @@ $('#b-save').onclick = async () => {
   if (busy) return;
   busy = true;
   $('#b-save').disabled = true;
-  const r = await api('/api/brand', draftFromForm());
+  const r = await api('api/brand', draftFromForm());
   $('#b-save').disabled = false;
   busy = false;
   if (r.ok){ BRAND = r.brand; DRAFT = null; fillSettings(BRAND); applyBrand(BRAND); toast(t('b_saved')); }
@@ -6420,7 +6451,7 @@ function actTarget(cmd){
 }
 
 async function loadLog(){
-  const r = await api('/api/log');
+  const r = await api('api/log');
   if (!r || !r.log) return;
   LOG = r.log;
   renderLog(LOG);
@@ -7308,6 +7339,62 @@ except Exception: pass' 2>/dev/null || true)"
 	dim "logged in has to sign in again"
 }
 
+# --- panel under a hidden path of a site: an ordinary route the form keeps ---
+panel_route_block() {
+	local base="$1" port="$2"
+	printf '\n\t# route: %s*\n\thandle %s* {\n' "$base" "$base"
+	printf '\t\treverse_proxy 127.0.0.1:%s {\n' "$port"
+	printf '\t\t\theader_up Host {host}\n'
+	printf '\t\t\theader_up X-Real-IP {client_ip}\n'
+	printf '\t\t\theader_up X-Forwarded-For {client_ip}\n'
+	printf '\t\t\theader_up X-Forwarded-Proto {scheme}\n'
+	printf '\t\t}\n\t}\n'
+}
+
+# Drop the handle block (and its "# route:" comment) that proxies to the panel.
+panel_route_strip() {
+	local f="$1" port="$2" tmp; tmp=$(mktemp)
+	awk -v up="reverse_proxy 127.0.0.1:${port} " '
+		function braces(s,  t, o) {
+			if (s ~ /^[[:space:]]*#/) return 0
+			t = s; o = gsub(/\{/, "", t); t = s; return o - gsub(/\}/, "", t)
+		}
+		inblk {
+			buf = buf ORS $0; d += braces($0); if (index($0, up)) hit = 1
+			if (d <= 0) {
+				if (!hit) { if (pend != "") print pend; print buf }
+				inblk = 0; pend = ""; buf = ""; hit = 0
+			}
+			next
+		}
+		/^[[:space:]]*# route: / { if (pend != "") print pend; pend = $0; next }
+		/^[[:space:]]*handle[[:space:]].*\{[[:space:]]*$/ { inblk = 1; buf = $0; d = braces($0); hit = 0; next }
+		{ if (pend != "") { print pend; pend = "" } print }
+		END { if (pend != "") print pend; if (inblk) print buf }
+	' "$f" | cat -s > "$tmp" && cat "$tmp" > "$f"
+	rm -f "$tmp"
+}
+
+# Put the block in $2 just before the closing brace of the first site in $1.
+panel_route_insert() {
+	local f="$1" blk="$2" tmp; tmp=$(mktemp)
+	awk -v blk="$blk" '
+		function braces(s,  t, o) {
+			if (s ~ /^[[:space:]]*#/) return 0
+			t = s; o = gsub(/\{/, "", t); t = s; return o - gsub(/\}/, "", t)
+		}
+		{
+			if (!done) {
+				nd = depth + braces($0)
+				if (depth > 0 && nd <= 0) { while ((getline l < blk) > 0) print l; done = 1 }
+				depth = nd
+			}
+			print
+		}
+	' "$f" > "$tmp" && cat "$tmp" > "$f"
+	rm -f "$tmp"
+}
+
 cmd_panel() {
 	need_root panel
 	local sub="${1:-}"
@@ -7317,11 +7404,12 @@ cmd_panel() {
 	esac
 
 	local domain="" user="admin" port="$UI_PORT_DEFAULT" pass=""
-	local behind_xray=0 front_port=""
+	local behind_xray=0 front_port="" base=""
 	# First bare argument is the domain; everything else is a flag.
 	if [[ -n "${1:-}" && "${1:0:1}" != "-" ]]; then domain="$1"; shift; fi
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
+			--path)     base="${2:?}";            shift 2 ;;
 			--user)     user="${2:?}";            shift 2 ;;
 			--port)     port="${2:?}";            shift 2 ;;
 			--password) pass="${2:?}";            shift 2 ;;
@@ -7369,6 +7457,14 @@ cmd_panel() {
 	valid_domain "$domain" || die "invalid domain: $domain"
 	[[ "$port" =~ ^[0-9]+$ ]] || die "invalid port: $port"
 	[[ "$user" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid username: $user"
+	if [[ -n "$base" ]]; then
+		base="$(clean_path "$base")"
+		[[ "$base" =~ ^(/[A-Za-z0-9._~-]+)+$ ]] || die "invalid --path: $base  (e.g. /x7Kq2mP9)"
+		[[ $behind_xray -eq 0 ]] || die "--path does not work with --behind-xray"
+		grep -qE "^[[:space:]]*(https?://)?${domain//./\\.}(:[0-9]+)?([[:space:],{]|$)" "$CADDYFILE" \
+			&& die "$domain is a block in $CADDYFILE - move it into $SITES_DIR first:
+       $SELF_NAME import $domain"
+	fi
 
 	local src
 	if ! src="$(find_ui_source)"; then
@@ -7432,6 +7528,7 @@ cmd_panel() {
 		Type=simple
 		Environment=SMART_CADDY_UI_HOST=127.0.0.1
 		Environment=SMART_CADDY_UI_PORT=${port}
+		Environment=SMART_CADDY_UI_BASE=${base}
 		ExecStart=$(command -v python3) ${UI_PY}
 		Restart=on-failure
 		RestartSec=3
@@ -7479,6 +7576,44 @@ cmd_panel() {
 	hdr "5/6  Caddy site"
 	local f; f="$(site_file "$domain")"
 	[[ -f "$f" ]] && stage_edit "$f" || stage_new "$f"
+
+	if [[ -n "$base" ]]; then
+		local blk; blk=$(mktemp)
+		panel_route_block "$base" "$port" > "$blk"
+		if [[ -f "$f" ]] && ! grep -q 'smart-caddy web panel - managed' "$f"; then
+			# another site lives here: add the panel as one more route, keep the rest
+			panel_route_strip "$f" "$port"
+			panel_route_insert "$f" "$blk"
+			ok "route ${base}* added to the existing site $domain"
+		else
+			{
+				echo "# smart-caddy web panel - managed by '$SELF_NAME panel'"
+				echo "$domain {"
+				bind_line
+				echo -e "\tencode zstd gzip"
+				[[ -n "$tls_block" ]] && echo "$tls_block"
+				cat "$blk"
+				echo -e "\n\thandle {\n\t\trespond 404\n\t}"
+				echo "}"
+				if [[ -n "$(caddy_front_port)" ]] && caddy_redirects_off; then
+					redirect_block "$domain"
+				fi
+			} > "$f"
+		fi
+		rm -f "$blk"
+		chown "root:$(caddy_group)" "$f" 2>/dev/null || true
+		chmod 0644 "$f"
+		apply
+		front_register "$domain"
+		hdr "6/6  Done"
+		ok "https://${domain}${base}/"
+		echo
+		printf '    username: %s%s%s\n' "$C_B" "$user" "$C_OFF"
+		printf '    password: %s%s%s\n' "$C_B" "$pass" "$C_OFF"
+		echo
+		warn "write the password down - only a PBKDF2 hash is kept, it cannot be recovered"
+		return 0
+	fi
 
 	if [[ $behind_xray -eq 1 ]]; then
 		ensure_global_server_block "127.0.0.1:${front_port}"
@@ -7577,22 +7712,32 @@ panel_status() {
 		dim "journalctl -u smart-caddy-ui -n 30 --no-pager"
 	fi
 	shopt -s nullglob
-	local f
+	local f port base
+	port=$(grep -oP 'SMART_CADDY_UI_PORT=\K[0-9]+' "$UI_UNIT" 2>/dev/null || echo "$UI_PORT_DEFAULT")
+	base=$(grep -oP 'SMART_CADDY_UI_BASE=\K\S+' "$UI_UNIT" 2>/dev/null || true)
 	for f in "$SITES_DIR"/*.caddy; do
-		grep -q 'smart-caddy web panel' "$f" && ok "served at: $(basename "$f" .caddy)"
+		grep -qE "smart-caddy web panel|reverse_proxy 127\.0\.0\.1:${port} " "$f" \
+			&& ok "served at: $(basename "$f" .caddy)${base:+${base}/}"
 	done
 	shopt -u nullglob
 }
 
 panel_remove() {
 	need_root panel
-	local domain="${1:-}"
+	local domain="${1:-}" port
+	port=$(grep -oP 'SMART_CADDY_UI_PORT=\K[0-9]+' "$UI_UNIT" 2>/dev/null || echo "$UI_PORT_DEFAULT")
 	systemctl disable --now smart-caddy-ui >/dev/null 2>&1 || true
 	rm -f "$UI_UNIT"; systemctl daemon-reload
 	rm -rf "$(dirname "$UI_PY")"
 	ok "panel service removed"
-	if [[ -n "$domain" ]]; then
-		rm -f "$(site_file "$domain")"
+	local f; f="$(site_file "$domain")"
+	if [[ -n "$domain" && -f "$f" ]] && ! grep -q 'smart-caddy web panel - managed' "$f"; then
+		stage_edit "$f"
+		panel_route_strip "$f" "$port"
+		apply
+		ok "panel route removed from $domain (the site itself stays)"
+	elif [[ -n "$domain" ]]; then
+		rm -f "$f"
 		apply
 		ok "$domain removed from Caddy (certificate kept)"
 	else
@@ -7658,6 +7803,8 @@ ${C_B}COMMANDS${C_OFF}
                                            if Caddy rejects it)
   panel <domain> [--user u] [--port n]     install the web UI at that domain
                  [--behind-xray]           ... behind an Xray fallback instead
+                 [--path /secret]          ... under a hidden path; an existing
+                                           site at that domain stays as it is
   panel status | panel remove [<domain>]   check or remove the web UI
   passwd [user] [--password <p>]           change the panel password
   update [--force]                         fetch and install the latest release
