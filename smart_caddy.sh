@@ -2453,17 +2453,7 @@ cmd_repair() {
 	else
 		ok "real visitor IP behind Cloudflare already set up"
 	fi
-	sni_fallback_sync
-	if [[ $SNIFB_CHANGED -eq 1 ]]; then
-		if caddy_validate >/dev/null 2>&1; then
-			clear_stage
-			systemctl reload caddy 2>/dev/null && ok "Caddy reloaded - names routed to Xray answer browsers again" \
-				|| { warn "Caddy did not reload:"; last_caddy_error | sed 's/^/       /'; }
-		else
-			rollback; SNIFB_PAIRS=""; warn "Caddy rejected the Xray fallback listeners - files restored"
-		fi
-	fi
-	sni_fallback_xray
+	sni_fallback_apply
 
 	hdr "Repairing the panel service"
 	if [[ -f "$UI_UNIT" && ! -f /etc/smart-caddy-panel.json ]]; then
@@ -3671,6 +3661,35 @@ def sni_routes():
     return out
 
 
+def direct_routes():
+    """Names the router in front of Caddy hands straight to an x-ui inbound,
+    with what that inbound is - shown even when no Caddy site exists."""
+    routed = sni_routes()
+    if not routed:
+        return []
+    ibs = {}
+    try:
+        import sqlite3
+        con = sqlite3.connect(f"file:{XUI_DB}?mode=ro", uri=True, timeout=3)
+        for i, remark, port, ss in con.execute("select id, remark, port, stream_settings from inbounds"):
+            try:
+                st = json.loads(ss or "{}")
+            except ValueError:
+                st = {}
+            rs = st.get("realitySettings") or {}
+            ibs[int(port or 0)] = {"id": i, "remark": remark or "", "sec": st.get("security") or "",
+                                   "real": str(rs.get("target") or rs.get("dest") or "")}
+        con.close()
+    except Exception:
+        pass
+    out = []
+    for name, t in sorted(routed.items()):
+        ib = ibs.get(int(t.rsplit(":", 1)[1]), {})
+        out.append({"name": name, "target": t, "id": ib.get("id"), "remark": ib.get("remark", ""),
+                    "kind": ib.get("sec", ""), "real": ib.get("real", "")})
+    return out
+
+
 def read_sites():
     sites = []
     try:
@@ -4077,6 +4096,7 @@ class Handler(BaseHTTPRequestHandler):
                 "ports": {"80": port_owner(80), "443": port_owner(443)},
                 "front": front_proxy(),
                 "sites": read_sites(),
+                "direct": direct_routes(),
                 "caddyfile": caddyfile_blocks(),
                 "brand": load_brand(),
                 "cloudflare": cf_state(),
@@ -4316,7 +4336,10 @@ class Handler(BaseHTTPRequestHandler):
             if action == "sync":
                 return self.send_json(self.cli(["reality", "sync"], timeout=120))
             if action == "on443" and str(data.get("id", "")).isdigit():
-                return self.send_json(self.cli(["reality", "on443", str(data["id"])], timeout=120))
+                dom = str(data.get("name", "")).strip().lower()
+                if dom and not RE_DOMAIN.match(dom):
+                    return self.send_json({"ok": False, "out": "invalid domain"}, 400)
+                return self.send_json(self.cli(["reality", "on443", str(data["id"])] + ([dom] if dom else []), timeout=180))
             return self.send_json({"ok": False, "out": "unknown action"}, 400)
 
         if path == "/api/update":
@@ -4753,6 +4776,9 @@ html[lang=fa] .card h3{letter-spacing:0}
 .cert-card .chead{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px}
 .cert-card .sec-d{margin:0}
 #add.sni-simple .full-only{display:none}
+#add.direct-mode .full-only:not(.kindbox){display:none}
+#add.direct-mode #sb-full{display:none}
+.dhead{margin:26px 0 4px;font-size:16px}
 #add.sni-simple #f-target{display:none}
 .sbopts{display:grid;gap:8px;margin:6px 0 12px}
 .sbopts label{display:flex;gap:8px;align-items:center;cursor:pointer;font-weight:600}
@@ -5080,26 +5106,13 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
     <div class="note" id="drop-note" hidden><span id="drop-text"></span>
       <button type="button" class="link" id="drop-raw" data-t="open_code">Edit as code</button></div>
 
-    <div class="sec glass" id="sni-box" hidden>
-      <p class="what" data-t="sb_t">This name belongs to an Xray config</p>
-      <p class="sec-d" id="sb-d"></p>
-      <div class="note warn" id="sb-nofb" hidden data-t="sb_nofb"></div>
-      <div class="sbopts">
-        <label><input type="radio" name="sbk" value="redirect" checked><span data-t="sb_redir">Send them to another site</span></label>
-        <input type="text" id="sb-url" class="ltr" dir="ltr" placeholder="https://www.google.com">
-        <label><input type="radio" name="sbk" value="app"><span data-t="sb_app">Show a site or app on this server</span></label>
-        <input type="text" id="sb-app" class="ltr" dir="ltr" placeholder="8088">
-        <label><input type="radio" name="sbk" value="none"><span data-t="sb_none">Show nothing (empty page, 404)</span></label>
-      </div>
-      <button type="button" class="link" id="sb-full" data-t="sb_full">Show the full form</button>
-    </div>
-
     <div class="sec glass kindbox full-only">
       <p class="what" data-t="what_t">What are you putting online?</p>
       <div class="pills" id="f-kind">
         <label><input type="radio" name="fkind" value="web" checked><span data-t="k_web">Website or app</span></label>
         <label><input type="radio" name="fkind" value="panel"><span data-t="k_panel">x-ui panel</span></label>
         <label><input type="radio" name="fkind" value="inbound"><span data-t="k_inbound">Xray config</span></label>
+        <label id="k-direct"><input type="radio" name="fkind" value="direct"><span data-t="k_direct">Xray config directly on 443</span></label>
       </div>
       <div class="row" id="xui-row" hidden>
         <button type="button" class="primary" id="btn-xui" data-t="xui_fill">Fill in from x-ui on this server</button>
@@ -5107,6 +5120,13 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
       </div>
       <div class="note" id="xui-note" hidden style="margin:14px 0 0"></div>
       <details class="howto" id="howto" open><summary data-t="howto_t">How to fill this in</summary><div id="howto-body"></div></details>
+    </div>
+
+    <div class="sec glass" id="direct-box" hidden>
+      <label for="d-ib" data-t="d_pick">Which x-ui inbound?</label>
+      <select id="d-ib"></select>
+      <div class="hint" id="d-hint"></div>
+      <div class="note" id="d-note" hidden style="margin:12px 0 0"></div>
     </div>
 
     <fieldset class="sec glass">
@@ -5136,6 +5156,20 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
         </div>
       </div>
     </fieldset>
+
+    <div class="sec glass" id="sni-box" hidden>
+      <p class="what" data-t="sb_t">This name belongs to an Xray config</p>
+      <p class="sec-d" id="sb-d"></p>
+      <div class="note warn" id="sb-nofb" hidden data-t="sb_nofb"></div>
+      <div class="sbopts">
+        <label><input type="radio" name="sbk" value="redirect" checked><span data-t="sb_redir">Send them to another site</span></label>
+        <input type="text" id="sb-url" class="ltr" dir="ltr" placeholder="https://www.google.com">
+        <label><input type="radio" name="sbk" value="app"><span data-t="sb_app">Show a site or app on this server</span></label>
+        <input type="text" id="sb-app" class="ltr" dir="ltr" placeholder="8088">
+        <label><input type="radio" name="sbk" value="none"><span data-t="sb_none">Show nothing (empty page, 404)</span></label>
+      </div>
+      <button type="button" class="link" id="sb-full" data-t="sb_full">Show the full form</button>
+    </div>
 
     <fieldset class="sec glass full-only">
       <legend><span class="num">2</span><span data-t="f_routes">Routes</span> <span class="opt sub" data-t="optional">(optional)</span></legend>
@@ -5395,6 +5429,15 @@ en: {
   sb_d:'Xray clients use it as it is - nothing to change for them. Choose only what someone sees who opens <b class="ltr">https://{0}</b> in a browser:',
   sb_redir:'Send them to another site', sb_app:'Show a site or app on this server (port)', sb_none:'Show nothing (empty page, 404)',
   sb_full:'Show the full form', sb_need_url:'Type the address to send visitors to', sb_need_app:'Type the port (or address) of the site on this server',
+  d_save:'Put on port 443', d_pick:'Which x-ui inbound?', d_choose:'Pick an inbound', d_need_dom:'Type the domain the clients use for this inbound',
+  d_none:'This server has no x-ui inbound that can go on 443 (Reality, or VLESS / Trojan with TLS over TCP).',
+  d_nofront:'Port 443 has no name router yet, so an inbound cannot share it with the sites. Turn on Caddy\'s SNI router in the Reality tab first.',
+  d_reality_h:'Reality: a browser that opens this name sees the real site it imitates ({0}) - nothing to choose here.',
+  d_tls_h:'TLS: the inbound answers only Xray clients - choose below what a browser sees on this name. The inbound\'s certificate must be for this domain; Caddy\'s certificate (Certificates tab) renews by itself.',
+  d_already:'Already on 443 - saving again only brings everything back in line.',
+  d_list_t:'Straight to Xray on port 443', d_list_d:'Names that port 443 hands to an x-ui inbound and that have no site of their own - mostly Reality.',
+  d_brw_real:'In a browser: the real site {0}', d_brw_nosite:'In a browser: no answer (no site for this name)', d_brw_other:'In a browser: whatever that program answers',
+  howto_direct:'<ol><li>For an x-ui inbound that clients reach <b>straight on port 443</b>, without a CDN (Cloudflare cloud <b>grey</b>): <b>Reality</b>, or <b>VLESS / Trojan with TLS</b> over TCP.</li><li>Pick the inbound below - nothing to type. Saving moves it to 127.0.0.1, gives its name a line in the router on 443 and points its share links at port 443.</li><li><b>TLS</b>: choose what a browser sees on that name (the inbound itself only answers Xray clients). <b>Reality</b>: browsers see the real site it imitates - nothing to choose.</li><li>Configs through Cloudflare (orange cloud: WebSocket, XHTTP, gRPC) are the previous choice, not this one.</li></ol>',
   sb_nofb:'The Xray inbound behind this name cannot send browsers back (only VLESS / Trojan over TCP + TLS can), so browsers get no answer whatever you choose here.',
   sni_fb_h:'The SNI router sends :443 for this name to Xray ({0}). What Xray does not take itself (a browser) falls back to Caddy on 127.0.0.1:{1}, so the backend above still answers.',
   sni_nofb_h:'The SNI router sends :443 for this name to Xray ({0}) and that inbound cannot fall back to Caddy (only VLESS / Trojan over TCP + TLS can) - only Xray clients get through.',
@@ -5496,7 +5539,7 @@ en: {
   routes_none:'No routes - every request goes to the main backend.',
   rt_http:'HTTP / WS / HTTPUpgrade', rt_h2c:'XHTTP / gRPC (h2c)',
   what_t:'What are you putting online?',
-  k_web:'Website or app', k_panel:'x-ui / 3x-ui panel', k_inbound:'Xray config through CDN',
+  k_web:'Website or app', k_panel:'x-ui / 3x-ui panel', k_inbound:'Xray config through CDN', k_direct:'Xray config directly on 443',
   howto_t:'How to fill this in',
   howto_web:'<ol><li><b>Domain</b>: the address visitors open, e.g. <code>app.example.com</code>. Its A record points at this server.</li><li><b>Main backend</b>: the app\'s port on this server, e.g. <code>8088</code> - or a folder (<code>/var/www/site</code>), another site (<code>example.com</code>) or <code>redirect:https://x.com</code>.</li><li><b>Routes</b> only when one path has to go somewhere else, e.g. <code>/dns-query/</code> → <code>8000</code>.</li><li>Save. Caddy gets the certificate by itself.</li></ol>',
   howto_panel:'<ol><li><b>Easiest</b>: put in the domain and press <b>Fill in from x-ui on this server</b> above - port, base path and subscription are filled in for you. The steps below are what it does.</li><li><b>In x-ui first</b> (Panel Settings): Listen IP <code>127.0.0.1</code>, and leave the panel\'s certificate and key fields <b>empty</b> - Caddy does HTTPS. The same on the Subscription tab.</li><li><b>Domain</b>: the panel\'s address, e.g. <code>panel.example.com</code>.</li><li><b>Panel port</b>: just the number, e.g. <code>2053</code> - never a path. If x-ui still has its own certificate, write <code>https://127.0.0.1:2053</code>.</li><li><b>Panel base path</b> (next to the port): the panel\'s <i>Web Base Path</i>, e.g. <code>/5wSobQvUFuNy4zBUcc</code>.</li><li><b>Subscription</b>: add a route of type <b>Web / Sub</b>: path = x-ui\'s <i>Sub Path</i> (e.g. <code>/sub/</code>), backend = the sub port (e.g. <code>2096</code>). In x-ui set <i>Sub URI</i> to <code>https://panel.example.com/sub/</code>.</li><li><b>Admin panel</b> (section 4) is ticked for you. Save, then open <code>https://panel.example.com/&lt;base path&gt;/</code>.</li></ol>',
@@ -5580,6 +5623,15 @@ fa: {
   sb_d:'کلاینت‌های Xray همین‌طور از آن استفاده می‌کنند و برای آن‌ها چیزی لازم نیست عوض شود. فقط انتخاب کنید کسی که <b class="ltr">https://{0}</b> را در مرورگر باز می‌کند چه ببیند:',
   sb_redir:'فرستادن به یک سایت دیگر', sb_app:'نشان دادن یک سایت یا برنامه روی همین سرور (پورت)', sb_none:'هیچ‌چیز (صفحهٔ خالی، 404)',
   sb_full:'نمایش فرم کامل', sb_need_url:'آدرس سایتی را که بازدیدکننده به آن برود بنویسید', sb_need_app:'پورت (یا آدرس) سایت روی همین سرور را بنویسید',
+  d_save:'بردن روی پورت 443', d_pick:'کدام اینباند x-ui؟', d_choose:'یک اینباند انتخاب کنید', d_need_dom:'دامنه‌ای را که کلاینت‌ها برای این اینباند استفاده می‌کنند بنویسید',
+  d_none:'روی این سرور اینباندی از x-ui نیست که بشود روی 443 برد (Reality، یا VLESS / Trojan با TLS روی TCP).',
+  d_nofront:'پورت 443 هنوز مسیریاب اسم ندارد، پس اینباند نمی‌تواند آن را با سایت‌ها شریک شود. اول در تب Reality مسیریاب SNI خود Caddy را روشن کنید.',
+  d_reality_h:'Reality: مرورگری که این اسم را باز کند همان سایت واقعی‌ای را می‌بیند که Reality از آن تقلید می‌کند ({0}) - اینجا چیزی برای انتخاب نیست.',
+  d_tls_h:'TLS: این اینباند فقط به کلاینت‌های Xray جواب می‌دهد - پایین انتخاب کنید مرورگر روی این اسم چه ببیند. گواهی اینباند باید برای همین دامنه باشد؛ گواهی Caddy (تب گواهی‌ها) خودش تمدید می‌شود.',
+  d_already:'از قبل روی 443 است - ذخیرهٔ دوباره فقط همه‌چیز را دوباره هماهنگ می‌کند.',
+  d_list_t:'مستقیم به Xray روی پورت 443', d_list_d:'اسم‌هایی که پورت 443 آن‌ها را به یک اینباند x-ui می‌دهد و سایت جداگانه ندارند - بیشترشان Reality.',
+  d_brw_real:'در مرورگر: سایت واقعی {0}', d_brw_nosite:'در مرورگر: جوابی نمی‌گیرد (این اسم سایت ندارد)', d_brw_other:'در مرورگر: هرچه آن برنامه جواب بدهد',
+  howto_direct:'<ol><li>برای اینباندی از x-ui که کلاینت‌ها <b>مستقیم روی پورت 443</b> به آن وصل می‌شوند، بدون CDN (ابر Cloudflare <b>خاکستری</b>): <b>Reality</b>، یا <b>VLESS / Trojan با TLS</b> روی TCP.</li><li>اینباند را از لیست پایین انتخاب کنید - لازم نیست چیزی تایپ کنید. با ذخیره، اینباند روی 127.0.0.1 می‌رود، اسمش در مسیریاب 443 ثبت می‌شود و لینک‌هایش روی پورت 443 می‌روند.</li><li><b>TLS</b>: انتخاب کنید مرورگر روی آن اسم چه ببیند (خود اینباند فقط به کلاینت‌های Xray جواب می‌دهد). <b>Reality</b>: مرورگر سایت واقعی‌ای را می‌بیند که از آن تقلید می‌کند - چیزی برای انتخاب نیست.</li><li>کانفیگ‌هایی که از Cloudflare رد می‌شوند (ابر نارنجی: WebSocket، XHTTP، gRPC) گزینهٔ قبلی هستند، نه این.</li></ol>',
   sb_nofb:'اینباند Xray پشت این دامنه نمی‌تواند مرورگر را برگرداند (فقط VLESS / Trojan روی TCP + TLS می‌تواند)، پس هرچه اینجا انتخاب کنید مرورگر جوابی نمی‌گیرد.',
   sni_fb_h:'مسیریاب SNI ترافیک :443 این نام را به Xray ({0}) می‌دهد. هرچه Xray خودش برندارد (مثلاً مرورگر) از راه fallback به Caddy روی 127.0.0.1:{1} برمی‌گردد، پس همین بک‌اند جواب می‌دهد.',
   sni_nofb_h:'مسیریاب SNI ترافیک :443 این نام را به Xray ({0}) می‌دهد و آن اینباند نمی‌تواند به Caddy برگرداند (فقط VLESS / Trojan روی TCP + TLS می‌تواند) - فقط کلاینت‌های Xray وصل می‌شوند.',
@@ -5681,7 +5733,7 @@ fa: {
   routes_none:'مسیری تعریف نشده - همهٔ درخواست‌ها به مقصد اصلی می‌روند.',
   rt_http:'HTTP / WS / HTTPUpgrade', rt_h2c:'XHTTP / gRPC (h2c)',
   what_t:'چه چیزی را آنلاین می‌کنید؟',
-  k_web:'سایت یا برنامه', k_panel:'پنل x-ui / 3x-ui', k_inbound:'کانفیگ Xray از طریق CDN',
+  k_web:'سایت یا برنامه', k_panel:'پنل x-ui / 3x-ui', k_direct:'کانفیگ Xray مستقیم روی 443', k_inbound:'کانفیگ Xray از طریق CDN',
   howto_t:'راهنمای پر کردن فرم',
   howto_web:'<ol><li><b>دامنه</b>: آدرسی که کاربر باز می‌کند، مثلاً <code>app.example.com</code>. رکورد A آن باید به IP همین سرور اشاره کند.</li><li><b>مقصد اصلی</b>: پورت برنامه روی همین سرور، مثلاً <code>8088</code>؛ یا یک پوشه (<code>/var/www/site</code>)، یک سایت دیگر (<code>example.com</code>) یا <code>redirect:https://x.com</code>.</li><li><b>مسیرها</b> فقط وقتی لازم است که یک مسیر باید جای دیگری برود، مثلاً <code>/dns-query/</code> ← <code>8000</code>.</li><li>ذخیره کنید. گواهی را Caddy خودش می‌گیرد.</li></ol>',
   howto_panel:'<ol><li><b>ساده‌ترین راه</b>: دامنه را بنویسید و دکمهٔ <b>پر کردن خودکار از x-ui همین سرور</b> را بالا بزنید؛ پورت، مسیر پایه و ساب خودکار پر می‌شوند. قدم‌های زیر همان کاری است که این دکمه انجام می‌دهد.</li><li><b>اول در x-ui</b> (تنظیمات پنل): Listen IP را <code>127.0.0.1</code> بگذارید و فیلدهای مسیر گواهی و کلید پنل را <b>خالی</b> کنید؛ HTTPS را Caddy می‌دهد. در تب Subscription هم همین کار را بکنید.</li><li><b>دامنه</b>: آدرس پنل، مثلاً <code>panel.example.com</code>.</li><li><b>پورت پنل</b>: فقط عدد، مثلاً <code>2053</code>؛ هیچ‌وقت مسیر ننویسید. اگر x-ui هنوز گواهی خودش را دارد بنویسید <code>https://127.0.0.1:2053</code>.</li><li><b>مسیر پایهٔ پنل</b> (کنار پورت): همان <i>Web Base Path</i> پنل، مثلاً <code>/5wSobQvUFuNy4zBUcc</code>.</li><li><b>ساب</b>: یک مسیر با نوع <b>وب / ساب</b> اضافه کنید: مسیر = <i>Sub Path</i> در x-ui (مثلاً <code>/sub/</code>)، مقصد = پورت ساب (مثلاً <code>2096</code>). در x-ui مقدار <i>Sub URI</i> را <code>https://panel.example.com/sub/</code> بگذارید.</li><li>تیک <b>پنل مدیریتی</b> (بخش ۴) خودکار زده شده است. ذخیره کنید و <code>https://panel.example.com/&lt;مسیر پایه&gt;/</code> را باز کنید.</li></ol>',
@@ -5975,9 +6027,10 @@ function render(d){
   $('#tab-btn-reality').hidden = !d.xui;
   kindTexts();      // the x-ui button needs to know whether x-ui is here
   $('#b-sites').textContent = d.sites.length;
+  const dh = directHtml(d);
   if (!d.sites.length){
     const any = (d.caddyfile || []).some(b => b.importable);
-    $('#sites').innerHTML = '<div class="empty glass card">' + esc(t(any ? 'no_sites_cf' : 'no_sites')) + '</div>';
+    $('#sites').innerHTML = '<div class="empty glass card">' + esc(t(any ? 'no_sites_cf' : 'no_sites')) + '</div>' + dh;
     return;
   }
 
@@ -6015,7 +6068,7 @@ function render(d){
       +  '<button class="link" data-del="' + esc(s.domain) + '">' + esc(t('remove')) + '</button></div>'
       +  '</div>';
   });
-  $('#sites').innerHTML = h + '</div>';
+  $('#sites').innerHTML = h + '</div>' + dh;
 
   document.querySelectorAll('[data-del]').forEach(b => b.onclick = () => remove(b.dataset.del));
   document.querySelectorAll('[data-raw]').forEach(b => b.onclick = () => openRaw(b.dataset.raw));
@@ -6423,7 +6476,7 @@ function kindTexts(){
   $('label[for="f-path"] span[data-t]').textContent = t(k === 'panel' ? 'p_panel' : 'f_path');
   $('#xui-row').hidden = !(k === 'panel' && STATE && STATE.xui);
   if (k !== 'panel') $('#xui-note').hidden = true;
-  $('#f-target').placeholder = {web: '8088', panel: '2053', inbound: 'redirect:https://github.com'}[k];
+  $('#f-target').placeholder = {web: '8088', panel: '2053', inbound: 'redirect:https://github.com'}[k] || '';
 }
 function setKind(k, apply){
   $('#f-kind input[value="' + k + '"]').checked = true;
@@ -6432,6 +6485,7 @@ function setKind(k, apply){
     if (k === 'inbound' && !document.querySelector('#routes .route')) addRouteRow('', '', 'ws');
   }
   kindTexts();
+  if ((k === 'direct') !== $('#add').classList.contains('direct-mode')) directMode(k === 'direct');
 }
 document.querySelectorAll('#f-kind input').forEach(i => i.onchange = () => setKind(i.value, true));
 
@@ -6471,13 +6525,137 @@ $('#drop-raw').onclick = () => { const d = EDITING && EDITING.domain; stopEdit()
 function formTexts(){
   $('#form-title').textContent = t('form_add');
   if (EDITING) $('#edit-title').textContent = t('form_edit', EDITING.domain);
-  $('#btn-add').textContent = t(EDITING ? 'btn_save' : 'btn_add');
+  $('#btn-add').textContent = t(EDITING ? 'btn_save' : siteKind() === 'direct' ? 'd_save' : 'btn_add');
   document.querySelectorAll('#routes .route').forEach(routeTexts);
   if (EDITING && EDITING.imported) $('#edit-note').innerHTML = t('note_imported');
   $('#name-list').innerHTML = t('name_ideas').split('|').map(n => '<option value="' + esc(n) + '">').join('');
   if (EDITING && EDITING.unknown && EDITING.unknown.length)
     $('#drop-text').innerHTML = t('note_drop', EDITING.unknown.map(u => '<code>' + esc(u) + '</code>').join(', '));
   kindTexts();
+}
+
+// names :443 hands straight to an x-ui inbound that have no site here (Reality, mostly)
+function directHtml(d){
+  const list = (d.direct || []).filter(x => !(d.sites || []).some(s => s.domain === x.name));
+  if (!list.length) return '';
+  let h = '<h3 class="dhead">' + esc(t('d_list_t')) + '</h3><p class="sec-d">' + esc(t('d_list_d')) + '</p><div class="slist">';
+  for (const x of list){
+    const kind = x.kind === 'reality' ? 'Reality' : x.kind === 'tls' ? 'TLS' : (x.kind || '?');
+    const brw = x.kind === 'reality' ? t('d_brw_real', '<code>' + esc((x.real || x.name).replace(/:443$/, '')) + '</code>')
+              : x.kind === 'tls' ? esc(t('d_brw_nosite')) : esc(t('d_brw_other'));
+    h += '<div class="site glass">'
+      +  '<div><span class="lbl">' + esc(t('th_domain')) + '</span>'
+      +  (x.remark ? '<div class="sname">' + esc(x.remark) + '</div>' : '')
+      +  '<div class="dom ltr">' + esc(x.name) + '</div></div>'
+      +  '<div><span class="lbl">' + esc(t('th_backend')) + '</span><div>' + esc(t('sni_cli')) + '</div><div class="sline">' + brw + '</div></div>'
+      +  '<div><span class="lbl">' + esc(t('th_notes')) + '</span><span class="tag cdn">' + esc(kind) + '</span>'
+      +  '<span class="tag"><span class="ltr">' + esc(x.target) + '</span></span></div>'
+      +  '<div class="acts"></div></div>';
+  }
+  return h + '</div>';
+}
+
+// ---- "Xray config directly on 443": pick an x-ui inbound, Save does the rest
+let DIRECT = null;
+function directIbs(){
+  if (!DIRECT) return [];
+  return (DIRECT.tls_inbounds || []).map(x => Object.assign({t: 'tls'}, x))
+    .concat((DIRECT.inbounds || []).map(x => Object.assign({t: 'reality'}, x)));
+}
+function directNote(html){ $('#d-note').innerHTML = html || ''; $('#d-note').hidden = !html; }
+async function directLoad(){
+  $('#d-ib').innerHTML = '<option value="">' + esc(t('loading')) + '</option>';
+  directNote('');
+  try { DIRECT = await api('api/reality'); } catch (_) { DIRECT = null; }
+  if (siteKind() !== 'direct') return;
+  const ibs = directIbs();
+  if (!DIRECT || !DIRECT.xui) directNote(esc(t('xui_none')));
+  else if (!DIRECT.front) directNote(esc(t('d_nofront')));
+  else if (!ibs.length) directNote(esc(t('d_none')));
+  $('#d-ib').innerHTML = '<option value="">' + esc(t('d_choose')) + '</option>' + ibs.map((x, i) => {
+    const what = x.t === 'reality' ? 'Reality · ' + (x.names.join(', ') || '?')
+               : (x.proto || '').toUpperCase() + ' + TLS · ' + ((x.via && x.via[0]) || x.tls_name || '?');
+    return '<option value="' + i + '">' + esc((x.remark || '#' + x.id) + ' — ' + what + (x.on443 ? '  ✓ 443' : '')) + '</option>';
+  }).join('');
+  directPick();
+}
+function directPick(){
+  const ib = directIbs()[parseInt($('#d-ib').value, 10)];
+  $('#sni-box').hidden = true;
+  $('#f-domain').readOnly = false;
+  if (!ib){ $('#d-hint').innerHTML = ''; return; }
+  if (DIRECT && DIRECT.front) directNote(ib.on443 ? esc(t('d_already')) : '');
+  if (ib.t === 'reality'){
+    $('#f-domain').value = ib.names.join(', ');
+    $('#f-domain').readOnly = true;
+    $('#d-hint').innerHTML = t('d_reality_h', '<code>' + esc((ib.target || ib.names[0] || '').replace(/:443$/, '')) + '</code>');
+    return;
+  }
+  const dom = (ib.via && ib.via[0]) || ib.tls_name || '';
+  $('#f-domain').value = dom;
+  const site = (SITES || []).find(x => x.domain === dom);
+  sbSet(site || {domain: dom || '…', target: 'respond:404', sni_fallback: '1'});
+  $('#sni-box').hidden = false;
+  $('#d-hint').innerHTML = t('d_tls_h');
+}
+$('#d-ib').onchange = directPick;
+$('#f-domain').addEventListener('input', () => {
+  if (siteKind() === 'direct' && !$('#sni-box').hidden)
+    $('#sb-d').innerHTML = t('sb_d', esc($('#f-domain').value.trim() || '…'));
+});
+function directMode(on){
+  $('#add').classList.toggle('direct-mode', on);
+  $('#direct-box').hidden = !on;
+  $('#btn-add').textContent = t(EDITING ? 'btn_save' : on ? 'd_save' : 'btn_add');
+  if (on){ $('#f-target').required = false; directLoad(); return; }
+  $('#sni-box').hidden = !$('#add').classList.contains('sni-simple');
+  $('#f-domain').readOnly = !!EDITING;
+  if (!$('#add').classList.contains('sni-simple')) syncExtra();
+}
+// a site this form may rewrite with just "what does a browser see"
+function plainSite(s){ return !!(s && s.form_ok && !s.routes.length && !s.paths.length && !s.extra && !s.host_header && !s.behind_xray); }
+async function directSave(){
+  const ib = directIbs()[parseInt($('#d-ib').value, 10)];
+  if (!ib){ toast(t('d_choose'), true); $('#d-ib').focus(); return; }
+  const dom = $('#f-domain').value.trim().toLowerCase();
+  let target = '';
+  if (ib.t === 'tls'){
+    if (!dom){ toast(t('d_need_dom'), true); $('#f-domain').focus(); return; }
+    const [v, miss] = sbTarget();
+    if (miss){ toast(t(miss), true); $(sbKind() === 'redirect' ? '#sb-url' : '#sb-app').focus(); return; }
+    target = v;
+  }
+  busy = true;
+  $('#btn-add').disabled = true;
+  $('#btn-add').textContent = t('working');
+  const outs = [];
+  let ok = true;
+  if (ib.t === 'tls'){
+    // the site keeps the certificate and is what a browser sees (through Xray's fallback)
+    const site = (SITES || []).find(x => x.domain === dom);
+    const body = {domain: dom, name: $('#f-name').value.trim() || (site && site.name) || '', target: target,
+                  routes: [], paths: [], host_header: '', panel: false, no_tls: false, behind_xray: false,
+                  cert: site && site.cert_via === 'cloudflare' ? 'cloudflare' : 'caddy', extra: ''};
+    if (!site || plainSite(site)){
+      const r = await api(site ? 'api/edit' : 'api/add', body);
+      outs.push(r.out || ''); ok = r.ok;
+    }
+  }
+  if (ok){
+    const r = await api('api/reality', {action: 'on443', id: ib.id, name: ib.t === 'tls' ? dom : ''});
+    outs.push(r.out || ''); ok = r.ok;
+  }
+  busy = false;
+  $('#btn-add').disabled = false;
+  const title = t('k_direct') + ' ' + (dom || ib.remark);
+  toast(ok ? t('toast_live', dom || ib.remark) : t('toast_failed'), !ok);
+  show(title, outs.join('\n'));
+  $('#form-out-title').textContent = title;
+  $('#form-out').innerHTML = paint(outs.join('\n')) || esc(t('no_output'));
+  $('#form-out-card').hidden = false;
+  if (ok) stopEdit(); else formTexts();
+  $('#form-out-card').scrollIntoView({behavior:'smooth', block:'nearest'});
+  refresh();
 }
 
 // what a browser gets on a name the SNI router hands to Xray, in words
@@ -6538,6 +6716,7 @@ $('#sb-full').onclick = () => {
 
 function startEdit(s){
   EDITING = s;
+  $('#k-direct').hidden = true;      // an existing site is edited as a site
   $('#f-domain').value  = s.domain;
   $('#f-name').value    = s.name || '';
   $('#f-target').value  = s.target;
@@ -6592,6 +6771,7 @@ function stopEdit(){
   setKind('web', false);
   $('#form-card').classList.remove('editing');
   $('#btn-cancel').hidden = true;
+  $('#k-direct').hidden = false;
   sbOn(false);
   formTexts();
 }
@@ -6609,6 +6789,7 @@ $('#edit-dlg').addEventListener('close', () => { if (EDITING) stopEdit(); });
 $('#add').onsubmit = async e => {
   e.preventDefault();
   if (busy) return;
+  if ($('#add').classList.contains('direct-mode')) return directSave();
   if ($('#add').classList.contains('sni-simple')){
     const [v, miss] = sbTarget();
     if (miss){ toast(t(miss), true); $(sbKind() === 'redirect' ? '#sb-url' : '#sb-app').focus(); return; }
@@ -7330,6 +7511,21 @@ PY
 	return 0
 }
 
+# sync + validate + reload + x-ui, for callers outside apply (repair, reality on443)
+sni_fallback_apply() {
+	sni_fallback_sync
+	if [[ $SNIFB_CHANGED -eq 1 ]]; then
+		if caddy_validate >/dev/null 2>&1; then
+			clear_stage
+			systemctl reload caddy 2>/dev/null && ok "Caddy reloaded - names routed to Xray answer browsers again" \
+				|| { warn "Caddy did not reload:"; last_caddy_error | sed 's/^/       /'; }
+		else
+			rollback; SNIFB_PAIRS=""; warn "Caddy rejected the Xray fallback listeners - files restored"
+		fi
+	fi
+	sni_fallback_xray
+}
+
 # Give each Xray inbound behind a routed name its fallback to our listener
 # (x-ui database; x-ui restarts only when something changed).
 sni_fallback_xray() {
@@ -7514,21 +7710,31 @@ reality_py() {
 import json, os, random, re, shutil, sqlite3, string, subprocess, sys, time
 db, envp, bdir, action = sys.argv[1:5]
 arg = sys.argv[5] if len(sys.argv) > 5 else ""
+arg2 = (sys.argv[6] if len(sys.argv) > 6 else "").lower()
 LOOP = ("127.0.0.1", "localhost", "::1")
 
 
 def inbounds(c):
     out = []
-    for i, remark, port, listen, enable, ss in c.execute(
-            "select id, remark, port, listen, enable, stream_settings from inbounds order by id"):
+    for i, remark, port, listen, enable, ss, proto, st in c.execute(
+            "select id, remark, port, listen, enable, stream_settings, protocol, settings from inbounds order by id"):
         try:
             s = json.loads(ss or "{}")
+            se = json.loads(st or "{}")
         except ValueError:
             continue
         rs = s.get("realitySettings") or {}
+        # TLS that Xray can take straight off :443 and hand browsers back from
+        # (fallback): VLESS without encryption or Trojan, over plain TCP
+        tls = (s.get("security") == "tls" and proto in ("vless", "trojan")
+               and s.get("network", "tcp") in ("tcp", "raw")
+               and (proto != "vless" or se.get("decryption", "none") == "none"))
         out.append({"id": i, "remark": remark or "", "port": int(port or 0), "listen": listen or "",
                     "enable": bool(enable), "reality": s.get("security") == "reality",
-                    "names": [n.lower() for n in (rs.get("serverNames") or []) if n]})
+                    "names": [n.lower() for n in (rs.get("serverNames") or []) if n],
+                    "target": str(rs.get("target") or rs.get("dest") or ""),
+                    "proto": proto or "", "tls": tls,
+                    "tls_name": str((s.get("tlsSettings") or {}).get("serverName") or "").lower()})
     return out
 
 
@@ -7660,8 +7866,11 @@ if action == "status":
         txt = None          # DNSGuard may exist here, but it is not in front of Caddy
     new, notes = want_pass(ibs, pairs) if txt is not None else (pairs, [])
     on = dict(pairs)
-    out = []
+    out, tout = [], []
     for ib in ibs:
+        if ib["tls"]:
+            via = sorted(n for n, t in pairs if t == f"127.0.0.1:{ib['port']}")
+            tout.append(dict(ib, local=ib["listen"] in LOOP, on443=bool(via), via=via))
         if not ib["reality"]:
             continue
         out.append(dict(ib, local=ib["listen"] in LOOP,
@@ -7669,7 +7878,7 @@ if action == "status":
                         links=[f"{r['address']}:{r['port']}" for r in rows(c, ib["id"])]))
     print(json.dumps({"xui": True, "front": txt is not None, "router": ROUTER if txt is not None else "",
                       "can_enable": os.environ.get("REALITY_CAN_SNI") == "1",
-                      "inbounds": out, "pass": pairs if txt is not None else [],
+                      "inbounds": out, "tls_inbounds": tout, "pass": pairs if txt is not None else [],
                       "in_sync": txt is None or (new == pairs and not want_rows(c, ibs)), "notes": notes}))
     sys.exit(0)
 
@@ -7678,12 +7887,48 @@ if txt is None:
     sys.exit(1)
 
 restart = set()
+orig = list(pairs)
+tls_todo = []
 if action == "on443":
     ib = next((x for x in ibs if str(x["id"]) == arg), None)
-    if not ib or not ib["reality"]:
-        print(f"inbound {arg} is not a Reality inbound")
+    if not ib or not (ib["reality"] or ib["tls"]):
+        print(f"inbound {arg} is neither Reality nor TLS that can share :443 (VLESS without encryption / Trojan, TCP + TLS)")
         sys.exit(1)
-    if not ib["names"]:
+    if ib["tls"]:
+        # TLS: the name the clients use (and the certificate is for)
+        name = arg2 or ib["tls_name"]
+        if not re.fullmatch(r"(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}", name or ""):
+            print(f"inbound {arg} has no server name - give the domain: reality on443 {arg} <domain>")
+            sys.exit(1)
+        t = f"127.0.0.1:{ib['port']}"
+        have = dict(pairs).get(name)
+        if have and have != t:
+            print(f"{name} already goes to {have} - remove that route first")
+            sys.exit(1)
+        if not have:
+            pairs = pairs + [(name, t)]
+        # share links: the inbound's own port only exists on loopback
+        if has_hosts(c):
+            rs = rows(c, ib["id"])
+            for r in rs:
+                if r["port"] == ib["port"]:
+                    tls_todo.append(("update hosts set port=443 where id=?", (r["id"],),
+                                     f"link {r['address']}:{r['port']} -> {r['address']}:443 (inbound {ib['id']})"))
+            tpl = c.execute("select * from hosts limit 1").fetchone()
+            if not rs and tpl:
+                cols = [x[1] for x in c.execute("pragma table_info(hosts)")]
+                row = {}
+                for k, v in zip(cols, tpl):
+                    if k != "id":
+                        row[k] = ("[]" if str(v).startswith("[") else "") if isinstance(v, str) else (0 if isinstance(v, int) else v)
+                now = int(time.time() * 1000)
+                row.update(inbound_id=ib["id"], remark=ib["remark"], address=name, port=443, security="same",
+                           fingerprint="chrome", created_at=now, updated_at=now,
+                           group_id="".join(random.choices(string.ascii_lowercase + string.digits, k=16)))
+                row = {k: v for k, v in row.items() if k in cols}
+                tls_todo.append(("insert into hosts (%s) values (%s)" % (",".join(row), ",".join("?" * len(row))),
+                                 tuple(row.values()), f"link added: {name}:443 (inbound {ib['id']} had none)"))
+    elif not ib["names"]:
         print(f"inbound {arg} has no server name (SNI)")
         sys.exit(1)
     if ib["listen"] not in LOOP:
@@ -7698,9 +7943,12 @@ elif action not in ("sync", "check"):
     sys.exit(1)
 
 new, notes = want_pass(ibs, pairs)
-todo = want_rows(c, ibs)
+todo = want_rows(c, ibs) + tls_todo
 if action == "check":
     sys.exit(3 if (new != pairs or todo) else 0)
+if action == "on443" and len(pairs) > len(orig):
+    notes.append(f"added {pairs[-1][0]} -> {pairs[-1][1]} (inbound {arg}, TLS)")
+pairs = orig
 
 if new != pairs:
     if ROUTER == "caddy":
@@ -7726,7 +7974,7 @@ if todo:
         print(note)
     c.commit()
 if not notes and not todo and not restart:
-    print("nothing to do - every Reality on loopback is on :443")
+    print("nothing to do - everything routed to Xray is on :443 already")
 for u in sorted(restart):
     print(f"RESTART {u}")
 PY
@@ -7764,9 +8012,11 @@ cmd_reality() {
 		sync|on443)
 			need_root reality
 			local id="" check=0 out line rc=0
+			local dom=""
 			if [[ "$action" == on443 ]]; then
 				id="${1:-}"
-				[[ "$id" =~ ^[0-9]+$ ]] || die "usage: $SELF_NAME reality on443 <inbound id>"
+				[[ "$id" =~ ^[0-9]+$ ]] || die "usage: $SELF_NAME reality on443 <inbound id> [domain]"
+				[[ -n "${2:-}" && "${2:-}" != --* ]] && { dom="${2,,}"; valid_domain "$dom" || die "invalid domain: $dom"; }
 			fi
 			[[ " $* " == *" --check "* ]] && check=1
 			[[ $front -eq 1 ]] || die "Reality on :443 needs DNSGuard in front of Caddy or Caddy's own SNI router ($SELF_NAME sni enable)"
@@ -7774,7 +8024,7 @@ cmd_reality() {
 				reality_py check || return $?
 				return 0
 			fi
-			out="$(reality_py "$action" $id)" || rc=$?
+			out="$(reality_py "$action" $id $dom)" || rc=$?
 			[[ $rc -eq 0 ]] || die "$out"
 			while IFS= read -r line; do
 				case "$line" in
@@ -7796,8 +8046,10 @@ cmd_reality() {
 					warn "could not restart ${line#RESTART } - restart it by hand"
 				fi
 			done <<<"$out"
+			# a TLS name now goes to Xray: its site (if any) answers browsers through a fallback
+			[[ "$action" == on443 ]] && sni_fallback_apply
 			;;
-		*) die "usage: $SELF_NAME reality [status|sync|on443 <inbound id>]" ;;
+		*) die "usage: $SELF_NAME reality [status|sync|on443 <inbound id> [domain]]" ;;
 	esac
 }
 
@@ -8360,7 +8612,9 @@ ${C_B}COMMANDS${C_OFF}
                                            they share :443
   reality sync                             give every Reality on loopback its
                                            SNI_PASS line and :443 share links
-  reality on443 <inbound id>               move one Reality to loopback + sync
+  reality on443 <inbound id> [domain]      put a Reality or TLS inbound on :443:
+                                           loopback, router line, :443 links;
+                                           TLS also gets its browser fallback
   xui [check|fix]                          x-ui panel / sub behind Caddy: check,
                                            or fix (Listen IP 127.0.0.1, no own
                                            cert where Caddy speaks plain HTTP,
