@@ -2797,16 +2797,28 @@ cmd_doctor() {
 			else
 				ok "$d -> Cloudflare ($r)"
 			fi
-		elif [[ -n "$FRONT_IP" && "$r" != "$FRONT_IP" ]]; then warn "$d -> $r  (expected $FRONT_IP)"
+		elif [[ -n "$FRONT_IP" && "$r" != "$FRONT_IP" ]]; then
+			# another CDN in front (ArvanCloud) answers with its own address
+			local srv
+			srv=$(curl -sI --max-time 8 "https://$d/" 2>/dev/null | tr -d '\r' \
+				| awk -F': *' 'tolower($1)=="server"{print $2; exit}' || true)
+			if [[ "$srv" =~ ^[Aa]rvan[Cc]loud ]]; then ok "$d -> ArvanCloud CDN ($r)"
+			else warn "$d -> $r  (expected $FRONT_IP)"; fi
 		else ok "$d -> $r"; fi
 	done
 	shopt -u nullglob
 	echo
 
 	hdr "11  Recent Caddy errors"
-	journalctl -u caddy --since "1 hour ago" --no-pager 2>/dev/null \
-		| grep -iE '"level":"error"|denied|already in use' | tail -5 | sed 's/^/       /' \
-		|| dim "(none in the last hour)"
+	local errs hung
+	errs=$(journalctl -u caddy --since "1 hour ago" --no-pager 2>/dev/null \
+		| grep -iE '"level":"error"|denied|already in use' || true)
+	# a visitor or scanner that hangs up mid-connection - noise, not a fault
+	hung=$(grep -cE 'connection reset by peer|broken pipe' <<<"$errs" || true)
+	errs=$(grep -vE 'connection reset by peer|broken pipe' <<<"$errs" | sed '/^$/d' | tail -5 || true)
+	if [[ -n "$errs" ]]; then sed 's/^/       /' <<<"$errs"
+	else dim "(none in the last hour)"; fi
+	if [[ "${hung:-0}" -gt 0 ]]; then dim "$hung connection(s) closed early by the other side (visitors, scanners) - normal"; fi
 	echo
 }
 
