@@ -348,11 +348,13 @@ target_hostport() {
 #   proxy     a service to reverse-proxy to (local port, or someone else's site)
 #   files     a directory served straight off disk
 #   redirect  send visitors somewhere else entirely
+#   respond   a bare status code, e.g. 404 around a panel on a hidden path
 classify_target() {
 	local t="$1"
 	case "$t" in
 		redirect:*) printf 'redirect %s\n' "${t#redirect:}"; return 0 ;;
 		redir:*)    printf 'redirect %s\n' "${t#redir:}";    return 0 ;;
+		respond:[1-5][0-9][0-9]) printf 'respond %s\n' "${t#respond:}"; return 0 ;;
 		/*)         printf 'files %s\n'    "${t%/}";         return 0 ;;
 	esac
 	if [[ "$t" =~ ^[0-9]+$ ]]; then printf 'proxy 127.0.0.1:%s\n' "$t"; return 0; fi
@@ -412,6 +414,8 @@ apply() {
 	# a new bind address needs HTTP/3 off too when UDP 443 is taken
 	ensure_h3_off
 	ensure_real_ip quiet
+	# names the SNI router hands to Xray: their listener for Xray's fallback
+	sni_fallback_sync
 
 	# the running Caddy gets the Cloudflare token from systemd; validate needs it too
 	if ! caddy_validate >"$log" 2>&1; then
@@ -431,6 +435,7 @@ apply() {
 		activity_diff
 		clear_stage
 		ok "Caddy reloaded with no downtime."
+		sni_fallback_xray
 		return 0
 	fi
 
@@ -444,6 +449,7 @@ apply() {
 			activity_diff
 			clear_stage
 			ok "Permissions repaired, Caddy reloaded."
+			sni_fallback_xray
 			return 0
 		fi
 		err="$(last_caddy_error)"
@@ -888,10 +894,13 @@ cmd_install() {
 	fi
 
 	hdr "9/9  Final check"
+	sni_fallback_sync
 	if caddy_validate >/dev/null 2>&1; then
 		ok "config is valid"
 		if systemctl reload caddy 2>/dev/null; then
 			ok "Caddy reloaded"
+			clear_stage
+			sni_fallback_xray
 		else
 			warn "reload failed:"
 			last_caddy_error | sed 's/^/       /'
@@ -1115,7 +1124,8 @@ ensure_global_server_block() {
 			cat "$CADDYFILE"
 		} > "$tmp"
 	fi
-	stage_edit "$CADDYFILE"
+	# staged once per change: a second copy would roll back to the half-way state
+	[[ " ${_rb_old[*]:-} " == *" $CADDYFILE|"* ]] || stage_edit "$CADDYFILE"
 	write_inplace "$CADDYFILE" "$tmp"
 }
 
@@ -1431,7 +1441,7 @@ cmd_add() {
 	tinfo="$(classify_target "$target")" \
 		|| die "don't know what to do with backend '$target'
        expected a port, host:port, https://host:port, a directory path,
-       another domain, or redirect:<url>"
+       another domain, redirect:<url> or respond:<code>"
 	fi
 	tkind="${tinfo%% *}"; target="${tinfo#* }"
 	# a panel's base path typed as its backend would serve an empty folder
@@ -1490,6 +1500,8 @@ cmd_add() {
 		fi
 	elif [[ "$tkind" == redirect ]]; then
 		ok "visitors will be redirected to $target"
+	elif [[ "$tkind" == respond ]]; then
+		ok "answered with HTTP $target"
 	elif target_is_remote "$target"; then
 		hp="$(target_hostport "$target")"; th="${hp%:*}"
 		ok "remote site: $target"
@@ -1625,6 +1637,7 @@ cmd_add() {
 				# change of the target would never reach anyone who saw the old one
 				printf '%sredir %s{uri}\n' "$ind" "${target%/}"
 				;;
+			respond) printf '%srespond %s\n' "$ind" "$target" ;;
 			none) ;;
 			*) render_proxy "$ind" "$target" ;;
 		esac
@@ -1656,6 +1669,10 @@ cmd_add() {
 	# --replace edits in place: back the old file up so a rejected config
 	# rolls back to exactly what was there, with no moment of downtime.
 	if [[ -f "$f" ]]; then stage_edit "$f"; else stage_new "$f"; fi
+	# the Xray fallback listener keeps its port (Xray points at it); apply
+	# rebuilds its content from the new site
+	local fb_keep=""
+	[[ -f "$f" ]] && fb_keep="$(sed -n "/^${SNIFB_BEGIN}\$/,/^${SNIFB_END}\$/p" "$f")"
 	{
 		[[ -n "$site_name" ]] && echo "# name: $site_name"
 		if [[ $behind_xray -eq 1 ]]; then
@@ -1732,6 +1749,7 @@ cmd_add() {
 		if [[ -n "$front_port" && $behind_xray -eq 0 && "$cert_mode" != none ]] && caddy_redirects_off; then
 			redirect_block "$domain"
 		fi
+		[[ -n "$fb_keep" && $behind_xray -eq 0 ]] && printf '\n%s\n' "$fb_keep"
 	} > "$f"
 	unset -f render_proxy render_body render_main
 	chown "root:$(caddy_group)" "$f" 2>/dev/null || true
@@ -1974,6 +1992,14 @@ cf_zone_for() {
 # Swap Caddy's build for one with the Cloudflare DNS module. Caddy's own
 # 'add-package' fetches it from caddyserver.com; the old binary is kept and
 # put back if anything goes wrong.
+# Put the saved Caddy binary back. Caddy may be running from it, and a running
+# binary cannot be written over ("Text file busy") - a rename replaces it.
+caddy_bin_restore() {
+	local bin="$1"
+	cmp -s "$bin.smart-caddy.bak" "$bin" && return 0
+	cp -p "$bin.smart-caddy.bak" "$bin.smart-caddy.new" && mv -f "$bin.smart-caddy.new" "$bin"
+}
+
 cf_install_module() {
 	cf_module_ok && { ok "Caddy already has the Cloudflare DNS module"; return 0; }
 	have caddy || die "caddy is not installed"
@@ -1982,7 +2008,7 @@ cf_install_module() {
 	cp -p "$bin" "$bin.smart-caddy.bak"
 	if ! caddy add-package "$CF_PKG" >"$log" 2>&1 || ! cf_module_ok; then
 		tail -n 5 "$log" | sed 's/^/       /' >&2; rm -f "$log"
-		cp -p "$bin.smart-caddy.bak" "$bin"
+		caddy_bin_restore "$bin"
 		dim "caddyserver.com must be reachable; behind a filter set https_proxy and run it again"
 		die "could not add the module - Caddy is unchanged"
 	fi
@@ -1994,7 +2020,7 @@ cf_install_module() {
 	if systemctl restart caddy; then
 		ok "Caddy restarted with the Cloudflare DNS module"
 	else
-		cp -p "$bin.smart-caddy.bak" "$bin"; systemctl restart caddy || true
+		caddy_bin_restore "$bin"; systemctl restart caddy || true
 		die "Caddy did not start with the new build - the previous one is back"
 	fi
 }
@@ -2324,6 +2350,17 @@ cmd_repair() {
 	else
 		ok "real visitor IP behind Cloudflare already set up"
 	fi
+	sni_fallback_sync
+	if [[ $SNIFB_CHANGED -eq 1 ]]; then
+		if caddy_validate >/dev/null 2>&1; then
+			clear_stage
+			systemctl reload caddy 2>/dev/null && ok "Caddy reloaded - names routed to Xray answer browsers again" \
+				|| { warn "Caddy did not reload:"; last_caddy_error | sed 's/^/       /'; }
+		else
+			rollback; SNIFB_PAIRS=""; warn "Caddy rejected the Xray fallback listeners - files restored"
+		fi
+	fi
+	sni_fallback_xray
 
 	hdr "Repairing the panel service"
 	if [[ -f "$UI_UNIT" && ! -f /etc/smart-caddy-panel.json ]]; then
@@ -3081,6 +3118,7 @@ RE_HOSTPORT = re.compile(r"^[a-zA-Z0-9.\-]{1,253}:[0-9]{1,5}$")
 RE_URL      = re.compile(r"^(https?|h2c)://[a-zA-Z0-9.\-]{1,253}(:[0-9]{1,5})?(/[A-Za-z0-9._~\-/]*)?$")
 RE_DIR      = re.compile(r"^/[A-Za-z0-9._\-/]{0,255}$")
 RE_REDIR    = re.compile(r"^redirect:https?://[A-Za-z0-9.\-]{1,253}(:[0-9]{1,5})?(/[A-Za-z0-9._~\-/]*)?$")
+RE_RESPOND  = re.compile(r"^respond:[1-5][0-9]{2}$")
 RE_PATH   = re.compile(r"^/[A-Za-z0-9._~\-/]{0,200}$")
 RE_HOST_H = re.compile(r"^[A-Za-z0-9.\-]{1,253}$")
 RE_ROUTE  = re.compile(r"^/[A-Za-z0-9._~\-/*]{0,200}$")
@@ -3194,7 +3232,14 @@ def parse_site(text):
             "host_header": "", "insecure": False, "nobuffer": False,
             "behind_xray": "behind an Xray fallback" in text, "listen_port": "",
             "no_tls": False, "form_ok": True, "unknown": [], "extra": "",
-            "custom": False}
+            "custom": False, "sni_fallback": ""}
+    # the listener for Xray's fallback is rebuilt from the site on every
+    # change (see sni_fallback_sync), so it is not part of what the form edits
+    m = re.search(r"\n*" + re.escape(SNIFB_BEGIN) + r".*?" + re.escape(SNIFB_END) + r"\n?", text, re.S)
+    if m:
+        p = re.search(r"^http://\S+?:(\d+)\s*\{", m.group(0), re.M)
+        info["sni_fallback"] = p.group(1) if p else ""
+        text = text[:m.start()] + "\n" + text[m.end():]
     m = re.search(r"^\s*(?:@app path|# app base path:)\s+(.+)$", text, re.M)
     if m:
         for tok in m.group(1).split():
@@ -3224,6 +3269,8 @@ def parse_site(text):
             return words[2]
         if d == "redir" and len(words) > 1:
             return "redirect:" + re.sub(r"\{uri\}$", "", words[1])
+        if d == "respond" and len(words) == 2 and RE_RESPOND.match("respond:" + words[1]):
+            return "respond:" + words[1]
         return None
 
     def route(path, target):
@@ -3454,12 +3501,47 @@ def xui_settings():
     return out
 
 
+SNIFB_BEGIN = "# --- xray fallback listener (smart-caddy) ---"
+SNIFB_END = "# --- end of xray fallback listener ---"
+SNI_PASS_FILE = "/etc/smart-caddy-sni.conf"
+CADDYFILE = os.environ.get("SMART_CADDY_CADDYFILE", "/etc/caddy/Caddyfile")
+DNSGUARD_ENV = "/opt/dnsguard/.env"
+
+
+def sni_routes():
+    """name -> 127.0.0.1:port for names the router in front of Caddy hands to
+    another program (Xray) instead of Caddy - like sni_routes_all()."""
+    raw = []
+    try:
+        cf = open(CADDYFILE).read()
+    except OSError:
+        cf = ""
+    if "# --- smart-caddy SNI router" in cf:
+        try:
+            raw = open(SNI_PASS_FILE).read().split()
+        except OSError:
+            pass
+    elif re.search(r"^\s*https_port\s+(?!443\b)\d+", cf, re.M):
+        try:
+            m = re.search(r"^SNI_PASS=(.*)$", open(DNSGUARD_ENV).read(), re.M)
+            raw = m.group(1).replace(" ", "").split(",") if m else []
+        except OSError:
+            pass
+    out = {}
+    for part in raw:
+        n, _, t = part.partition("=")
+        if n and re.fullmatch(r"127\.0\.0\.1:\d{1,5}", t):
+            out.setdefault(n.lower(), t)
+    return out
+
+
 def read_sites():
     sites = []
     try:
         names = sorted(n for n in os.listdir(SITES_DIR) if n.endswith(".caddy"))
     except OSError:
         return sites
+    routed = sni_routes()
 
     for name in names:
         domain = name[:-6]
@@ -3503,6 +3585,8 @@ def read_sites():
             "cert_via": "cloudflare" if re.search(r"^\s*dns\s+cloudflare", text, re.M) else "",
             "imported": bool(re.search(r"^# (imported by|custom config)", text, re.M)),
             "name": (re.search(r"^# name: (.+)$", text, re.M) or [None, ""])[1].strip(),
+            # :443 for this name goes past Caddy to Xray (127.0.0.1:port)
+            "sni": "" if info["behind_xray"] else routed.get(domain, ""),
         })
         sites.append(info)
     return sites
@@ -3917,11 +4001,11 @@ class Handler(BaseHTTPRequestHandler):
             target = "none"         # the extra lines serve the site
         elif not (RE_PORT.match(target) or RE_HOSTPORT.match(target)
                 or RE_URL.match(target) or RE_DIR.match(target)
-                or RE_REDIR.match(target) or RE_DOMAIN.match(target)):
+                or RE_REDIR.match(target) or RE_RESPOND.match(target) or RE_DOMAIN.match(target)):
             return self.send_json(
                 {"ok": False,
                  "out": "backend must be a port, host:port, https://host:port, "
-                        "a directory path, another domain, or redirect:<url>"}, 400)
+                        "a directory path, another domain, redirect:<url> or respond:<code>"}, 400)
 
         # The browser re-sends a POST when the connection drops before the
         # answer arrives (a front proxy like DNSGuard restarting mid-request).
@@ -3955,7 +4039,7 @@ class Handler(BaseHTTPRequestHandler):
             if not RE_ROUTE.match(rp):
                 return self.send_json({"ok": False, "out": f"invalid route path: {rp}"}, 400)
             if not (RE_PORT.match(rt) or RE_HOSTPORT.match(rt) or RE_URL.match(rt)
-                    or RE_DIR.match(rt) or RE_REDIR.match(rt) or RE_DOMAIN.match(rt)):
+                    or RE_DIR.match(rt) or RE_REDIR.match(rt) or RE_RESPOND.match(rt) or RE_DOMAIN.match(rt)):
                 return self.send_json({"ok": False, "out": f"invalid route backend: {rt}"}, 400)
             kind = str((r or {}).get("kind", ""))
             kind = kind + ":" if kind in ("ws", "web", "h2c") else ""
@@ -5146,6 +5230,9 @@ en: {
   no_sites:'No sites yet. Add one with the form.', no_sites_cf:'No sites yet. Add one with the form, or import the ones found in the Caddyfile.',
   edit:'Edit', config:'Config', remove:'Remove',
   tag_pending:'no cert yet', tag_internal:'self-signed', tag_xray:'cert on Xray', tag_none:'plain HTTP',
+  tag_sni:'SNI → Xray', tag_sni_nofb:'browsers get no answer',
+  sni_fb_h:'The SNI router sends :443 for this name to Xray ({0}). What Xray does not take itself (a browser) falls back to Caddy on 127.0.0.1:{1}, so the backend above still answers.',
+  sni_nofb_h:'The SNI router sends :443 for this name to Xray ({0}) and that inbound cannot fall back to Caddy (only VLESS / Trojan over TCP + TLS can) - only Xray clients get through.',
   tag_path:'path', tag_behind_xray:'behind Xray', tag_unbuffered:'unbuffered', tag_insecure:'insecure upstream',
   tag_custom:'custom config', tag_imported:'imported', routes_n:'{0} routes',
   cf_title:'Found in Caddyfile', import_all:'Import all', import:'Import', lines:'lines',
@@ -5321,6 +5408,9 @@ fa: {
   no_sites:'هنوز سایتی نیست. از فرم یکی اضافه کنید.', no_sites_cf:'هنوز سایتی نیست. از فرم یکی اضافه کنید یا سایت‌های پیداشده در Caddyfile را وارد کنید.',
   edit:'ویرایش', config:'کانفیگ', remove:'حذف',
   tag_pending:'هنوز گواهی ندارد', tag_internal:'خودامضا', tag_xray:'گواهی روی Xray', tag_none:'HTTP ساده',
+  tag_sni:'SNI → Xray', tag_sni_nofb:'مرورگر جوابی نمی‌گیرد',
+  sni_fb_h:'مسیریاب SNI ترافیک :443 این نام را به Xray ({0}) می‌دهد. هرچه Xray خودش برندارد (مثلاً مرورگر) از راه fallback به Caddy روی 127.0.0.1:{1} برمی‌گردد، پس همین بک‌اند جواب می‌دهد.',
+  sni_nofb_h:'مسیریاب SNI ترافیک :443 این نام را به Xray ({0}) می‌دهد و آن اینباند نمی‌تواند به Caddy برگرداند (فقط VLESS / Trojan روی TCP + TLS می‌تواند) - فقط کلاینت‌های Xray وصل می‌شوند.',
   tag_path:'مسیر', tag_behind_xray:'پشت Xray', tag_unbuffered:'بدون بافر', tag_insecure:'بک‌اند بدون بررسی گواهی',
   tag_custom:'کانفیگ سفارشی', tag_imported:'واردشده', routes_n:'{0} مسیر',
   cf_title:'پیداشده در Caddyfile', import_all:'وارد کردن همه', import:'وارد کردن', lines:'خطوط',
@@ -5728,6 +5818,9 @@ function render(d){
     if (s.paths.length)  notes += '<span class="tag">' + esc(t('tag_path')) + ' <span class="ltr">' + esc(pth) + '</span></span>';
     if (s.behind_xray)   notes += '<span class="tag">' + esc(t('tag_behind_xray'))
                                 + (s.listen_port ? ' :' + esc(s.listen_port) : '') + '</span>';
+    if (s.sni)           notes += '<span class="tag cdn" title="' + esc(t(s.sni_fallback ? 'sni_fb_h' : 'sni_nofb_h', s.sni, s.sni_fallback)) + '">'
+                                + esc(t('tag_sni')) + ' <span class="ltr">' + esc(s.sni) + '</span></span>'
+                                + (s.sni_fallback ? '' : '<span class="tag warn" title="' + esc(t('sni_nofb_h', s.sni)) + '">' + esc(t('tag_sni_nofb')) + '</span>');
     if (s.nobuffer)      notes += '<span class="tag">' + esc(t('tag_unbuffered')) + '</span>';
     if (s.insecure)      notes += '<span class="tag">' + esc(t('tag_insecure')) + '</span>';
     if (!s.form_ok)      notes += '<span class="tag warn">' + esc(t('tag_custom')) + '</span>';
@@ -6642,7 +6735,7 @@ l4_install_module() {
 	# add-package keeps the modules this build already has (e.g. Cloudflare DNS)
 	if ! caddy add-package "$L4_PKG" >"$log" 2>&1 || ! l4_module_ok; then
 		tail -n 5 "$log" | sed 's/^/       /' >&2; rm -f "$log"
-		cp -p "$bin.smart-caddy.bak" "$bin"
+		caddy_bin_restore "$bin"
 		dim "caddyserver.com must be reachable; behind a filter set https_proxy and run it again"
 		die "could not add the module - Caddy is unchanged"
 	fi
@@ -6839,7 +6932,10 @@ if mode in ("on", "off"):
                                 "\tredir https://{host}{uri} permanent", "}", ""]
             nt = "\n".join(out)
         else:
-            nt = re.sub(r"\n?" + re.escape(RCOMMENT) + r"\nhttp://\S+ \{\n\tbind 127\.0\.0\.1\n\tredir https://\{host\}\{uri\} permanent\n\}\n?", "\n", t)
+            # Xray fallback listeners belong to the router; without it the name reaches the site itself
+            nt = re.sub(r"\n*# --- xray fallback listener \(smart-caddy\) ---\n.*?# --- end of xray fallback listener ---\n?",
+                        "\n", t, flags=re.S)
+            nt = re.sub(r"\n?" + re.escape(RCOMMENT) + r"\nhttp://\S+ \{\n\tbind 127\.0\.0\.1\n\tredir https://\{host\}\{uri\} permanent\n\}\n?", "\n", nt)
             nt = re.sub(r"^\tbind 127\.0\.0\.1$", f"\tbind {front}" if front else "\x00", nt, flags=re.M)
             nt = nt.replace("\x00\n", "")
             nt = nt.rstrip("\n") + "\n" if t.endswith("\n") else nt.rstrip("\n")
@@ -6848,6 +6944,237 @@ if mode in ("on", "off"):
             changed.append(f)
 print("\n".join(changed))
 PY
+}
+
+# =============================================================================
+#  Xray fallback listeners for names the router hands to Xray
+#
+#  A name in the router's list (Caddy's SNI router or DNSGuard's SNI_PASS)
+#  that points at a TLS inbound on loopback never reaches Caddy on :443 -
+#  Xray gets the connection. Caddy still keeps that name's certificate (the
+#  HTTP challenge comes in on :80), but whatever the site says - a redirect,
+#  a cover site, a panel - would never be seen: a browser that is not an
+#  Xray client got a reset. So each such site gets a second, plain HTTP
+#  listener on loopback with the same content, and the Xray inbound a
+#  fallback to it (PROXY v2, so the site still sees the visitor's address).
+#  Both are kept in step on every change.
+# =============================================================================
+
+SNIFB_BEGIN="# --- xray fallback listener (smart-caddy) ---"
+SNIFB_END="# --- end of xray fallback listener ---"
+SNIFB_CHANGED=0
+SNIFB_PAIRS=""
+
+# name=127.0.0.1:port lines of the router that is in front of Caddy, if any
+sni_routes_all() {
+	if sni_mode_on; then
+		[[ -r "$SNI_PASS_FILE" ]] && tr -d ' \r' < "$SNI_PASS_FILE"
+	elif [[ -n "$(caddy_front_port)" && -r "$DNSGUARD_ENV" ]]; then
+		grep -oP '^SNI_PASS=\K.*' "$DNSGUARD_ENV" | head -1 | tr -d ' \r' | tr ',' '\n'
+	fi | grep -E '^[A-Za-z0-9.-]+=127\.0\.0\.1:[0-9]+$' || true
+}
+
+# Rewrite the fallback listener blocks in the site files (staged, so a
+# rejected config rolls back). Sets SNIFB_CHANGED and SNIFB_PAIRS
+# ("port domain target" lines for sni_fallback_xray).
+sni_fallback_sync() {
+	SNIFB_CHANGED=0; SNIFB_PAIRS=""
+	[[ -d "$SITES_DIR" ]] && have python3 || return 0
+	local out line f port
+	out="$(SNIFB_ROUTES="$(sni_routes_all)" python3 - "$SITES_DIR" "$CADDYFILE" "$SNIFB_BEGIN" "$SNIFB_END" <<'PY'
+import glob, os, re, subprocess, sys
+sdir, cfile, BEGIN, END = sys.argv[1:5]
+routes = {}
+for l in os.environ.get("SNIFB_ROUTES", "").split():
+    n, _, t = l.partition("=")
+    routes.setdefault(n.lower(), t)
+
+
+def depth(s):
+    s = re.sub(r'"[^"]*"', "", s.split("#", 1)[0])
+    return s.count("{") - s.count("}")
+
+
+def drop_block(text):
+    """text without our fallback block; and the port it had"""
+    m = re.search(r"\n*" + re.escape(BEGIN) + r".*?" + re.escape(END) + r"\n?", text, re.S)
+    if not m:
+        return text, ""
+    p = re.search(r"^http://\S+?:(\d+)\s*\{", m.group(0), re.M)
+    return text[:m.start()] + "\n" + text[m.end():], p.group(1) if p else ""
+
+
+def main_body(text, domain):
+    """lines inside the site's own HTTPS block, minus bind and tls"""
+    ls = text.split("\n")
+    for i, l in enumerate(ls):
+        if l.startswith(("\t", " ", "#")) or not l.rstrip().endswith("{"):
+            continue
+        if l.rstrip()[:-1].strip().lower() != domain:
+            continue
+        body, d, j, skip = [], 1, i + 1, 0
+        while j < len(ls):
+            x = ls[j]
+            nd = d + depth(x)
+            if nd <= 0:
+                return body
+            if skip:
+                skip = skip + depth(x)
+                if skip <= 0:
+                    skip = 0
+            elif d == 1 and re.match(r"^\s*(bind|tls)(\s|$)", x):
+                if depth(x) > 0:
+                    skip = depth(x)
+            else:
+                body.append(x)
+            d = nd
+            j += 1
+        return None
+    return None
+
+
+used = set()
+for f in glob.glob(os.path.join(sdir, "*.caddy")) + [cfile]:
+    try:
+        used |= {int(p) for p in re.findall(r":(\d{2,5})\b", open(f).read())}
+    except OSError:
+        pass
+r = subprocess.run(["ss", "-Htln"], capture_output=True, text=True)
+used |= {int(p) for p in re.findall(r":(\d+)\s", r.stdout)}
+
+for f in sorted(glob.glob(os.path.join(sdir, "*.caddy"))):
+    domain = os.path.basename(f)[:-6].lower()
+    try:
+        text = open(f).read()
+    except OSError:
+        continue
+    if "behind an Xray fallback" in text:
+        continue
+    base, port = drop_block(text)
+    target = routes.get(domain)
+    body = main_body(base, domain) if target else None
+    new = base
+    if target and body is not None:
+        if not port:
+            port = next((str(p) for p in range(8200, 8300) if p not in used), "")
+            if not port:
+                continue
+            used.add(int(port))
+        while body and not body[0].strip():
+            body.pop(0)
+        blk = [BEGIN,
+               f"# :443 for {domain} goes to Xray ({target}, SNI router); what Xray",
+               "# does not take itself - a browser, a cover page - comes back here.",
+               "# Rebuilt from the site above on every change: edit the site, not this.",
+               f"http://{domain}:{port} {{", "\tbind 127.0.0.1"] + body + ["}", END]
+        new = base.rstrip("\n") + "\n\n" + "\n".join(blk) + "\n"
+        print(f"PAIR {port} {domain} {target}")
+    if new != text:
+        open(f + ".sfb-new", "w").write(new)
+        print(f"FILE {f}")
+PY
+)" || return 0
+	while IFS= read -r line; do
+		case "$line" in
+			"FILE "*)
+				f="${line#FILE }"
+				[[ -f "$f.sfb-new" ]] || continue
+				[[ " ${_rb_old[*]:-} " == *" $f|"* ]] || stage_edit "$f"
+				write_inplace "$f" "$f.sfb-new"
+				SNIFB_CHANGED=1 ;;
+			"PAIR "*)
+				SNIFB_PAIRS+="${line#PAIR }"$'\n'
+				port="${line#PAIR }"; port="${port%% *}"
+				if ! grep -qF "servers 127.0.0.1:${port} {" "$CADDYFILE"; then
+					ensure_global_server_block "127.0.0.1:${port}"
+					SNIFB_CHANGED=1
+				fi ;;
+		esac
+	done <<<"$out"
+	return 0
+}
+
+# Give each Xray inbound behind a routed name its fallback to our listener
+# (x-ui database; x-ui restarts only when something changed).
+sni_fallback_xray() {
+	[[ -n "$SNIFB_PAIRS" && -w "$XUI_DB" ]] && have python3 || return 0
+	local out line restart=0
+	out="$(SNIFB_PAIRS="$SNIFB_PAIRS" python3 - "$XUI_DB" "$REALITY_BACKUPS" <<'PY'
+import json, os, shutil, sqlite3, sys, time
+db, bdir = sys.argv[1:3]
+LOOP = ("127.0.0.1", "localhost", "::1")
+pairs = [l.split() for l in os.environ.get("SNIFB_PAIRS", "").splitlines() if len(l.split()) == 3]
+try:
+    c = sqlite3.connect(db, timeout=10)
+    ibs = list(c.execute("select id, remark, port, listen, protocol, settings, stream_settings from inbounds"))
+    table = bool(c.execute("select 1 from sqlite_master where type='table' and name='inbound_fallbacks'").fetchone())
+except Exception as exc:
+    print(f"WARN cannot read {db}: {exc}")
+    sys.exit(0)
+backed = False
+
+
+def backup():
+    global backed
+    if not backed:
+        os.makedirs(bdir, exist_ok=True)
+        dst = os.path.join(bdir, "x-ui.db." + time.strftime("%Y%m%d-%H%M%S"))
+        shutil.copy2(db, dst)
+        print(f"BACKUP {dst}")
+        backed = True
+
+
+for port, domain, target in pairs:
+    tport = int(target.rsplit(":", 1)[1])
+    dest = f"127.0.0.1:{port}"
+    ib = next((x for x in ibs if int(x[2] or 0) == tport and (x[3] or "") in LOOP), None)
+    if not ib:
+        continue
+    iid, remark, _, _, proto, settings, stream = ib
+    try:
+        st, ss = json.loads(settings or "{}"), json.loads(stream or "{}")
+    except ValueError:
+        continue
+    if proto not in ("vless", "trojan") or ss.get("security") != "tls" \
+            or ss.get("network", "tcp") not in ("tcp", "raw") \
+            or (proto == "vless" and st.get("decryption", "none") != "none"):
+        print(f"SKIP inbound {iid} ({remark}) cannot fall back ({proto}/{ss.get('network')}/{ss.get('security')})"
+              f" - {domain} only answers Xray clients on :443")
+        continue
+    if table:
+        rows = list(c.execute("select name, alpn, path, dest from inbound_fallbacks where master_id=?", (iid,)))
+    else:
+        rows = [(f.get("name", ""), f.get("alpn", ""), f.get("path", ""), str(f.get("dest", "")))
+                for f in (st.get("fallbacks") or [])]
+    if any(str(d).strip() in (dest, port) for _, _, _, d in rows):
+        continue
+    has_default = any(not (n or a or p) for n, a, p, _ in rows)
+    name = domain if has_default else ""
+    backup()
+    if table:
+        order = (c.execute("select max(sort_order) from inbound_fallbacks where master_id=?", (iid,)).fetchone()[0] or 0) + 1
+        c.execute("insert into inbound_fallbacks (master_id, child_id, name, alpn, path, dest, xver, sort_order)"
+                  " values (?, 0, ?, '', '', ?, 2, ?)", (iid, name, dest, order if rows else 0))
+    else:
+        st.setdefault("fallbacks", []).append(dict({"dest": dest, "xver": 2}, **({"name": name} if name else {})))
+        c.execute("update inbounds set settings=? where id=?", (json.dumps(st, indent=2), iid))
+    c.commit()
+    print(f"ADDED inbound {iid} ({remark}): fallback {('SNI ' + name + ' ') if name else ''}-> {dest} for {domain}")
+PY
+)" || return 0
+	while IFS= read -r line; do
+		case "$line" in
+			"BACKUP "*) dim "x-ui database backup: ${line#BACKUP }" ;;
+			"ADDED "*)  ok "Xray ${line#ADDED }"; restart=1 ;;
+			"SKIP "*)   warn "${line#SKIP }" ;;
+			"WARN "*)   warn "${line#WARN }" ;;
+		esac
+	done <<<"$out"
+	if [[ $restart -eq 1 ]]; then
+		if systemctl restart x-ui 2>/dev/null; then ok "x-ui restarted - Xray now hands browsers back to Caddy"
+		else warn "could not restart x-ui - restart it by hand so the fallback takes effect"; fi
+	fi
+	return 0
 }
 
 # sni_write <on|off|render> - stage, write and validate; returns 1 (rolled back) on a bad config
@@ -7593,7 +7920,7 @@ cmd_panel() {
 				echo -e "\tencode zstd gzip"
 				[[ -n "$tls_block" ]] && echo "$tls_block"
 				cat "$blk"
-				echo -e "\n\thandle {\n\t\trespond 404\n\t}"
+				echo -e "\n\t# everything else\n\thandle {\n\t\trespond 404\n\t}"
 				echo "}"
 				if [[ -n "$(caddy_front_port)" ]] && caddy_redirects_off; then
 					redirect_block "$domain"
@@ -7853,6 +8180,7 @@ ${C_B}TARGETS${C_OFF}
   /var/www/mysite            serve files from a directory
   example.com                proxy through to somebody else's site
   redirect:https://x.com     send visitors there instead
+  respond:404                answer with a bare status code (e.g. around routes)
 
 ${C_B}RECIPES${C_OFF}
   ${C_DIM}# plain web app${C_OFF}
