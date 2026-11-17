@@ -4925,7 +4925,7 @@ table.cmp td.yes{color:var(--ok);font-weight:600} table.cmp td.no{color:var(--ba
 dialog{border:1px solid var(--stroke-2);border-radius:var(--r);color:var(--ink);padding:22px;width:min(1000px,94vw);
   background:rgba(20,18,36,.82);-webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur);
   box-shadow:0 30px 80px rgba(0,0,0,.6)}
-#edit-dlg{width:calc(100vw - 2*max(50px,3vw));max-width:none;max-height:calc(100vh - 32px)}
+#edit-dlg{width:min(1360px,calc(100vw - 2*max(50px,3vw)));max-width:none;max-height:calc(100vh - 32px)}
 @media (max-width:640px){#edit-dlg{width:calc(100vw - 32px);padding:16px}}
 dialog::backdrop{background:rgba(4,3,10,.6);-webkit-backdrop-filter:blur(4px);backdrop-filter:blur(4px)}
 textarea{width:100%;min-height:50vh;resize:vertical;padding:16px;border:1px solid var(--stroke);
