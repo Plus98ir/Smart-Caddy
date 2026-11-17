@@ -4752,6 +4752,13 @@ html[lang=fa] .card h3{letter-spacing:0}
 .cert-card{padding:16px 18px;display:grid;gap:10px}
 .cert-card .chead{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px}
 .cert-card .sec-d{margin:0}
+#add.sni-simple .full-only{display:none}
+#add.sni-simple #f-target{display:none}
+.sbopts{display:grid;gap:8px;margin:6px 0 12px}
+.sbopts label{display:flex;gap:8px;align-items:center;cursor:pointer;font-weight:600}
+.sbopts input[type=text]{margin:0 0 6px 26px;width:calc(100% - 26px)}
+html[dir=rtl] .sbopts input[type=text]{margin:0 26px 6px 0}
+.sline{font-size:12.5px;color:var(--dim);margin-top:4px}
 .cpath{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:10px;align-items:center}
 .cpath .lbl{font-size:11.5px;color:var(--dim);min-width:72px}
 .cpath code{overflow-wrap:anywhere;word-break:break-all}
@@ -4808,7 +4815,8 @@ select:disabled{opacity:.45;cursor:default}
   background:color-mix(in srgb,var(--acc) 14%,transparent)}
 .pills input{margin:0;flex:none;accent-color:var(--acc);width:15px;height:15px}
 .pills.sm label{padding:6px 11px;font-size:12.5px}
-.kindbox .what{font-weight:600;font-size:15px;margin:0 0 12px}
+.kindbox .what,#sni-box .what{font-weight:600;font-size:15px;margin:0 0 12px}
+.note.warn{border-color:rgba(255,194,77,.35);background:rgba(255,194,77,.08)}
 .howto{margin-top:14px}
 .howto summary{cursor:pointer;color:var(--acc);font-weight:600;font-size:13.5px}
 .howto ol{margin:10px 0 0;padding-inline-start:22px;line-height:1.9;font-size:13.5px;color:var(--mut)}
@@ -5072,7 +5080,21 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
     <div class="note" id="drop-note" hidden><span id="drop-text"></span>
       <button type="button" class="link" id="drop-raw" data-t="open_code">Edit as code</button></div>
 
-    <div class="sec glass kindbox">
+    <div class="sec glass" id="sni-box" hidden>
+      <p class="what" data-t="sb_t">This name belongs to an Xray config</p>
+      <p class="sec-d" id="sb-d"></p>
+      <div class="note warn" id="sb-nofb" hidden data-t="sb_nofb"></div>
+      <div class="sbopts">
+        <label><input type="radio" name="sbk" value="redirect" checked><span data-t="sb_redir">Send them to another site</span></label>
+        <input type="text" id="sb-url" class="ltr" dir="ltr" placeholder="https://www.google.com">
+        <label><input type="radio" name="sbk" value="app"><span data-t="sb_app">Show a site or app on this server</span></label>
+        <input type="text" id="sb-app" class="ltr" dir="ltr" placeholder="8088">
+        <label><input type="radio" name="sbk" value="none"><span data-t="sb_none">Show nothing (empty page, 404)</span></label>
+      </div>
+      <button type="button" class="link" id="sb-full" data-t="sb_full">Show the full form</button>
+    </div>
+
+    <div class="sec glass kindbox full-only">
       <p class="what" data-t="what_t">What are you putting online?</p>
       <div class="pills" id="f-kind">
         <label><input type="radio" name="fkind" value="web" checked><span data-t="k_web">Website or app</span></label>
@@ -5102,20 +5124,20 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
           <datalist id="name-list"></datalist>
           <div class="hint" data-t="f_name_h"></div>
         </div>
-        <div>
+        <div class="full-only">
           <label for="f-target" data-t="f_target">Main backend</label>
           <input type="text" id="f-target" placeholder="8088" required>
           <div class="hint" data-th="f_target_h"></div>
         </div>
-        <div>
+        <div class="full-only">
           <label for="f-path"><span data-t="f_path">Path prefix</span> <span class="opt" data-t="optional">(optional)</span></label>
-          <input type="text" id="f-path" placeholder="/5wSobQvUFuNy4zBUcc">
+          <input type="text" id="f-path" placeholder="/secret-path">
           <div class="hint" data-t="f_path_h"></div>
         </div>
       </div>
     </fieldset>
 
-    <fieldset class="sec glass">
+    <fieldset class="sec glass full-only">
       <legend><span class="num">2</span><span data-t="f_routes">Routes</span> <span class="opt sub" data-t="optional">(optional)</span></legend>
       <p class="sec-d" data-th="f_routes_h"></p>
       <div id="routes"></div>
@@ -5124,7 +5146,7 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
       <div class="hint" data-th="route_auto"></div>
     </fieldset>
 
-    <fieldset class="sec glass">
+    <fieldset class="sec glass full-only">
       <legend><span class="num">3</span><span data-t="sec_opts">Certificate and options</span></legend>
       <p class="sec-d" data-t="sec_opts_d"></p>
       <div class="grid">
@@ -5146,7 +5168,7 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
       </div>
     </fieldset>
 
-    <fieldset class="sec glass">
+    <fieldset class="sec glass full-only">
       <legend><span class="num">4</span><span data-t="sec_mode">Site type</span></legend>
       <p class="sec-d" data-t="sec_mode_d"></p>
       <div class="checks">
@@ -5159,7 +5181,7 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
       </div>
     </fieldset>
 
-    <details class="sec glass" id="sec-extra">
+    <details class="sec glass full-only" id="sec-extra">
       <summary><span class="num">5</span><span data-t="sec_extra">Extra Caddy lines</span> <span class="opt sub" data-t="optional">(optional)</span></summary>
       <p class="sec-d" data-th="sec_extra_d"></p>
       <textarea id="f-extra" class="ltr" dir="ltr" spellcheck="false" autocomplete="off" placeholder="header -Server"></textarea>
@@ -5366,7 +5388,14 @@ en: {
   no_sites:'No sites yet. Add one with the form.', no_sites_cf:'No sites yet. Add one with the form, or import the ones found in the Caddyfile.',
   edit:'Edit', config:'Config', remove:'Remove',
   tag_pending:'no cert yet', tag_internal:'self-signed', tag_xray:'cert on Xray', tag_none:'plain HTTP',
-  tag_sni:'SNI → Xray', tag_sni_nofb:'browsers get no answer',
+  tag_sni:'Xray config', tag_sni_nofb:'browsers get no answer',
+  sni_cli:'Xray clients connect straight through', sni_brw:'In a browser: {0}',
+  sni_redir:'goes to {0}', sni_404:'empty page (404)', sni_app:'shows {0} on this server', sni_none:'no answer',
+  sb_t:'This name belongs to an Xray config',
+  sb_d:'Xray clients use it as it is - nothing to change for them. Choose only what someone sees who opens <b class="ltr">https://{0}</b> in a browser:',
+  sb_redir:'Send them to another site', sb_app:'Show a site or app on this server (port)', sb_none:'Show nothing (empty page, 404)',
+  sb_full:'Show the full form', sb_need_url:'Type the address to send visitors to', sb_need_app:'Type the port (or address) of the site on this server',
+  sb_nofb:'The Xray inbound behind this name cannot send browsers back (only VLESS / Trojan over TCP + TLS can), so browsers get no answer whatever you choose here.',
   sni_fb_h:'The SNI router sends :443 for this name to Xray ({0}). What Xray does not take itself (a browser) falls back to Caddy on 127.0.0.1:{1}, so the backend above still answers.',
   sni_nofb_h:'The SNI router sends :443 for this name to Xray ({0}) and that inbound cannot fall back to Caddy (only VLESS / Trojan over TCP + TLS can) - only Xray clients get through.',
   tag_path:'path', tag_behind_xray:'behind Xray', tag_unbuffered:'unbuffered', tag_insecure:'insecure upstream',
@@ -5544,7 +5573,14 @@ fa: {
   no_sites:'هنوز سایتی نیست. از فرم یکی اضافه کنید.', no_sites_cf:'هنوز سایتی نیست. از فرم یکی اضافه کنید یا سایت‌های پیداشده در Caddyfile را وارد کنید.',
   edit:'ویرایش', config:'کانفیگ', remove:'حذف',
   tag_pending:'هنوز گواهی ندارد', tag_internal:'خودامضا', tag_xray:'گواهی روی Xray', tag_none:'HTTP ساده',
-  tag_sni:'SNI → Xray', tag_sni_nofb:'مرورگر جوابی نمی‌گیرد',
+  tag_sni:'کانفیگ Xray', tag_sni_nofb:'مرورگر جوابی نمی‌گیرد',
+  sni_cli:'کلاینت‌های Xray مستقیم وصل می‌شوند', sni_brw:'در مرورگر: {0}',
+  sni_redir:'می‌رود به {0}', sni_404:'صفحهٔ خالی (404)', sni_app:'{0} روی همین سرور را نشان می‌دهد', sni_none:'جوابی نمی‌گیرد',
+  sb_t:'این دامنه مال یک کانفیگ Xray است',
+  sb_d:'کلاینت‌های Xray همین‌طور از آن استفاده می‌کنند و برای آن‌ها چیزی لازم نیست عوض شود. فقط انتخاب کنید کسی که <b class="ltr">https://{0}</b> را در مرورگر باز می‌کند چه ببیند:',
+  sb_redir:'فرستادن به یک سایت دیگر', sb_app:'نشان دادن یک سایت یا برنامه روی همین سرور (پورت)', sb_none:'هیچ‌چیز (صفحهٔ خالی، 404)',
+  sb_full:'نمایش فرم کامل', sb_need_url:'آدرس سایتی را که بازدیدکننده به آن برود بنویسید', sb_need_app:'پورت (یا آدرس) سایت روی همین سرور را بنویسید',
+  sb_nofb:'اینباند Xray پشت این دامنه نمی‌تواند مرورگر را برگرداند (فقط VLESS / Trojan روی TCP + TLS می‌تواند)، پس هرچه اینجا انتخاب کنید مرورگر جوابی نمی‌گیرد.',
   sni_fb_h:'مسیریاب SNI ترافیک :443 این نام را به Xray ({0}) می‌دهد. هرچه Xray خودش برندارد (مثلاً مرورگر) از راه fallback به Caddy روی 127.0.0.1:{1} برمی‌گردد، پس همین بک‌اند جواب می‌دهد.',
   sni_nofb_h:'مسیریاب SNI ترافیک :443 این نام را به Xray ({0}) می‌دهد و آن اینباند نمی‌تواند به Caddy برگرداند (فقط VLESS / Trojan روی TCP + TLS می‌تواند) - فقط کلاینت‌های Xray وصل می‌شوند.',
   tag_path:'مسیر', tag_behind_xray:'پشت Xray', tag_unbuffered:'بدون بافر', tag_insecure:'بک‌اند بدون بررسی گواهی',
@@ -5955,7 +5991,7 @@ function render(d){
     if (s.behind_xray)   notes += '<span class="tag">' + esc(t('tag_behind_xray'))
                                 + (s.listen_port ? ' :' + esc(s.listen_port) : '') + '</span>';
     if (s.sni)           notes += '<span class="tag cdn" title="' + esc(t(s.sni_fallback ? 'sni_fb_h' : 'sni_nofb_h', s.sni, s.sni_fallback)) + '">'
-                                + esc(t('tag_sni')) + ' <span class="ltr">' + esc(s.sni) + '</span></span>'
+                                + esc(t('tag_sni')) + '</span>'
                                 + (s.sni_fallback ? '' : '<span class="tag warn" title="' + esc(t('sni_nofb_h', s.sni)) + '">' + esc(t('tag_sni_nofb')) + '</span>');
     if (s.nobuffer)      notes += '<span class="tag">' + esc(t('tag_unbuffered')) + '</span>';
     if (s.insecure)      notes += '<span class="tag">' + esc(t('tag_insecure')) + '</span>';
@@ -5963,6 +5999,7 @@ function render(d){
     else if (s.custom)   notes += '<span class="tag">' + esc(t('tag_custom')) + '</span>';
     else if (s.imported) notes += '<span class="tag">' + esc(t('tag_imported')) + '</span>';
     let backend = s.target ? '<code>' + esc(s.target) + '</code>' : '<span class="tag">' + esc(t('sec_extra')) + '</span>';
+    if (s.sni) backend = '<div>' + esc(t('sni_cli')) + '</div><div class="sline">' + t('sni_brw', sniSees(s)) + '</div>';
     for (const r of s.routes)
       backend += '<div class="rt ltr"><code>' + esc(r.path) + '</code> → <code>' + esc(r.target) + '</code>'
               +  (/^h2c:\/\//.test(r.target) ? ' <span class="tag cdn">XHTTP / gRPC</span>' : '') + '</div>';
@@ -6443,6 +6480,62 @@ function formTexts(){
   kindTexts();
 }
 
+// what a browser gets on a name the SNI router hands to Xray, in words
+function sniSees(s){
+  if (!s.sni_fallback) return esc(t('sni_none'));
+  const v = s.target || '';
+  if (v.startsWith('redirect:')) return t('sni_redir', '<code>' + esc(v.slice(9)) + '</code>');
+  if (/^respond:/.test(v)) return esc(t('sni_404'));
+  return t('sni_app', '<code>' + esc(v) + '</code>');
+}
+// such a name only needs one answer - "what does a browser see?" - unless the
+// site has more than the simple box can show
+function sniSimple(s){
+  return !!(s && s.sni && s.form_ok && !s.routes.length && !s.paths.length && !s.extra && !s.host_header);
+}
+function sbSet(s){
+  const v = s.target || '';
+  let k = 'app';
+  $('#sb-url').value = ''; $('#sb-app').value = '';
+  if (v.startsWith('redirect:')){ k = 'redirect'; $('#sb-url').value = v.slice(9); }
+  else if (/^respond:/.test(v)) k = 'none';
+  else $('#sb-app').value = v;
+  document.querySelector('#sni-box input[name=sbk][value="' + k + '"]').checked = true;
+  $('#sb-d').innerHTML = t('sb_d', esc(s.domain));
+  $('#sb-nofb').hidden = !!s.sni_fallback;
+  sbSync();
+}
+function sbKind(){ return (document.querySelector('#sni-box input[name=sbk]:checked') || {}).value || 'app'; }
+function sbSync(){
+  const k = sbKind();
+  $('#sb-url').hidden = k !== 'redirect';
+  $('#sb-app').hidden = k !== 'app';
+}
+// the simple box -> the form's main backend; [value, missing-message key]
+function sbTarget(){
+  const k = sbKind();
+  if (k === 'none') return ['respond:404', ''];
+  if (k === 'redirect'){
+    let u = $('#sb-url').value.trim();
+    if (!u) return ['', 'sb_need_url'];
+    if (!/^https?:\/\//.test(u)) u = 'https://' + u;
+    return ['redirect:' + u.replace(/\/+$/, ''), ''];
+  }
+  const a = $('#sb-app').value.trim();
+  return a ? [a, ''] : ['', 'sb_need_app'];
+}
+function sbOn(on){
+  $('#add').classList.toggle('sni-simple', on);
+  $('#sni-box').hidden = !on;
+  $('#f-target').required = !on && !$('#f-extra').value.trim();
+}
+document.querySelectorAll('#sni-box input[name=sbk]').forEach(i => i.onchange = sbSync);
+$('#sb-full').onclick = () => {
+  const [v] = sbTarget();
+  if (v) $('#f-target').value = v;
+  sbOn(false);
+};
+
 function startEdit(s){
   EDITING = s;
   $('#f-domain').value  = s.domain;
@@ -6472,6 +6565,7 @@ function startEdit(s){
   $('#btn-cancel').hidden = false;
   $('#form-out-card').hidden = true;
   formTexts();
+  if (sniSimple(s)){ sbSet(s); sbOn(true); } else sbOn(false);
   // edit in a window over the current page, like Config, instead of jumping to the Add tab
   $('#edit-dlg').appendChild($('#form-card'));
   if (!$('#edit-dlg').open) $('#edit-dlg').showModal();
@@ -6498,6 +6592,7 @@ function stopEdit(){
   setKind('web', false);
   $('#form-card').classList.remove('editing');
   $('#btn-cancel').hidden = true;
+  sbOn(false);
   formTexts();
 }
 
@@ -6514,6 +6609,11 @@ $('#edit-dlg').addEventListener('close', () => { if (EDITING) stopEdit(); });
 $('#add').onsubmit = async e => {
   e.preventDefault();
   if (busy) return;
+  if ($('#add').classList.contains('sni-simple')){
+    const [v, miss] = sbTarget();
+    if (miss){ toast(t(miss), true); $(sbKind() === 'redirect' ? '#sb-url' : '#sb-app').focus(); return; }
+    $('#f-target').value = v;
+  }
   // the commonest slip: the panel's base path typed as its backend
   const tv = $('#f-target').value.trim();
   if ($('#f-panel').checked && tv.startsWith('/')){
