@@ -4925,6 +4925,8 @@ table.cmp td.yes{color:var(--ok);font-weight:600} table.cmp td.no{color:var(--ba
 dialog{border:1px solid var(--stroke-2);border-radius:var(--r);color:var(--ink);padding:22px;width:min(1000px,94vw);
   background:rgba(20,18,36,.82);-webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur);
   box-shadow:0 30px 80px rgba(0,0,0,.6)}
+#edit-dlg{width:calc(100vw - 2*max(50px,3vw));max-width:none;max-height:calc(100vh - 32px)}
+@media (max-width:640px){#edit-dlg{width:calc(100vw - 32px);padding:16px}}
 dialog::backdrop{background:rgba(4,3,10,.6);-webkit-backdrop-filter:blur(4px);backdrop-filter:blur(4px)}
 textarea{width:100%;min-height:50vh;resize:vertical;padding:16px;border:1px solid var(--stroke);
   border-radius:var(--r-sm);background:rgba(0,0,0,.4);color:var(--ink);tab-size:4;direction:ltr;text-align:left;
@@ -5425,7 +5427,7 @@ en: {
   edit:'Edit', config:'Config', remove:'Remove',
   tag_pending:'no cert yet', tag_internal:'self-signed', tag_xray:'cert on Xray', tag_none:'plain HTTP',
   tag_sni:'Xray config', tag_sni_nofb:'browsers get no answer',
-  sni_cli:'Xray clients connect straight through', sni_brw:'In a browser: {0}',
+  sni_cli:'Xray clients connect straight through', sni_brw:'In a browser: {0}', sni_ib:'x-ui inbound: {0}', sni_ib_h:'The x-ui inbound that port 443 hands this name to',
   sni_redir:'goes to {0}', sni_404:'empty page (404)', sni_app:'shows {0} on this server', sni_none:'no answer',
   sb_t:'This name belongs to an Xray config',
   sb_d:'Xray clients use it as it is - nothing to change for them. Choose only what someone sees who opens <b class="ltr">https://{0}</b> in a browser:',
@@ -5621,7 +5623,7 @@ fa: {
   edit:'ویرایش', config:'کانفیگ', remove:'حذف',
   tag_pending:'هنوز گواهی ندارد', tag_internal:'خودامضا', tag_xray:'گواهی روی Xray', tag_none:'HTTP ساده',
   tag_sni:'کانفیگ Xray', tag_sni_nofb:'مرورگر جوابی نمی‌گیرد',
-  sni_cli:'کلاینت‌های Xray مستقیم وصل می‌شوند', sni_brw:'در مرورگر: {0}',
+  sni_cli:'کلاینت‌های Xray مستقیم وصل می‌شوند', sni_brw:'در مرورگر: {0}', sni_ib:'اینباند x-ui: {0}', sni_ib_h:'اینباند x-ui که پورت 443 این اسم را به آن می‌دهد',
   sni_redir:'می‌رود به {0}', sni_404:'صفحهٔ خالی (404)', sni_app:'{0} روی همین سرور را نشان می‌دهد', sni_none:'جوابی نمی‌گیرد',
   sb_t:'این دامنه مال یک کانفیگ Xray است',
   sb_d:'کلاینت‌های Xray همین‌طور از آن استفاده می‌کنند و برای آن‌ها چیزی لازم نیست عوض شود. فقط انتخاب کنید کسی که <b class="ltr">https://{0}</b> را در مرورگر باز می‌کند چه ببیند:',
@@ -6058,7 +6060,16 @@ function render(d){
     else if (s.custom)   notes += '<span class="tag">' + esc(t('tag_custom')) + '</span>';
     else if (s.imported) notes += '<span class="tag">' + esc(t('tag_imported')) + '</span>';
     let backend = s.target ? '<code>' + esc(s.target) + '</code>' : '<span class="tag">' + esc(t('sec_extra')) + '</span>';
-    if (s.sni) backend = '<div>' + esc(t('sni_cli')) + '</div><div class="sline">' + t('sni_brw', sniSees(s)) + '</div>';
+    if (s.sni){
+      const ib = (d.direct || []).find(x => x.name === s.domain) || {};
+      const kind = ib.kind === 'reality' ? 'Reality' : ib.kind === 'tls' ? 'TLS' : (ib.kind || '');
+      const what = '<bdi dir="ltr"><b>' + esc(ib.remark || (ib.id ? '#' + ib.id : '?')) + '</b>'
+                 + (ib.id && ib.remark ? ' #' + esc(ib.id) : '')
+                 + (kind ? ' · ' + esc(kind) : '') + ' · <code>' + esc(s.sni) + '</code></bdi>';
+      backend = '<div>' + esc(t('sni_cli')) + '</div>'
+              + '<div class="sline" title="' + esc(t('sni_ib_h')) + '">' + t('sni_ib', what) + '</div>'
+              + '<div class="sline">' + t('sni_brw', sniSees(s)) + '</div>';
+    }
     for (const r of s.routes)
       backend += '<div class="rt ltr"><code>' + esc(r.path) + '</code> → <code>' + esc(r.target) + '</code>'
               +  (/^h2c:\/\//.test(r.target) ? ' <span class="tag cdn">XHTTP / gRPC</span>' : '') + '</div>';
