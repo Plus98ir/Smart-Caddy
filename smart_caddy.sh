@@ -1251,6 +1251,109 @@ ensure_h3_off() {
 
 CF_RANGES="173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32"
 
+ip_is_cloudflare() {
+	python3 -c 'import ipaddress, sys
+ip = ipaddress.ip_address(sys.argv[1])
+sys.exit(0 if any(ip in ipaddress.ip_network(n) for n in sys.argv[2].split() if ip.version == ipaddress.ip_network(n).version) else 1)' \
+		"$1" "$CF_RANGES" 2>/dev/null
+}
+
+# doctor: x-ui panel / subscription behind a Caddy site - the mistakes that
+# look like "502" or "sub link does not work" (read-only)
+# xui_doctor [fix] - with "fix" (smart-caddy xui fix) it also changes x-ui:
+# Listen IP 127.0.0.1, no own certificate where Caddy proxies plain HTTP,
+# Sub URI = the site's address. Backup first; prints RESTART when x-ui must.
+xui_doctor() {
+	local line mode="${1:-check}" restart=0
+	while IFS= read -r line; do
+		case "$line" in
+			"OK "*)      ok "${line#OK }" ;;
+			"WARN "*)    warn "${line#WARN }" ;;
+			"FIX "*)     [[ "$mode" == fix ]] || dim "fix: ${line#FIX }" ;;
+			"DIM "*)     dim "${line#DIM }" ;;
+			"SET "*)     ok "x-ui: ${line#SET }" ;;
+			"BACKUP "*)  dim "x-ui database backup: ${line#BACKUP }" ;;
+			RESTART)     restart=1 ;;
+		esac
+	done < <(python3 - "$XUI_DB" "$SITES_DIR" "$mode" "$REALITY_BACKUPS" <<'PY' 2>/dev/null
+import glob, os, re, shutil, sqlite3, sys, time
+db, sdir, mode, bdir = sys.argv[1:5]
+try:
+    c = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=3)
+    s = {k: str(v or "").strip() for k, v in c.execute("select key, value from settings")}
+except Exception as exc:
+    print(f"DIM cannot read x-ui settings: {exc}")
+    sys.exit(0)
+LOOP = ("127.0.0.1", "localhost", "::1")
+parts = [("panel", s.get("webPort") or "2053", s.get("webListen", ""), s.get("webCertFile", ""))]
+if s.get("subEnable", "true") == "true":
+    parts.append(("subscription", s.get("subPort") or "2096", s.get("subListen", ""), s.get("subCertFile", "")))
+KEYS = {"panel": ("webListen", "webCertFile", "webKeyFile"),
+        "subscription": ("subListen", "subCertFile", "subKeyFile")}
+todo = {}           # x-ui setting -> new value (fix mode)
+found = False
+for what, port, listen, cert in parts:
+    # every site (and route) that proxies to this port
+    uses = []
+    for f in sorted(glob.glob(os.path.join(sdir, "*.caddy"))):
+        t = open(f).read()
+        for m in re.finditer(r"reverse_proxy\s+(?:/\S+\s+)?((?:https?://)?(?:127\.0\.0\.1|localhost):" + port + r")\b", t):
+            uses.append((os.path.basename(f)[:-6], m.group(1)))
+    if not uses:
+        continue
+    found = True
+    names = ", ".join(sorted({d for d, _ in uses}))
+    if listen not in LOOP:
+        todo[KEYS[what][0]] = "127.0.0.1"
+        print(f"WARN x-ui {what} (:{port}) listens on {listen or 'every address'} - reachable around Caddy")
+        print(f"FIX smart-caddy xui fix  (or in x-ui settings: {what} Listen IP 127.0.0.1 - Caddy still reaches it)")
+    tls = [b for _, b in uses if b.startswith("https://")]
+    plain = [b for _, b in uses if not b.startswith("https://")]
+    if cert and plain and not tls:
+        todo[KEYS[what][1]] = todo[KEYS[what][2]] = ""
+        print(f"WARN x-ui {what} (:{port}) has its own certificate (speaks HTTPS), but {names} proxies to it as plain HTTP - 502")
+        print(f"FIX smart-caddy xui fix  (clears the {what} certificate fields in x-ui - Caddy does TLS)")
+    elif not cert and tls:
+        print(f"WARN x-ui {what} (:{port}) has no certificate (plain HTTP), but {names} proxies to it as https:// - 502")
+        print(f"FIX Edit the site -> 'Fill in from x-ui' (backend {port}, no https://)")
+    else:
+        print(f"OK x-ui {what} (:{port}) behind {names}, {'HTTPS' if cert else 'plain HTTP'} on both sides")
+    if what == "subscription":
+        uri = s.get("subURI", "")
+        sp = "/" + (s.get("subPath") or "/sub/").strip("/") + "/"
+        doms = sorted({d for d, _ in uses})
+        if not uri or not any(uri.rstrip("/") == f"https://{d}{sp}".rstrip("/") for d in doms):
+            todo["subURI"] = f"https://{doms[0]}{sp}"
+        if not uri:
+            print(f"WARN x-ui Sub URI is empty - sub links carry the inner port :{port}, which only Caddy can reach")
+            print(f"FIX smart-caddy xui fix  (or x-ui settings -> Subscription -> Sub URI = https://{doms[0]}{sp})")
+        elif not any(uri.rstrip("/") == f"https://{d}{sp}".rstrip("/") for d in doms):
+            print(f"WARN x-ui Sub URI is {uri} - expected https://{doms[0]}{sp}")
+            print(f"FIX smart-caddy xui fix  (or x-ui settings -> Subscription -> Sub URI = https://{doms[0]}{sp})")
+if not found:
+    print("DIM (no site proxies to the x-ui panel or subscription)")
+if mode == "fix" and todo:
+    os.makedirs(bdir, exist_ok=True)
+    dst = os.path.join(bdir, "x-ui.db." + time.strftime("%Y%m%d-%H%M%S"))
+    shutil.copy2(db, dst)
+    print(f"BACKUP {dst}")
+    w = sqlite3.connect(db, timeout=10)
+    for k, v in todo.items():
+        if w.execute("update settings set value=? where key=?", (v, k)).rowcount == 0:
+            w.execute("insert into settings (key, value) values (?, ?)", (k, v))
+        print(f"SET {k} = {v or '(empty)'}")
+    w.commit()
+    print("RESTART")
+elif mode == "fix":
+    print("OK nothing to change in x-ui")
+PY
+)
+	if [[ $restart -eq 1 ]]; then
+		if systemctl restart x-ui 2>/dev/null; then ok "x-ui restarted with the new settings"
+		else warn "could not restart x-ui - restart it so the settings take effect"; fi
+	fi
+}
+
 # real_ip_fix <global|site> <file> - print the updated text (unchanged if nothing to do)
 real_ip_fix() {
 	python3 - "$1" "$2" "$CF_RANGES" <<'PY'
@@ -2659,7 +2762,29 @@ cmd_doctor() {
 		fi
 	done
 	shopt -u nullglob
+	# names the SNI router hands to Xray: browsers come back through a fallback
+	local sl sd st sp
+	while IFS= read -r sl; do
+		sd="${sl%%=*}"; st="${sl#*=}"
+		[[ -f "$(site_file "$sd")" ]] || continue
+		xany=1
+		sp=$(grep -A6 -F "$SNIFB_BEGIN" "$(site_file "$sd")" | grep -oP '^http://[^:]+:\K[0-9]+' | head -1 || true)
+		if [[ -z "$sp" ]]; then
+			warn "$sd: :443 goes to Xray ($st) and the site has no fallback listener"
+			dim "fix: $SELF_NAME repair"
+		elif [[ -n "$xdests" ]] && ! grep -qx "$sp" <<<"$xdests"; then
+			warn "$sd: :443 goes to Xray ($st), but Xray does not fall back to :$sp - browsers get no answer"
+			dim "only VLESS / Trojan over TCP + TLS can fall back; fix: $SELF_NAME repair"
+		else
+			ok "$sd: :443 goes to Xray ($st), browsers fall back to the site (:$sp)"
+		fi
+	done < <(sni_routes_all)
 	[[ $xany -eq 0 ]] && dim "(no sites are behind an Xray fallback)"
+
+	if [[ -r "$XUI_DB" ]]; then
+		hdr "8a x-ui behind Caddy"
+		xui_doctor
+	fi
 
 	hdr "9  Sites"
 	cmd_list
@@ -2671,6 +2796,17 @@ cmd_doctor() {
 		d=$(basename "$f" .caddy)
 		r=$(dig +short "$d" @1.1.1.1 2>/dev/null | grep -E '^[0-9.]+$' | head -1) || true
 		if [[ -z "$r" ]];                                 then warn "$d -> no A record"
+		elif ip_is_cloudflare "$r"; then
+			# Cloudflare SSL "Flexible" fetches the origin over http://, Caddy
+			# sends it to https://, Cloudflare passes that on: an endless loop
+			local loc
+			loc=$(curl -s -o /dev/null --max-time 8 --max-redirs 0 -w '%{http_code} %{redirect_url}' "https://$d/" 2>/dev/null || true)
+			if [[ "$loc" =~ ^30[1278]\ https://${d//./\\.}/?$ ]]; then
+				warn "$d -> Cloudflare ($r), redirect loop: Cloudflare SSL mode is \"Flexible\""
+				dim "in Cloudflare: SSL/TLS -> Overview -> Full (strict)"
+			else
+				ok "$d -> Cloudflare ($r)"
+			fi
 		elif [[ -n "$FRONT_IP" && "$r" != "$FRONT_IP" ]]; then warn "$d -> $r  (expected $FRONT_IP)"
 		else ok "$d -> $r"; fi
 	done
@@ -5300,7 +5436,7 @@ en: {
   tab_overview:'Overview', tab_sites:'Sites', tab_add:'Add site', tab_edit:'Edit site', tab_caddyfile:'Import',
   tab_guide:'Cloudflare CDN', tab_diag:'Diagnostics', tab_log:'Activity', tab_certs:'Certificates',
   tab_certs_d:'Where the certificate and key of every site sit on this server. Copy a path into x-ui, Xray or any program that serves TLS itself on the same domain.',
-  certs_note:'Caddy renews these files <b>in place</b>, so a program that points at these paths always reads a fresh certificate - nothing to copy after a renewal. Xray re-reads its certificate files by itself; programs that load them only at start need a restart once in a while.',
+  certs_note:'Caddy renews these files <b>in place</b>, so a program that points at these paths always reads a fresh certificate - nothing to copy after a renewal. Xray re-reads its certificate files by itself; programs that load them only at start need a restart once in a while.<br><b>Where to use them:</b> on inbounds that do TLS themselves (TCP + TLS, Hysteria, Trojan). An x-ui <b>panel or subscription behind Caddy</b> must have its certificate fields <b>empty</b> - Caddy already does TLS, and a second TLS layer gives 502 / a broken sub link (<code>smart-caddy xui fix</code> clears them).',
   certs_none:'No certificates on this server yet.', certs_pending:'Caddy has not got a certificate for this domain yet. If ports 80/443 do not reach Caddy for it, switch it to Cloudflare DNS below.',
   cert_file:'Certificate', key_file:'Key', copy:'Copy', copied:'Copied',
   cert_cf:'Caddy - through Cloudflare DNS (no :80/:443 needed)',
@@ -5478,7 +5614,7 @@ fa: {
   tab_overview:'داشبورد', tab_sites:'سایت‌ها', tab_add:'افزودن سایت', tab_edit:'ویرایش سایت', tab_caddyfile:'وارد کردن',
   tab_guide:'CDN کلودفلر', tab_diag:'عیب‌یابی', tab_log:'گزارش تغییرات', tab_certs:'گواهی‌ها',
   tab_certs_d:'محل فایل گواهی و کلید هر سایت روی این سرور. مسیر را کپی کنید و در x-ui، Xray یا هر برنامه‌ای که خودش TLS همان دامنه را سرو می‌کند بگذارید.',
-  certs_note:'Caddy این فایل‌ها را <b>در همان مسیر</b> تمدید می‌کند؛ پس برنامه‌ای که به این مسیرها اشاره کند همیشه گواهی تازه را می‌خواند و بعد از تمدید کپی لازم نیست. Xray فایل گواهی را خودش دوباره می‌خواند؛ برنامه‌هایی که فقط هنگام شروع می‌خوانند، گاهی یک restart لازم دارند.',
+  certs_note:'Caddy این فایل‌ها را <b>در همان مسیر</b> تمدید می‌کند؛ پس برنامه‌ای که به این مسیرها اشاره کند همیشه گواهی تازه را می‌خواند و بعد از تمدید کپی لازم نیست. Xray فایل گواهی را خودش دوباره می‌خواند؛ برنامه‌هایی که فقط هنگام شروع می‌خوانند، گاهی یک restart لازم دارند.<br><b>کجا استفاده شوند:</b> روی اینباندهایی که خودشان TLS دارند (TCP + TLS، Hysteria، Trojan). برای <b>پنل یا ساب x-ui که پشت Caddy است</b> فیلدهای گواهی در x-ui باید <b>خالی</b> بمانند - Caddy خودش TLS را انجام می‌دهد و TLS دوم باعث 502 یا خراب شدن لینک ساب می‌شود (<code>smart-caddy xui fix</code> آن‌ها را خالی می‌کند).',
   certs_none:'هنوز گواهی‌ای روی این سرور نیست.', certs_pending:'Caddy هنوز برای این دامنه گواهی نگرفته است. اگر پورت ۸۰/۴۴۳ برای این دامنه به Caddy نمی‌رسد، با دکمهٔ زیر آن را به DNS کلودفلر ببرید.',
   cert_file:'گواهی', key_file:'کلید', copy:'کپی', copied:'کپی شد',
   cert_cf:'Caddy - از راه DNS کلودفلر (پورت ۸۰/۴۴۳ لازم نیست)',
@@ -7496,6 +7632,19 @@ for u in sorted(restart):
 PY
 }
 
+# smart-caddy xui [check|fix] - x-ui panel / subscription behind Caddy
+cmd_xui() {
+	[[ -r "$XUI_DB" ]] || die "no x-ui database at $XUI_DB"
+	case "${1:-check}" in
+		check|status) xui_doctor ;;
+		fix)
+			need_root xui
+			info "x-ui behind Caddy: Listen IP 127.0.0.1, no own certificate where Caddy speaks plain HTTP to it, Sub URI = the site"
+			xui_doctor fix ;;
+		*) die "usage: $SELF_NAME xui [check|fix]" ;;
+	esac
+}
+
 cmd_reality() {
 	local action="${1:-status}"; [[ $# -gt 0 ]] && shift
 	if [[ ! -r "$XUI_DB" ]]; then
@@ -8112,6 +8261,10 @@ ${C_B}COMMANDS${C_OFF}
   reality sync                             give every Reality on loopback its
                                            SNI_PASS line and :443 share links
   reality on443 <inbound id>               move one Reality to loopback + sync
+  xui [check|fix]                          x-ui panel / sub behind Caddy: check,
+                                           or fix (Listen IP 127.0.0.1, no own
+                                           cert where Caddy speaks plain HTTP,
+                                           Sub URI) - backup first, restarts x-ui
   cert <domain> caddy                      let Caddy issue and renew the
                                            certificate instead of certbot
   renew <domain>                           get a fresh certificate right now
@@ -8217,6 +8370,8 @@ main() {
 			if [[ "${1:-status}" != status && " $* " != *" --check "* ]]; then activity_begin "$cmd" "$@"; fi ;;
 		sni)
 			if [[ "${1:-status}" != status && "${1:-}" != render ]]; then activity_begin "$cmd" "$@"; fi ;;
+		xui)
+			[[ "${1:-}" == fix ]] && activity_begin "$cmd" "$@" ;;
 	esac
 	case "$cmd" in
 		setup)             cmd_setup "$@" ;;
@@ -8231,6 +8386,7 @@ main() {
 		cloudflare|cf)     cmd_cloudflare "$@" ;;
 		reality)           cmd_reality "$@" ;;
 		sni)               cmd_sni "$@" ;;
+		xui)               cmd_xui "$@" ;;
 		put)             cmd_put "$@" ;;
 		doctor|check)      cmd_doctor ;;
 		panel)             cmd_panel "$@" ;;
