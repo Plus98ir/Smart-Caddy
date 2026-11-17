@@ -4347,6 +4347,8 @@ class Handler(BaseHTTPRequestHandler):
             action = str(data.get("action", ""))
             if action == "sync":
                 return self.send_json(self.cli(["reality", "sync"], timeout=120))
+            if action == "off443" and str(data.get("id", "")).isdigit():
+                return self.send_json(self.cli(["reality", "off443", str(data["id"])], timeout=180))
             if action == "on443" and str(data.get("id", "")).isdigit():
                 dom = str(data.get("name", "")).strip().lower()
                 if dom and not RE_DOMAIN.match(dom):
@@ -4655,7 +4657,8 @@ html[lang=fa] body{font-family:Flags,Vazirmatn,var(--font)}
   -webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur);
   box-shadow:inset 0 1px 0 rgba(255,255,255,.08),0 20px 50px -20px rgba(0,0,0,.6)}
 
-.wrap{max-width:none;margin:0;padding:22px 24px 72px}
+.wrap{max-width:none;margin:0;padding:22px 74px 72px}
+@media(max-width:1200px){.wrap{padding-inline:40px}}
 .ltr{direction:ltr;unicode-bidi:isolate}
 .sub{color:var(--mut);font-size:13px}
 
@@ -5577,6 +5580,7 @@ en: {
   rl_nofront:'Reality on :443 needs a program on :443 that routes by name. Another program holds :443 here, so Reality stays on its own port.',
   rl_on:'on :443', rl_off:'not on :443', rl_wait:'waiting for sync', rl_public:'listens on all addresses',
   rl_port:'internal port', rl_links:'share links', rl_nolinks:'none - x-ui uses the sub address',
+  rl_take:'Take off 443', rl_take_confirm:'Take inbound {0} off port 443? It goes back to its own port {1} on all addresses, its share links go back to that port, and Caddy answers this name to browsers itself again. x-ui restarts for a few seconds; clients update their subscription afterwards.',
   rl_put:'Put on :443', rl_confirm:'Move inbound {0} to 127.0.0.1 and serve it on :443? x-ui and DNSGuard restart for a few seconds; clients update their subscription afterwards.',
   rl_synced:'In step with x-ui.', rl_pending:'x-ui changed - the next automatic sync (within a minute) applies it, or press Sync now.',
   rl_sni_t:'Caddy\'s SNI router',
@@ -5773,6 +5777,7 @@ fa: {
   rl_nofront:'ریالیتی روی 443 به برنامه‌ای روی 443 نیاز دارد که از روی اسم پخش کند. اینجا برنامهٔ دیگری 443 را گرفته، پس ریالیتی روی پورت خودش می‌ماند.',
   rl_on:'روی 443', rl_off:'روی 443 نیست', rl_wait:'منتظر همگام‌سازی', rl_public:'روی همهٔ آدرس‌ها گوش می‌دهد',
   rl_port:'پورت داخلی', rl_links:'لینک‌های اشتراک', rl_nolinks:'ندارد - x-ui آدرس ساب را می‌گذارد',
+  rl_take:'برداشتن از 443', rl_take_confirm:'اینباند {0} از روی پورت 443 برداشته شود؟ برمی‌گردد روی پورت خودش ({1}) روی همهٔ آدرس‌ها، لینک‌هایش هم به همان پورت برمی‌گردد و Caddy دوباره خودش این اسم را به مرورگرها جواب می‌دهد. x-ui چند ثانیه ری‌استارت می‌شود؛ بعدش کاربرها ساب را آپدیت کنند.',
   rl_put:'ببر روی 443', rl_confirm:'اینباند {0} روی 127.0.0.1 برود و روی 443 سرویس بدهد؟ x-ui و دیگارد چند ثانیه ری‌استارت می‌شوند؛ بعدش کاربرها ساب را آپدیت کنند.',
   rl_synced:'با x-ui همگام است.', rl_pending:'x-ui تغییر کرده - همگام‌سازی خودکار بعدی (حداکثر یک دقیقه) اعمالش می‌کند، یا «همگام‌سازی» را بزنید.',
   rl_sni_t:'مسیریاب SNI خود Caddy',
@@ -6072,8 +6077,9 @@ function render(d){
     else if (s.custom)   notes += '<span class="tag">' + esc(t('tag_custom')) + '</span>';
     else if (s.imported) notes += '<span class="tag">' + esc(t('tag_imported')) + '</span>';
     let backend = s.target ? '<code>' + esc(s.target) + '</code>' : '<span class="tag">' + esc(t('sec_extra')) + '</span>';
+    const sniIb = (s.sni && (d.direct || []).find(x => x.name === s.domain)) || {};
     if (s.sni){
-      const ib = (d.direct || []).find(x => x.name === s.domain) || {};
+      const ib = sniIb;
       const kind = ib.kind === 'reality' ? 'Reality' : ib.kind === 'tls' ? 'TLS' : (ib.kind || '');
       const what = '<bdi dir="ltr"><b>' + esc(ib.remark || (ib.id ? '#' + ib.id : '?')) + '</b>'
                  + (ib.id && ib.remark ? ' #' + esc(ib.id) : '')
@@ -6093,6 +6099,7 @@ function render(d){
       +  '<div><span class="lbl">' + esc(t('th_notes')) + '</span>' + notes + '</div>'
       +  '<div class="acts">'
       +  '<button class="link go" data-edit="' + i + '">' + esc(t('edit')) + '</button>'
+      +  (s.sni && sniIb.id ? '<button class="link" data-off="' + sniIb.id + '" data-port="' + esc(s.sni.split(':').pop()) + '">' + esc(t('rl_take')) + '</button>' : '')
       +  '<button class="link go" data-raw="' + esc(s.domain) + '">' + esc(t('config')) + '</button>'
       +  '<button class="link" data-del="' + esc(s.domain) + '">' + esc(t('remove')) + '</button></div>'
       +  '</div>';
@@ -6100,6 +6107,7 @@ function render(d){
   $('#sites').innerHTML = h + '</div>' + dh;
 
   document.querySelectorAll('[data-del]').forEach(b => b.onclick = () => remove(b.dataset.del));
+  document.querySelectorAll('#sites [data-off]').forEach(b => b.onclick = () => off443(b.dataset.off, b.dataset.port));
   document.querySelectorAll('[data-raw]').forEach(b => b.onclick = () => openRaw(b.dataset.raw));
   document.querySelectorAll('[data-cert]').forEach(b => b.onclick = () => toCaddy(b.dataset.cert));
   document.querySelectorAll('[data-renew]').forEach(b => b.onclick = () => renewCert(b.dataset.renew));
@@ -6339,10 +6347,12 @@ function renderReality(){
       +  '<div><span class="lbl">' + esc(t('rl_port')) + '</span><code>' + esc((ib.listen || '*') + ':' + ib.port) + '</code></div>'
       +  '<div><span class="lbl">' + esc(t('rl_links')) + '</span>' + links + '<div style="margin-top:6px">' + st + '</div></div>'
       +  '<div class="acts">' + (d.front && !ib.local && ib.names.length
-           ? '<button class="link go" data-rl="' + ib.id + '">' + esc(t('rl_put')) + '</button>' : '') + '</div>'
+           ? '<button class="link go" data-rl="' + ib.id + '">' + esc(t('rl_put')) + '</button>' : '')
+      +  (d.front && ib.on443 ? '<button class="link" data-off="' + ib.id + '" data-port="' + esc(String(ib.port)) + '">' + esc(t('rl_take')) + '</button>' : '') + '</div>'
       +  '</div>';
   }
   $('#reality').innerHTML = h + '</div>';
+  document.querySelectorAll('#reality [data-off]').forEach(b => b.onclick = () => off443(b.dataset.off, b.dataset.port));
   document.querySelectorAll('[data-rl]').forEach(b => b.onclick = async () => {
     if (busy || !confirm(t('rl_confirm', b.dataset.rl))) return;
     busy = true;
@@ -6352,6 +6362,18 @@ function renderReality(){
     show(t('rl_put') + ' #' + b.dataset.rl, r.out);
     loadReality();
   });
+}
+// the way back from :443 - off the router, own port again, links + fallback undone
+async function off443(id, port){
+  if (busy || !confirm(t('rl_take_confirm', '#' + id, port || '?'))) return;
+  busy = true;
+  let r;
+  try { r = await api('api/reality', {action: 'off443', id: +id}); } catch (e) { r = {ok: false, out: String(e)}; }
+  busy = false;
+  toast(r.ok ? t('rl_take') + ' #' + id : t('toast_failed'), !r.ok);
+  show(t('rl_take') + ' #' + id, r.out);
+  refresh();
+  if (typeof loadReality === 'function') loadReality();
 }
 // Caddy restarts in the middle, so this runs detached; poll until it reports
 async function sniSwitch(action){
@@ -6579,7 +6601,7 @@ function directHtml(d){
       +  '<div><span class="lbl">' + esc(t('th_backend')) + '</span><div>' + esc(t('sni_cli')) + '</div><div class="sline">' + brw + '</div></div>'
       +  '<div><span class="lbl">' + esc(t('th_notes')) + '</span><span class="tag cdn">' + esc(kind) + '</span>'
       +  '<span class="tag"><span class="ltr">' + esc(x.target) + '</span></span></div>'
-      +  '<div class="acts"></div></div>';
+      +  '<div class="acts">' + (x.id ? '<button class="link" data-off="' + x.id + '" data-port="' + esc(x.target.split(':').pop()) + '">' + esc(t('rl_take')) + '</button>' : '') + '</div></div>';
   }
   return h + '</div>';
 }
@@ -7743,7 +7765,7 @@ cmd_sni() {
 XUI_DB="/etc/x-ui/x-ui.db"
 REALITY_BACKUPS="/var/backups/smart-caddy"
 
-# reality_py <status|check|sync|on443> [inbound id]
+# reality_py <status|check|sync|on443|off443> [inbound id]
 # status prints JSON; check exits 3 when sync has work to do; sync/on443 print
 # what they changed plus "RESTART <unit>" lines for the caller.
 reality_py() {
@@ -7979,6 +8001,54 @@ if action == "on443":
         print(f"inbound {ib['id']} {ib['remark']}: listens on 127.0.0.1:{ib['port']} now (only :443 reaches it)")
         restart.add("x-ui")
         ibs = inbounds(c)
+elif action == "off443":
+    # the way back: off the router, own port open again, links on that port
+    ib = next((x for x in ibs if str(x["id"]) == arg), None)
+    if not ib or not (ib["reality"] or ib["tls"]):
+        print(f"inbound {arg} is neither Reality nor TLS that can share :443")
+        sys.exit(1)
+    t = f"127.0.0.1:{ib['port']}"
+    gone = [n for n, x in pairs if x == t]
+    if not gone and ib["listen"] not in LOOP:
+        print(f"nothing to do - inbound {arg} is not on :443")
+        sys.exit(0)
+    # Xray fallback rows Smart-Caddy made for these names (dest = our listener)
+    fb = set()
+    sdir = os.environ.get("SC_SITES_DIR", "/etc/caddy/sites.d")
+    for n in gone:
+        try:
+            m = re.search(r"^http://" + re.escape(n) + r":(\d+)\s*\{", open(os.path.join(sdir, n + ".caddy")).read(), re.M)
+        except OSError:
+            m = None
+        if m:
+            fb.update({f"127.0.0.1:{m.group(1)}", m.group(1)})
+    print(f"backup: {backup(db, 'x-ui.db')}")
+    if ib["listen"] in LOOP:
+        c.execute("update inbounds set listen='' where id=?", (ib["id"],))
+        print(f"inbound {ib['id']} {ib['remark']}: listens on its own port {ib['port']} again (all addresses)")
+    if has_hosts(c):
+        for r in rows(c, ib["id"]):
+            if r["port"] == 443:
+                c.execute("update hosts set port=? where id=?", (ib["port"], r["id"]))
+                print(f"link {r['address']}:443 -> {r['address']}:{ib['port']} (inbound {ib['id']})")
+    if fb:
+        if c.execute("select 1 from sqlite_master where type='table' and name='inbound_fallbacks'").fetchone():
+            k = c.execute("delete from inbound_fallbacks where master_id=? and trim(dest) in (%s)"
+                          % ",".join("?" * len(fb)), (ib["id"], *sorted(fb))).rowcount
+        else:
+            st = json.loads(c.execute("select settings from inbounds where id=?", (ib["id"],)).fetchone()[0] or "{}")
+            old = st.get("fallbacks") or []
+            st["fallbacks"] = [f for f in old if str(f.get("dest", "")).strip() not in fb]
+            k = len(old) - len(st["fallbacks"])
+            if k:
+                c.execute("update inbounds set settings=? where id=?", (json.dumps(st, indent=2), ib["id"]))
+        if k:
+            print(f"inbound {ib['id']}: browser fallback to Caddy removed ({k} row{'s' if k > 1 else ''})")
+    c.commit()
+    restart.add("x-ui")
+    ibs = inbounds(c)
+    pairs = [(n, x) for n, x in pairs if x != t]
+    off_notes = [f"removed {n} -> {t} (inbound {ib['id']})" for n in gone]
 elif action not in ("sync", "check"):
     print(f"unknown action: {action}")
     sys.exit(1)
@@ -7989,6 +8059,8 @@ if action == "check":
     sys.exit(3 if (new != pairs or todo) else 0)
 if action == "on443" and len(pairs) > len(orig):
     notes.append(f"added {pairs[-1][0]} -> {pairs[-1][1]} (inbound {arg}, TLS)")
+if action == "off443":
+    notes = off_notes + notes
 pairs = orig
 
 if new != pairs:
@@ -8050,11 +8122,14 @@ cmd_reality() {
 	case "$action" in
 		status)
 			REALITY_FRONT=$front REALITY_CAN_SNI=$can reality_py status ;;
-		sync|on443)
+		sync|on443|off443)
 			need_root reality
 			local id="" check=0 out line rc=0
 			local dom=""
-			if [[ "$action" == on443 ]]; then
+			if [[ "$action" == off443 ]]; then
+				id="${1:-}"
+				[[ "$id" =~ ^[0-9]+$ ]] || die "usage: $SELF_NAME reality off443 <inbound id>"
+			elif [[ "$action" == on443 ]]; then
 				id="${1:-}"
 				[[ "$id" =~ ^[0-9]+$ ]] || die "usage: $SELF_NAME reality on443 <inbound id> [domain]"
 				[[ -n "${2:-}" && "${2:-}" != --* ]] && { dom="${2,,}"; valid_domain "$dom" || die "invalid domain: $dom"; }
@@ -8065,7 +8140,7 @@ cmd_reality() {
 				reality_py check || return $?
 				return 0
 			fi
-			out="$(reality_py "$action" $id $dom)" || rc=$?
+			out="$(SC_SITES_DIR="$SITES_DIR" reality_py "$action" $id $dom)" || rc=$?
 			[[ $rc -eq 0 ]] || die "$out"
 			while IFS= read -r line; do
 				case "$line" in
@@ -8088,9 +8163,10 @@ cmd_reality() {
 				fi
 			done <<<"$out"
 			# a TLS name now goes to Xray: its site (if any) answers browsers through a fallback
-			[[ "$action" == on443 ]] && sni_fallback_apply
+			# off443: its name is Caddy's again - the fallback listener goes
+			[[ "$action" == on443 || "$action" == off443 ]] && sni_fallback_apply
 			;;
-		*) die "usage: $SELF_NAME reality [status|sync|on443 <inbound id> [domain]]" ;;
+		*) die "usage: $SELF_NAME reality [status|sync|on443 <inbound id> [domain]|off443 <inbound id>]" ;;
 	esac
 }
 
@@ -8656,6 +8732,9 @@ ${C_B}COMMANDS${C_OFF}
   reality on443 <inbound id> [domain]      put a Reality or TLS inbound on :443:
                                            loopback, router line, :443 links;
                                            TLS also gets its browser fallback
+  reality off443 <inbound id>              the way back: off the router, own
+                                           port on all addresses again, links
+                                           and fallback undone (backup first)
   xui [check|fix]                          x-ui panel / sub behind Caddy: check,
                                            or fix (Listen IP 127.0.0.1, no own
                                            cert where Caddy speaks plain HTTP,
