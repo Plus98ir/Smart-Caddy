@@ -4837,6 +4837,7 @@ select:disabled{opacity:.45;cursor:default}
   border-radius:999px;border:1px solid var(--stroke);background:rgba(0,0,0,.18);font-size:13.5px;
   color:var(--mut);transition:border-color .15s,background .15s,color .15s}
 .pills label:hover{border-color:var(--stroke-2)}
+.pills label[hidden]{display:none}
 .pills label:has(input:checked){border-color:var(--acc);color:var(--ink);
   background:color-mix(in srgb,var(--acc) 14%,transparent)}
 .pills input{margin:0;flex:none;accent-color:var(--acc);width:15px;height:15px}
@@ -5103,6 +5104,7 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
   <div id="form-card">
   <form id="add" autocomplete="off">
     <div class="note" id="edit-note" hidden></div>
+    <div class="note info" id="sni-note" hidden></div>
     <div class="note" id="drop-note" hidden><span id="drop-text"></span>
       <button type="button" class="link" id="drop-raw" data-t="open_code">Edit as code</button></div>
 
@@ -5429,7 +5431,9 @@ en: {
   sb_d:'Xray clients use it as it is - nothing to change for them. Choose only what someone sees who opens <b class="ltr">https://{0}</b> in a browser:',
   sb_redir:'Send them to another site', sb_app:'Show a site or app on this server (port)', sb_none:'Show nothing (empty page, 404)',
   sb_full:'Show the full form', sb_need_url:'Type the address to send visitors to', sb_need_app:'Type the port (or address) of the site on this server',
-  d_save:'Put on port 443', d_pick:'Which x-ui inbound?', d_choose:'Pick an inbound', d_need_dom:'Type the domain the clients use for this inbound',
+  d_save:'Put on port 443', d_pick:'Which x-ui inbound?',
+  sni_edit_note:'Port 443 hands this name straight to Xray ({0}): Xray clients connect directly, and what you set below is what a browser sees.',
+  d_site_kept:'This name already has a site ({0}) - it stays as it is, and it is what a browser sees. Saving only puts the inbound on 443.', d_choose:'Pick an inbound', d_need_dom:'Type the domain the clients use for this inbound',
   d_none:'This server has no x-ui inbound that can go on 443 (Reality, or VLESS / Trojan with TLS over TCP).',
   d_nofront:'Port 443 has no name router yet, so an inbound cannot share it with the sites. Turn on Caddy\'s SNI router in the Reality tab first.',
   d_reality_h:'Reality: a browser that opens this name sees the real site it imitates ({0}) - nothing to choose here.',
@@ -5623,7 +5627,9 @@ fa: {
   sb_d:'کلاینت‌های Xray همین‌طور از آن استفاده می‌کنند و برای آن‌ها چیزی لازم نیست عوض شود. فقط انتخاب کنید کسی که <b class="ltr">https://{0}</b> را در مرورگر باز می‌کند چه ببیند:',
   sb_redir:'فرستادن به یک سایت دیگر', sb_app:'نشان دادن یک سایت یا برنامه روی همین سرور (پورت)', sb_none:'هیچ‌چیز (صفحهٔ خالی، 404)',
   sb_full:'نمایش فرم کامل', sb_need_url:'آدرس سایتی را که بازدیدکننده به آن برود بنویسید', sb_need_app:'پورت (یا آدرس) سایت روی همین سرور را بنویسید',
-  d_save:'بردن روی پورت 443', d_pick:'کدام اینباند x-ui؟', d_choose:'یک اینباند انتخاب کنید', d_need_dom:'دامنه‌ای را که کلاینت‌ها برای این اینباند استفاده می‌کنند بنویسید',
+  d_save:'بردن روی پورت 443', d_pick:'کدام اینباند x-ui؟',
+  sni_edit_note:'پورت 443 این اسم را مستقیم به Xray می‌دهد ({0}): کلاینت‌های Xray مستقیم وصل می‌شوند و چیزی که پایین تنظیم می‌کنید همان است که مرورگر می‌بیند.',
+  d_site_kept:'این اسم از قبل سایت دارد ({0}) - همان‌طور می‌ماند و مرورگر همان را می‌بیند. ذخیره فقط اینباند را روی 443 می‌برد.', d_choose:'یک اینباند انتخاب کنید', d_need_dom:'دامنه‌ای را که کلاینت‌ها برای این اینباند استفاده می‌کنند بنویسید',
   d_none:'روی این سرور اینباندی از x-ui نیست که بشود روی 443 برد (Reality، یا VLESS / Trojan با TLS روی TCP).',
   d_nofront:'پورت 443 هنوز مسیریاب اسم ندارد، پس اینباند نمی‌تواند آن را با سایت‌ها شریک شود. اول در تب Reality مسیریاب SNI خود Caddy را روشن کنید.',
   d_reality_h:'Reality: مرورگری که این اسم را باز کند همان سایت واقعی‌ای را می‌بیند که Reality از آن تقلید می‌کند ({0}) - اینجا چیزی برای انتخاب نیست.',
@@ -6593,10 +6599,14 @@ function directPick(){
   }
   const dom = (ib.via && ib.via[0]) || ib.tls_name || '';
   $('#f-domain').value = dom;
+  $('#d-hint').innerHTML = t('d_tls_h');
   const site = (SITES || []).find(x => x.domain === dom);
+  if (site && !plainSite(site)){
+    directNote(t('d_site_kept', '<b>' + esc(site.name || site.domain) + '</b>') + (ib.on443 ? '<br>' + esc(t('d_already')) : ''));
+    return;
+  }
   sbSet(site || {domain: dom || '…', target: 'respond:404', sni_fallback: '1'});
   $('#sni-box').hidden = false;
-  $('#d-hint').innerHTML = t('d_tls_h');
 }
 $('#d-ib').onchange = directPick;
 $('#f-domain').addEventListener('input', () => {
@@ -6619,8 +6629,11 @@ async function directSave(){
   if (!ib){ toast(t('d_choose'), true); $('#d-ib').focus(); return; }
   const dom = $('#f-domain').value.trim().toLowerCase();
   let target = '';
+  const keep = (SITES || []).find(x => x.domain === dom);
   if (ib.t === 'tls'){
     if (!dom){ toast(t('d_need_dom'), true); $('#f-domain').focus(); return; }
+  }
+  if (ib.t === 'tls' && (!keep || plainSite(keep))){
     const [v, miss] = sbTarget();
     if (miss){ toast(t(miss), true); $(sbKind() === 'redirect' ? '#sb-url' : '#sb-app').focus(); return; }
     target = v;
@@ -6717,6 +6730,7 @@ $('#sb-full').onclick = () => {
 function startEdit(s){
   EDITING = s;
   $('#k-direct').hidden = true;      // an existing site is edited as a site
+  $('#howto').open = false;          // the step-by-step guide is for adding
   $('#f-domain').value  = s.domain;
   $('#f-name').value    = s.name || '';
   $('#f-target').value  = s.target;
@@ -6745,6 +6759,8 @@ function startEdit(s){
   $('#form-out-card').hidden = true;
   formTexts();
   if (sniSimple(s)){ sbSet(s); sbOn(true); } else sbOn(false);
+  $('#sni-note').innerHTML = s.sni && !sniSimple(s) ? t('sni_edit_note', '<code>' + esc(s.sni) + '</code>') : '';
+  $('#sni-note').hidden = !(s.sni && !sniSimple(s));
   // edit in a window over the current page, like Config, instead of jumping to the Add tab
   $('#edit-dlg').appendChild($('#form-card'));
   if (!$('#edit-dlg').open) $('#edit-dlg').showModal();
@@ -6772,6 +6788,8 @@ function stopEdit(){
   $('#form-card').classList.remove('editing');
   $('#btn-cancel').hidden = true;
   $('#k-direct').hidden = false;
+  $('#howto').open = true;
+  $('#sni-note').hidden = true;
   sbOn(false);
   formTexts();
 }
