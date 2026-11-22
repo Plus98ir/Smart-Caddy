@@ -20,8 +20,21 @@
 # =============================================================================
 set -euo pipefail
 
-VERSION="1.7.1"
+VERSION="1.7.2"
 SELF_NAME="smart-caddy"
+
+# --- changes (newest first; the panel shows the last two) ---
+# v1.7.2 | 2026-11-23
+#  en: What's new: the Update card shows what the last two versions changed, and what a new version brings before you install it. Right after an update a short note shows it once.
+#  fa: تازه‌ها: کارت به‌روزرسانی تغییرات دو نسخهٔ آخر را نشان می‌دهد و قبل از نصب می‌گوید نسخهٔ جدید چه چیزی دارد. بعد از هر به‌روزرسانی هم یک بار یک پیام کوتاه آن را نشان می‌دهد.
+#  en: The panel shows the right version number (it kept saying 1.7.0).
+#  fa: پنل شمارهٔ نسخه را درست نشان می‌دهد (قبلاً همیشه 1.7.0 می‌گفت).
+# v1.7.1 | 2026-11-22
+#  en: Reality on port 443 and 'Add module' (Cloudflare) work again on new servers: caddyserver.com no longer builds Caddy for everyone, so Smart-Caddy now brings its own Caddy build with these modules.
+#  fa: Reality روی پورت 443 و دکمهٔ «Add module» (کلودفلر) روی سرورهای جدید دوباره کار می‌کنند: سایت caddyserver.com دیگر برای همه Caddy نمی‌سازد، پس Smart-Caddy حالا Caddy آمادهٔ خودش را با این ماژول‌ها می‌آورد.
+#  en: The old Caddy is kept and comes back by itself if anything goes wrong.
+#  fa: Caddy قبلی نگه داشته می‌شود و اگر مشکلی پیش بیاید خودش برمی‌گردد.
+# --- end of changes ---
 CONF_FILE="/etc/smart-caddy.conf"
 
 # --- defaults (overridden by install / /etc/smart-caddy.conf) ----------------
@@ -3294,7 +3307,43 @@ CLI = shutil.which("smart-caddy") or "/usr/local/bin/smart-caddy"
 CONF = "/etc/smart-caddy.conf"
 AUTH_FILE = os.environ.get("SMART_CADDY_PANEL_AUTH", "/etc/smart-caddy-panel.json")
 ACTIVITY_LOG = os.environ.get("SMART_CADDY_ACTIVITY", "/var/log/smart-caddy/activity.jsonl")
-VERSION = "1.7.0"
+CHANGES_RE = re.compile(rb"^# --- changes .*?^# --- end of changes ---", re.M | re.S)
+
+
+def parse_changes(data, limit=2):
+    """The changes block of a smart-caddy script: [{v, date, en: [..], fa: [..]}], newest first."""
+    m = CHANGES_RE.search(data or b"")
+    out = []
+    if not m:
+        return out
+    cur = None
+    for line in m.group(0).decode("utf-8", "replace").splitlines()[1:-1]:
+        t = line[1:].strip() if line.startswith("#") else ""
+        mv = re.match(r"v(\S+)\s*\|\s*(\S+)$", t)
+        if mv:
+            cur = {"v": mv.group(1), "date": mv.group(2), "en": [], "fa": []}
+            out.append(cur)
+        elif cur and t[:3] in ("en:", "fa:"):
+            cur[t[:2]].append(t[3:].strip())
+    return out[:limit]
+
+
+def vtuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v or ""))
+
+
+def _installed():
+    try:
+        with open("/usr/local/bin/smart-caddy", "rb") as fh:
+            return fh.read()
+    except OSError:
+        return b""
+
+
+_SELF = _installed()
+_mv = re.search(rb'^VERSION="([^"]+)"', _SELF, re.M)
+VERSION = _mv.group(1).decode() if _mv else "?"
+CHANGES = parse_changes(_SELF, 2)
 
 COOKIE = "sc_session"
 SESSION_HOURS = 12
@@ -3631,6 +3680,7 @@ def update_check():
     m = re.search(rb'^VERSION="([^"]+)"', new, re.M)
     return {"ok": True, "available": new != cur, "installed": VERSION,
             "latest": m.group(1).decode() if m else "?",
+            "news": [c for c in parse_changes(new, 2) if vtuple(c["v"]) > vtuple(VERSION)],
             "installed_build": hashlib.sha256(cur).hexdigest()[:12],
             "latest_build": hashlib.sha256(new).hexdigest()[:12]}
 
@@ -4156,6 +4206,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/state":
             return self.send_json({
                 "version": VERSION,
+                "changes": CHANGES,
                 "front_ip": front_ip(),
                 "caddy_running": caddy_running(),
                 "ports": {"80": port_owner(80), "443": port_owner(443)},
@@ -5046,6 +5097,13 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
   #log summary .grow{order:9;flex-basis:100%}
   #log summary .sub{overflow-wrap:anywhere;min-width:0}
 }
+#news-dlg{width:min(560px,94vw)}
+.news-t{margin-top:16px;font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim)}
+.news{margin-top:8px}
+.news-h{font-weight:600;color:var(--ink)}
+.news-h .d{color:var(--mut);font-weight:400;font-size:12.5px;margin-inline-start:10px}
+.news ul{margin:4px 0 0;padding-inline-start:20px}
+.news li{margin:4px 0;line-height:1.65;color:var(--ink)}
 </style>
 </head>
 <body>
@@ -5393,6 +5451,7 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
     <h3 data-t="up_title">Update</h3>
     <p class="sec-d" data-t="up_d"></p>
     <div class="cf-state" id="up-state"></div>
+    <div id="up-news"></div>
     <div class="row">
       <button type="button" class="primary" id="up-check" data-t="up_check">Check for an update</button>
       <button type="button" id="up-go" data-t="up_go" hidden>Update now</button>
@@ -5429,6 +5488,13 @@ textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px color-m
     <button type="button" class="primary" id="raw-save" data-t="raw_save">Save &amp; reload</button>
     <button type="button" class="link" id="raw-cancel" data-t="cancel">Cancel</button>
   </div>
+</dialog>
+
+<!-- shown once after an update: what this version changed -->
+<dialog id="news-dlg">
+  <h3 id="news-title" style="font-size:16px;text-transform:none;letter-spacing:0;color:var(--ink);margin-bottom:6px"></h3>
+  <div id="news-body"></div>
+  <div style="margin-top:18px"><button type="button" class="primary" id="news-ok" data-t="news_ok">Got it</button></div>
 </dialog>
 
 <!-- the site form moves in here while a site is edited -->
@@ -5649,6 +5715,7 @@ en: {
   up_none:'Up to date: v{0} (build {1}).', up_avail:'A new build is available: v{0} → v{1} (build {2} → {3}).',
   up_confirm:'Update Smart-Caddy on this server now? The panel restarts for a few seconds.',
   up_started:'Updating… this page reloads by itself in a few seconds.',
+  up_recent:'Recent changes', up_next:'In the new version', news_title:'New in v{0}', news_ok:'Got it',
   xui_fill:'Fill in from x-ui on this server', xui_fill_h:'Reads the panel port, base path and subscription from x-ui - nothing to type.',
   xui_none:'No x-ui found on this server (/etc/x-ui/x-ui.db).',
   xui_done:'Filled in from x-ui: panel on port <b>{0}</b>, base path <code>{1}</code>{2}. Check the domain and save.',
@@ -5846,6 +5913,7 @@ fa: {
   up_none:'به‌روز است: v{0} (بیلد {1}).', up_avail:'نسخهٔ جدید آماده است: v{0} ← v{1} (بیلد {2} ← {3}).',
   up_confirm:'Smart-Caddy روی این سرور همین الان به‌روز شود؟ پنل چند ثانیه ری‌استارت می‌شود.',
   up_started:'در حال به‌روزرسانی… این صفحه چند ثانیه دیگر خودش دوباره باز می‌شود.',
+  up_recent:'تغییرات اخیر', up_next:'در نسخهٔ جدید', news_title:'تازه‌های نسخهٔ {0}', news_ok:'باشه',
   xui_fill:'پر کردن خودکار از x-ui همین سرور', xui_fill_h:'پورت پنل، مسیر پایه و ساب را از x-ui می‌خواند؛ لازم نیست چیزی تایپ کنید.',
   xui_none:'روی این سرور x-ui پیدا نشد (/etc/x-ui/x-ui.db).',
   xui_done:'از x-ui پر شد: پنل روی پورت <b>{0}</b>، مسیر پایه <code>{1}</code>{2}. دامنه را چک کنید و ذخیره بزنید.',
@@ -5906,6 +5974,7 @@ function applyLang(){
   if (STATE) render(STATE);
   if (LOG) renderLog(LOG);
   if (RL) renderReality();
+  if (STATE) renderNews();
 }
 
 document.querySelectorAll('[data-lang]').forEach(b => b.onclick = () => {
@@ -6069,6 +6138,8 @@ async function load(){
     BRAND = d.brand; applyBrand(BRAND); fillSettings(BRAND);
   }
   render(d);
+  renderNews();
+  maybeShowNews(d);
 }
 
 function render(d){
@@ -6459,6 +6530,40 @@ $('#rl-sync').onclick = async () => {
   loadReality();
 };
 
+// ---------------------------------------------------------------- what's new
+// The changes block of the script: the installed version's last two entries in
+// the Update card, what an available update brings, and once after an update
+// a short note (remembered per browser).
+var NEXT = null;
+function newsLines(e){ return ((e[LANG] && e[LANG].length) ? e[LANG] : (e.en || [])).map(x => '<li>' + escXml(x) + '</li>').join(''); }
+function newsHtml(list){
+  return (list || []).map(e => '<div class="news"><div class="news-h"><bdi>v' + escXml(e.v) + '</bdi><span class="d">'
+    + escXml(e.date) + '</span></div><ul>' + newsLines(e) + '</ul></div>').join('');
+}
+function renderNews(){
+  const cur = (STATE && STATE.changes) || [];
+  $('#up-news').innerHTML = (NEXT && NEXT.length ? '<div class="news-t">' + escXml(t('up_next')) + '</div>' + newsHtml(NEXT) : '')
+    + (cur.length ? '<div class="news-t">' + escXml(t('up_recent')) + '</div>' + newsHtml(cur) : '');
+  if ($('#news-dlg').open && cur[0]){
+    $('#news-title').textContent = t('news_title', cur[0].v);
+    $('#news-body').innerHTML = '<div class="news"><ul>' + newsLines(cur[0]) + '</ul></div>';
+  }
+}
+function maybeShowNews(d){
+  const c = (d.changes || [])[0];
+  if (!c || c.v !== d.version || document.querySelector('dialog[open]')) return;
+  let seen = '';
+  try { seen = localStorage.getItem('sc-news-seen') || ''; } catch(_) {}
+  if (seen === c.v) return;
+  $('#news-dlg').showModal();
+  renderNews();
+}
+$('#news-dlg').addEventListener('close', () => {
+  const c = ((STATE && STATE.changes) || [])[0];
+  try { if (c) localStorage.setItem('sc-news-seen', c.v); } catch(_) {}
+});
+$('#news-ok').onclick = () => $('#news-dlg').close();
+
 // ---------------------------------------------------------------- update
 $('#up-check').onclick = async () => {
   $('#up-check').disabled = true;
@@ -6470,6 +6575,8 @@ $('#up-check').onclick = async () => {
     ? t('up_avail', r.installed, r.latest, r.installed_build, r.latest_build)
     : t('up_none', r.installed, r.installed_build);
   $('#up-go').hidden = !r.available;
+  NEXT = r.available ? (r.news || []) : null;
+  renderNews();
 };
 $('#up-go').onclick = async () => {
   if (busy || !confirm(t('up_confirm'))) return;
