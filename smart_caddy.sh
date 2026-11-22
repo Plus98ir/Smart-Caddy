@@ -20,7 +20,7 @@
 # =============================================================================
 set -euo pipefail
 
-VERSION="1.7.0"
+VERSION="1.7.1"
 SELF_NAME="smart-caddy"
 CONF_FILE="/etc/smart-caddy.conf"
 
@@ -2064,7 +2064,7 @@ CF_MODULE="dns.providers.cloudflare"
 CF_PKG="github.com/caddy-dns/cloudflare"
 CF_TLS_BLOCK=$'\ttls {\n\t\tdns cloudflare {env.CF_API_TOKEN}\n\t\tresolvers 1.1.1.1 8.8.8.8\n\t}'
 
-cf_module_ok() { have caddy && caddy list-modules 2>/dev/null | grep -qx "$CF_MODULE"; }
+cf_module_ok() { caddy_has_module "$CF_MODULE"; }
 cf_token()     { [[ -r "$CF_ENV" ]] && grep -oP '^CF_API_TOKEN=\K\S+' "$CF_ENV" | head -1 || true; }
 site_uses_cf() { grep -qE '^\s*dns\s+cloudflare' "$(site_file "$1")" 2>/dev/null; }
 cf_sites() {
@@ -2092,9 +2092,6 @@ cf_zone_for() {
 	done
 }
 
-# Swap Caddy's build for one with the Cloudflare DNS module. Caddy's own
-# 'add-package' fetches it from caddyserver.com; the old binary is kept and
-# put back if anything goes wrong.
 # Put the saved Caddy binary back. Caddy may be running from it, and a running
 # binary cannot be written over ("Text file busy") - a rename replaces it.
 caddy_bin_restore() {
@@ -2103,19 +2100,75 @@ caddy_bin_restore() {
 	cp -p "$bin.smart-caddy.bak" "$bin.smart-caddy.new" && mv -f "$bin.smart-caddy.new" "$bin"
 }
 
+# Smart-Caddy's own Caddy build (standard + caddy-l4 + caddy-dns/cloudflare),
+# files caddy-linux-<arch> + caddy-linux-<arch>.sha256 on a GitHub release.
+CADDY_BUILD_URL="${SMART_CADDY_CADDY_URL:-https://github.com/Plus98ir/Smart-Caddy/releases/download/caddy-modules}"
+
+# (output read whole first: grep -q stopping early would SIGPIPE caddy under pipefail)
+caddy_has_module() { have caddy || return 1; local m; m="$(caddy list-modules 2>/dev/null)" || true; grep -qx "$1" <<<"$m"; }
+
+# The non-standard modules a Caddy binary has (one per line).
+caddy_extra_modules() {
+	"$1" list-modules 2>/dev/null | awk '/Non-standard modules:/{s=0;next} /Standard modules:/{s=1;next} s && /^[a-z0-9_]+(\.[a-z0-9_]+)*$/'
+}
+
+# caddy_add_module <module id> <package> - give Caddy a build with that module.
+# 1) Caddy's own 'add-package' (caddyserver.com build server - since 2026-11 it
+#    answers 401 "Please log in or use an API key" to most servers);
+# 2) Smart-Caddy's ready-made build from GitHub (sha256 checked, must hold the
+#    module and every extra module the current build has).
+# The old binary is kept as <bin>.smart-caddy.bak and put back on any failure.
+caddy_add_module() {
+	local mod="$1" pkg="$2" bin log tmp a want got missing
+	have caddy || die "caddy is not installed"
+	bin="$(readlink -f "$(command -v caddy)")"; log="$(mktemp)"
+	cp -p "$bin" "$bin.smart-caddy.bak"
+	info "adding $pkg to Caddy - asking caddyserver.com for a build (~40 MB)"
+	# add-package keeps the modules this build already has (e.g. Cloudflare DNS)
+	if caddy add-package "$pkg" >"$log" 2>&1 && caddy_has_module "$mod"; then
+		rm -f "$log"; return 0
+	fi
+	grep -oE '"msg":"download failed[^"]*' "$log" | tail -n 1 | sed 's/^"msg":"/       /' >&2
+	rm -f "$log"; caddy_bin_restore "$bin"
+	case "$(uname -m)" in
+		x86_64|amd64)  a=amd64 ;;
+		aarch64|arm64) a=arm64 ;;
+		*) warn "no ready-made Caddy build for $(uname -m)"; return 1 ;;
+	esac
+	info "caddyserver.com did not build it - downloading Smart-Caddy's Caddy build (standard + layer4 + Cloudflare DNS) from GitHub"
+	tmp="$(mktemp -d)"
+	if ! curl -fsSL --retry 2 --connect-timeout 20 --max-time 600 -o "$tmp/caddy" "$CADDY_BUILD_URL/caddy-linux-$a" \
+		|| ! curl -fsSL --retry 2 --connect-timeout 20 --max-time 60 -o "$tmp/sum" "$CADDY_BUILD_URL/caddy-linux-$a.sha256"; then
+		rm -rf "$tmp"; warn "could not download $CADDY_BUILD_URL/caddy-linux-$a"; return 1
+	fi
+	want="$(awk '{print $1; exit}' "$tmp/sum")"; got="$(sha256sum "$tmp/caddy" | awk '{print $1}')"
+	if [[ -z "$want" || "$want" != "$got" ]]; then
+		rm -rf "$tmp"; warn "the downloaded Caddy build does not match its sha256 - not used"; return 1
+	fi
+	chmod 755 "$tmp/caddy"
+	if ! grep -qx "$mod" <<<"$("$tmp/caddy" list-modules 2>/dev/null || true)"; then
+		rm -rf "$tmp"; warn "the downloaded Caddy build has no $mod module"; return 1
+	fi
+	missing="$(comm -23 <(caddy_extra_modules "$bin" | sort -u) <(caddy_extra_modules "$tmp/caddy" | sort -u))"
+	if [[ -n "$missing" ]]; then
+		rm -rf "$tmp"
+		warn "the current Caddy has modules the ready-made build lacks: $(echo $missing)"
+		return 1
+	fi
+	cp "$tmp/caddy" "$bin.smart-caddy.new" && mv -f "$bin.smart-caddy.new" "$bin"
+	rm -rf "$tmp"
+	caddy_has_module "$mod" || { caddy_bin_restore "$bin"; return 1; }
+	ok "Caddy $(caddy version 2>/dev/null | awk '{print $1}') with layer4 + Cloudflare DNS installed (sha256 ${got:0:12})"
+}
+
 cf_install_module() {
 	cf_module_ok && { ok "Caddy already has the Cloudflare DNS module"; return 0; }
 	have caddy || die "caddy is not installed"
-	local bin log; bin="$(readlink -f "$(command -v caddy)")"; log="$(mktemp)"
-	info "adding $CF_PKG to Caddy - downloads a Caddy build from caddyserver.com (~40 MB)"
-	cp -p "$bin" "$bin.smart-caddy.bak"
-	if ! caddy add-package "$CF_PKG" >"$log" 2>&1 || ! cf_module_ok; then
-		tail -n 5 "$log" | sed 's/^/       /' >&2; rm -f "$log"
-		caddy_bin_restore "$bin"
-		dim "caddyserver.com must be reachable; behind a filter set https_proxy and run it again"
+	local bin; bin="$(readlink -f "$(command -v caddy)")"
+	if ! caddy_add_module "$CF_MODULE" "$CF_PKG"; then
+		dim "caddyserver.com or github.com must be reachable; behind a filter set https_proxy and run it again"
 		die "could not add the module - Caddy is unchanged"
 	fi
-	rm -f "$log"
 	# a package upgrade would bring back a build without the module
 	if have apt-mark && apt-mark hold caddy >/dev/null 2>&1; then
 		ok "caddy package held - apt upgrades will not replace this build"
@@ -5544,7 +5597,7 @@ en: {
   cf_token_h:'Cloudflare -> My Profile -> API Tokens -> Create Token -> template <b>Edit zone DNS</b>, zones: the domains you need. Stored on this server only, readable by root alone; never shown again.',
   cf_has_token:'token saved {0}', cf_no_token:'no token yet', cf_has_module:'Caddy has the Cloudflare module', cf_no_module:'Caddy has no Cloudflare module yet',
   cf_saved:'Token works and is saved. Zones it can edit: {0}\n\nCaddy restarts once to load it. If Caddy has no Cloudflare module yet, add it with the button below the token.',
-  confirm_cf_module:'Add the Cloudflare DNS module to Caddy?\n\nThe server downloads a Caddy build with the module from caddyserver.com (~40 MB), keeps the old one as a backup and restarts Caddy - sites are down for a second. The caddy package is held so apt does not undo it.',
+  confirm_cf_module:'Add the Cloudflare DNS module to Caddy?\n\nThe server downloads a Caddy build with the module (from caddyserver.com, or the ready-made Smart-Caddy build on GitHub, ~50 MB), keeps the old one as a backup and restarts Caddy - sites are down for a second. The caddy package is held so apt does not undo it.',
   cf_module_started:'Adding the module - this takes up to two minutes. Caddy restarts at the end; the result appears in the activity log, and this page updates by itself.',
   confirm_cf_clear:'Remove the Cloudflare token from this server?', done_ok:'Done',
   tab_overview_d:'The state of Caddy, your sites and their certificates at a glance. This page refreshes by itself every 20 seconds.',
@@ -5741,7 +5794,7 @@ fa: {
   cf_token_h:'Cloudflare -> My Profile -> API Tokens -> Create Token -> قالب <b>Edit zone DNS</b> و دامنه‌های لازم. فقط روی همین سرور و فقط برای root ذخیره می‌شود و دیگر نمایش داده نمی‌شود.',
   cf_has_token:'توکن ذخیره شده {0}', cf_no_token:'هنوز توکنی نیست', cf_has_module:'Caddy ماژول کلودفلر را دارد', cf_no_module:'Caddy هنوز ماژول کلودفلر ندارد',
   cf_saved:'توکن کار می‌کند و ذخیره شد. دامنه‌هایی که می‌تواند ویرایش کند: {0}\n\nCaddy یک بار restart می‌شود تا توکن را بخواند. اگر Caddy هنوز ماژول کلودفلر ندارد، با دکمهٔ زیر توکن اضافه‌اش کنید.',
-  confirm_cf_module:'ماژول DNS کلودفلر به Caddy اضافه شود؟\n\nسرور یک نسخهٔ Caddy همراه این ماژول را از caddyserver.com دانلود می‌کند (حدود ۴۰ مگابایت)، نسخهٔ قبلی را نگه می‌دارد و Caddy را restart می‌کند - سایت‌ها یک ثانیه قطع می‌شوند. بستهٔ caddy قفل می‌شود تا apt آن را برنگرداند.',
+  confirm_cf_module:'ماژول DNS کلودفلر به Caddy اضافه شود؟\n\nسرور یک نسخهٔ Caddy همراه این ماژول را دانلود می‌کند (از caddyserver.com یا نسخهٔ آمادهٔ Smart-Caddy در GitHub، حدود ۵۰ مگابایت)، نسخهٔ قبلی را نگه می‌دارد و Caddy را restart می‌کند - سایت‌ها یک ثانیه قطع می‌شوند. بستهٔ caddy قفل می‌شود تا apt آن را برنگرداند.',
   cf_module_started:'در حال افزودن ماژول - تا دو دقیقه طول می‌کشد. در پایان Caddy restart می‌شود؛ نتیجه در گزارش تغییرات می‌آید و این صفحه خودش به‌روز می‌شود.',
   confirm_cf_clear:'توکن کلودفلر از این سرور حذف شود؟', done_ok:'انجام شد',
   tab_overview_d:'وضعیت Caddy، سایت‌ها و گواهی‌هایشان در یک نگاه. این صفحه هر ۲۰ ثانیه خودش به‌روز می‌شود.',
@@ -7194,7 +7247,7 @@ L4_PKG="github.com/mholt/caddy-l4"
 SNI_HTTPS_PORT=8444
 SNI_HTTP_PORT=8081
 
-l4_module_ok() { have caddy && caddy list-modules 2>/dev/null | grep -qx layer4; }
+l4_module_ok() { caddy_has_module layer4; }
 sni_mode_on()  { grep -q '# --- smart-caddy SNI router' "$CADDYFILE" 2>/dev/null; }
 
 # Could this server switch the router on? Caddy holds :443 itself (or nothing
@@ -7209,17 +7262,10 @@ sni_can_enable() {
 l4_install_module() {
 	l4_module_ok && { ok "Caddy already has the layer4 module"; return 0; }
 	have caddy || die "caddy is not installed"
-	local bin log; bin="$(readlink -f "$(command -v caddy)")"; log="$(mktemp)"
-	info "adding $L4_PKG to Caddy - downloads a Caddy build from caddyserver.com (~40 MB)"
-	cp -p "$bin" "$bin.smart-caddy.bak"
-	# add-package keeps the modules this build already has (e.g. Cloudflare DNS)
-	if ! caddy add-package "$L4_PKG" >"$log" 2>&1 || ! l4_module_ok; then
-		tail -n 5 "$log" | sed 's/^/       /' >&2; rm -f "$log"
-		caddy_bin_restore "$bin"
-		dim "caddyserver.com must be reachable; behind a filter set https_proxy and run it again"
+	if ! caddy_add_module layer4 "$L4_PKG"; then
+		dim "caddyserver.com or github.com must be reachable; behind a filter set https_proxy and run it again"
 		die "could not add the module - Caddy is unchanged"
 	fi
-	rm -f "$log"
 	if have apt-mark && apt-mark hold caddy >/dev/null 2>&1; then
 		ok "caddy package held - apt upgrades will not replace this build"
 	fi
